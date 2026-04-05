@@ -1,5 +1,12 @@
 import { ArgumentError } from './exceptions.js';
 
+export function normalizeModelsToObject(models) {
+  if (Array.isArray(models)) {
+    return Object.freeze(Object.fromEntries(models.map((m) => [m, m])));
+  }
+  return Object.freeze({ ...models });
+}
+
 export class ProviderConfig {
   #id;
   #url;
@@ -18,7 +25,7 @@ export class ProviderConfig {
     }
     this.#id = id ?? '';
     this.#url = url;
-    this.#models = Array.isArray(models) ? Object.freeze([...models]) : Object.freeze({ ...models });
+    this.#models = normalizeModelsToObject(models);
     this.#anthropicCompliant = anthropicCompliant;
     Object.freeze(this);
   }
@@ -62,11 +69,7 @@ export class ProvidersMap {
         }
         this.#providerIds.add(provider.id);
       }
-      const models = provider.models;
-      const entries = Array.isArray(models)
-        ? models.map((m) => [m, m])
-        : Object.entries(models);
-      for (const [alias, realModel] of entries) {
+      for (const [alias, realModel] of Object.entries(provider.models)) {
         this.#map.set(alias, new ProviderMatch(provider, alias, realModel));
       }
     }

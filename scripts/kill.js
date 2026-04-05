@@ -9,5 +9,4 @@ const config = loadConfigFromFile(USER_CONFIG_DIR);
 const PORT = config.port;
 
 const args = process.argv.slice(2);
-const target = args[0] === 'all' ? undefined : args[0];
-runKill({ logsDir: LOGS_DIR, target, port: PORT });
+runKill();

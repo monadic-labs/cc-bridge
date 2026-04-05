@@ -37,12 +37,12 @@ export class ProxyConfig {
     const daemon = raw.daemon;
     if (!daemon || typeof daemon !== 'object') throw new ConfigError('Config must explicitly define a "daemon" object');
 
-    if (typeof daemon.healthCheckTimeout !== 'number') throw new ConfigError('daemon.healthCheckTimeout must be an explicit number');
-    if (typeof daemon.pollInterval !== 'number') throw new ConfigError('daemon.pollInterval must be an explicit number');
+    if (typeof daemon.healthCheckTimeoutMs !== 'number') throw new ConfigError('daemon.healthCheckTimeoutMs must be an explicit number');
+    if (typeof daemon.pollIntervalMs !== 'number') throw new ConfigError('daemon.pollIntervalMs must be an explicit number');
     if (typeof daemon.pollMaxAttempts !== 'number') throw new ConfigError('daemon.pollMaxAttempts must be an explicit number');
 
-    this.#healthCheckTimeout = daemon.healthCheckTimeout;
-    this.#pollInterval = daemon.pollInterval;
+    this.#healthCheckTimeout = daemon.healthCheckTimeoutMs;
+    this.#pollInterval = daemon.pollIntervalMs;
     this.#pollMaxAttempts = daemon.pollMaxAttempts;
 
     this.#loggingEnabled = logging.enabled;
@@ -60,8 +60,8 @@ export class ProxyConfig {
   get historySize() { return this.#historySize; }
   get maxBodyLog() { return this.#maxBodyLog; }
   get port() { return this.#port; }
-  get healthCheckTimeout() { return this.#healthCheckTimeout; }
-  get pollInterval() { return this.#pollInterval; }
+  get healthCheckTimeoutMs() { return this.#healthCheckTimeout; }
+  get pollIntervalMs() { return this.#pollInterval; }
   get pollMaxAttempts() { return this.#pollMaxAttempts; }
 }
 

@@ -1,5 +1,6 @@
 import { Result } from './types.js';
 import { ArgumentError } from './exceptions.js';
+import { normalizeModelsToObject } from './providers.js';
 
 export function findProviderIndex(providers, identifier) {
   if (typeof identifier !== 'string' || !identifier) return -1;
@@ -8,19 +9,12 @@ export function findProviderIndex(providers, identifier) {
   return providers.findIndex((p) => p.url.includes(identifier));
 }
 
-function modelsToObject(models) {
-  if (Array.isArray(models)) {
-    return Object.fromEntries(models.map((m) => [m, m]));
-  }
-  return { ...models };
-}
-
 export function addModel(rawProviders, providerId, alias, realModel) {
   const providers = rawProviders.map((p) => ({ ...p }));
   const idx = findProviderIndex(providers, providerId);
   if (idx === -1) return Result.fail(new ArgumentError(`No provider matching "${providerId}"`));
 
-  const models = modelsToObject(providers[idx].models);
+  const models = { ...normalizeModelsToObject(providers[idx].models) };
   if (models[alias] !== undefined) {
     return Result.fail(new ArgumentError(`Model "${alias}" already exists on "${providers[idx].url}"`));
   }
@@ -35,7 +29,7 @@ export function removeModel(rawProviders, providerId, alias) {
   const idx = findProviderIndex(providers, providerId);
   if (idx === -1) return Result.fail(new ArgumentError(`No provider matching "${providerId}"`));
 
-  const models = modelsToObject(providers[idx].models);
+  const models = { ...normalizeModelsToObject(providers[idx].models) };
   if (models[alias] === undefined) {
     return Result.fail(new ArgumentError(`Model "${alias}" not found on "${providers[idx].url}"`));
   }
@@ -71,17 +65,15 @@ export function listModels(rawProviders, providerId) {
   if (idx === -1) return Result.fail(new ArgumentError(`No provider matching "${providerId}"`));
 
   const provider = rawProviders[idx];
-  const entries = Array.isArray(provider.models)
-    ? provider.models.map((m) => [m, m])
-    : Object.entries(provider.models);
+  const entries = Object.entries(normalizeModelsToObject(provider.models));
 
   return Result.ok({ url: provider.url, compliant: provider.anthropicCompliant, models: entries });
 }
 
 export function listProviders(rawProviders) {
   return rawProviders.map((p) => {
-    const count = Array.isArray(p.models) ? p.models.length : Object.keys(p.models).length;
-    return { url: p.url, compliant: p.anthropicCompliant, modelCount: count };
+    const models = normalizeModelsToObject(p.models);
+    return { url: p.url, compliant: p.anthropicCompliant, modelCount: Object.keys(models).length };
   });
 }
 
@@ -92,9 +84,7 @@ export function formatTree(rawProviders) {
     const tag = p.anthropicCompliant ? 'compliant' : 'non-compliant';
     lines.push(`${p.url} (${tag})`);
 
-    const entries = Array.isArray(p.models)
-      ? p.models.map((m) => [m, m])
-      : Object.entries(p.models);
+    const entries = Object.entries(normalizeModelsToObject(p.models));
 
     for (let j = 0; j < entries.length; j++) {
       const [alias, real] = entries[j];

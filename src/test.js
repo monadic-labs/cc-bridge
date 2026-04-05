@@ -200,7 +200,7 @@ async function runUnitTests() {
   console.log('\nProxyConfig:');
   const validConfig = new ProxyConfig({
     port: 9099,
-    daemon: { healthCheckTimeout: 500, pollInterval: 300, pollMaxAttempts: 10 },
+    daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10 },
     logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }
   });
   assert(validConfig.port === 9099, 'port');
@@ -347,7 +347,7 @@ async function setupTestConfig() {
 
   const config = {
     port: TEST_PORT,
-    daemon: { healthCheckTimeout: 1000, pollInterval: 200, pollMaxAttempts: 15 },
+    daemon: { healthCheckTimeoutMs: 1000, pollIntervalMs: 200, pollMaxAttempts: 15 },
     logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }
   };
   fs.writeFileSync(path.join(TEST_CONFIG_DIR, 'config.json'), JSON.stringify(config, null, 2), 'utf8');
@@ -367,6 +367,8 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+let testDaemonPid = null;
+
 async function startTestDaemon() {
   const CCB_BIN = path.join(PKG_ROOT, 'bin', 'ccb.js');
   const out = fs.openSync(path.join(TEST_CONFIG_DIR, 'logs', 'daemon.log'), 'a');
@@ -378,6 +380,7 @@ async function startTestDaemon() {
     windowsHide: true,
     env: { ...process.env, CCB_CONFIG_DIR: TEST_CONFIG_DIR }
   });
+  testDaemonPid = child.pid;
   child.unref();
 
   for (let i = 0; i < 15; i++) {
@@ -388,15 +391,9 @@ async function startTestDaemon() {
 }
 
 function killTestDaemon() {
-  const pidsFile = path.join(TEST_CONFIG_DIR, 'logs', 'proxy.pids');
-  if (fs.existsSync(pidsFile)) {
-    try {
-      const pids = fs.readFileSync(pidsFile, 'utf8').split('\n').filter(Boolean).map(Number);
-      for (const pid of pids) {
-        try { process.kill(pid, 'SIGKILL'); } catch {}
-      }
-      fs.unlinkSync(pidsFile);
-    } catch {}
+  if (testDaemonPid) {
+    try { process.kill(testDaemonPid, 'SIGKILL'); } catch {}
+    testDaemonPid = null;
   }
   
   // Also try to kill anything on the test port
@@ -629,7 +626,7 @@ async function main() {
 
   if (integrationResults.every(Boolean)) {
     console.log('\n✨ ALL TESTS PASSED!');
-    return;
+    process.exit(0);
   }
   console.error('\n🚨 INTEGRATION TESTS FAILED!');
   process.exit(1);

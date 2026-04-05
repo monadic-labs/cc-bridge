@@ -1,8 +1,8 @@
 export const DEFAULT_RAW_CONFIG = {
   port: 9099,
   daemon: {
-    healthCheckTimeout: 500,
-    pollInterval: 300,
+    healthCheckTimeoutMs: 500,
+    pollIntervalMs: 300,
     pollMaxAttempts: 10,
   },
   logging: {
@@ -51,6 +51,19 @@ function deepMerge(target, source) {
 
 export function ensureCompleteConfig(existingRaw) {
   const merged = JSON.parse(JSON.stringify(existingRaw || {}));
+  
+  // Migrate legacy daemon properties
+  if (merged.daemon) {
+    if (merged.daemon.healthCheckTimeout !== undefined) {
+      merged.daemon.healthCheckTimeoutMs = merged.daemon.healthCheckTimeout;
+      delete merged.daemon.healthCheckTimeout;
+    }
+    if (merged.daemon.pollInterval !== undefined) {
+      merged.daemon.pollIntervalMs = merged.daemon.pollInterval;
+      delete merged.daemon.pollInterval;
+    }
+  }
+
   deepMerge(merged, DEFAULT_RAW_CONFIG);
   return merged;
 }

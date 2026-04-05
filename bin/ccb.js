@@ -108,7 +108,6 @@ function runProxyDaemon() {
   const config = loadDaemonConfig();
   const core = createProxyCore({ configDir: USER_CONFIG_DIR, port: config.port });
   core.initProviders();
-  core._appendPid();
 
   core.emit(`CC-Bridge proxy daemon started on http://localhost:${config.port}`);
   core.emit(`Logs directory: ${LOGS_DIR}`);
@@ -122,7 +121,7 @@ function checkProxy(config) {
   return new Promise((resolve) => {
     const req = http.get(`http://localhost:${config.port}/v1/models`, () => resolve(true));
     req.on('error', () => resolve(false));
-    req.setTimeout(config.healthCheckTimeout, () => { req.destroy(); resolve(false); });
+    req.setTimeout(config.healthCheckTimeoutMs, () => { req.destroy(); resolve(false); });
   });
 }
 
@@ -131,10 +130,10 @@ function sleep(ms) {
 }
 
 async function pollUntilReady(config) {
-  const { pollMaxAttempts, pollInterval } = config;
+  const { pollMaxAttempts, pollIntervalMs } = config;
   for (let attempt = 0; attempt < pollMaxAttempts; attempt++) {
     if (await checkProxy(config)) return true;
-    if (attempt < pollMaxAttempts - 1) await sleep(pollInterval);
+    if (attempt < pollMaxAttempts - 1) await sleep(pollIntervalMs);
   }
   return false;
 }
@@ -205,9 +204,16 @@ async function main() {
   const spawnCmd = cli.isNode ? process.execPath : cli.cmd;
   const spawnArgs = cli.isNode ? [cli.cmd, ...args] : args;
 
+  const keepaliveReq = http.get(`http://localhost:${config.port}/__ccb_internal__/keepalive`);
+  keepaliveReq.on('error', () => { /* Ignore errors, if it dies it dies */ });
+
   const child = spawn(spawnCmd, spawnArgs, { stdio: 'inherit', env, shell: false });
-  child.on('exit', (code) => process.exit(code ?? 0));
+  child.on('exit', (code) => {
+    keepaliveReq.destroy();
+    process.exit(code ?? 0);
+  });
   child.on('error', (err) => {
+    keepaliveReq.destroy();
     process.stderr.write(`ccb: failed to launch claude: ${err.message}\n`);
     process.exit(1);
   });
@@ -220,7 +226,7 @@ const CCB_CMDS = {
     process.exit(0);
   },
   '--x-killall': () => {
-    runKill({ logsDir: LOGS_DIR, target: undefined, port: loadDaemonConfig().port });
+    runKill();
     process.exit(0);
   },
   '--x-restartall': () => {

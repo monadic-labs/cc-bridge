@@ -14,6 +14,13 @@ export class ProxyError extends Error {
   get operation() { return this.#operation; }
   get requestId() { return this.#requestId; }
   get context() { return Object.freeze({ ...this.#context }); }
+
+  toResponsePayload() {
+    return JSON.stringify({
+      type: 'error',
+      error: { type: 'invalid_request_error', message: this.message }
+    });
+  }
 }
 
 export class ConfigError extends ProxyError {
