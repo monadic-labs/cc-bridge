@@ -17,12 +17,10 @@ export const DEFAULT_RAW_CONFIG = {
 export const DEFAULT_RAW_PROVIDERS = {
   providers: [
     {
-      id: "zai",
-      url: "https://api.z.ai/api/anthropic",
+      id: "custom-gateway",
+      url: "https://api.example-gateway.internal/v1",
       models: {
-        "glm-4.7": "glm-4.7",
-        "glm-5": "glm-5",
-        "glm-5.1": "glm-5.1"
+        "custom-model": "actual-model-name"
       },
       anthropicCompliant: false
     }

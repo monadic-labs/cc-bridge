@@ -45,7 +45,7 @@ function main() {
 
   if (!fs.existsSync(ENV_PATH)) {
     console.log(`Initializing empty .env file...`);
-    fs.writeFileSync(ENV_PATH, '# Add your API keys here\n# ZAI_KEY=your_key_here\n');
+    fs.writeFileSync(ENV_PATH, '# Add your API keys here\n# CUSTOM_GATEWAY_KEY=your_key_here\n');
   }
 
   console.log('✨ CC-Bridge user directory is ready.');

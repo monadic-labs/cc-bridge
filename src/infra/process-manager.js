@@ -64,8 +64,7 @@ export async function runKill() {
 
   let procs = getProcesses();
 
-  // Find all ccb processes (excluding the current one)
-  const ccbProcs = procs.filter(p => 
+  const ccbProcs = procs.filter(p =>
     p.pid !== currentPid && 
     (p.cmd.includes('bin/ccb.js') || p.cmd.includes('bin\\ccb.js') || /\bccb(\.js|\.cmd)?\b/.test(p.cmd))
   );
@@ -82,21 +81,17 @@ export async function runKill() {
     await sleep(5000);
   }
 
-  // Rescan for survivors
   procs = getProcesses();
-  
-  // CCB survivors
+
   const survivingCcb = procs.filter(p => ccbPids.has(p.pid));
-  
-  // Claude children of survivors or orphaned survivors
-  const survivingClaude = procs.filter(p => 
+
+  const survivingClaude = procs.filter(p =>
     p.pid !== currentPid && 
     p.cmd.includes('claude') && 
     ccbPids.has(p.ppid)
   );
   
   let killed = 0;
-  // Force kill remaining clients
   for (const p of [...survivingClaude, ...survivingCcb]) {
     if (forceKill(p.pid)) {
       console.log(`Forcefully killed persistent process ${p.pid} (${p.cmd.substring(0, 50)}...)`);
