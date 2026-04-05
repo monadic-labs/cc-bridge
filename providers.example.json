@@ -1,0 +1,22 @@
+{
+  "providers": [
+    {
+      "url": "https://api.z.ai/api/anthropic",
+      "apiKey": "ENV:ZAI_KEY",
+      "models": {
+        "glm-4.7": "glm-4.7",
+        "glm-5.1": "glm-5.1"
+      },
+      "anthropicCompliant": false
+    },
+    {
+      "url": "https://my-anthropic-mirror.example.com/v1",
+      "apiKey": "sk-your-key-here",
+      "models": {
+        "mirror-sonnet": "claude-sonnet-4-6",
+        "mirror-opus": "claude-opus-4-6"
+      },
+      "anthropicCompliant": true
+    }
+  ]
+}

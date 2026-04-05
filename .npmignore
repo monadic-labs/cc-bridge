@@ -1,0 +1,15 @@
+logs/
+.env
+providers.json
+config.json
+.vscode/
+scripts/restart.js
+scripts/kill.js
+src/test.js
+implementation_plan.md
+REFACTORING_PLAN.md
+*.err
+*.log
+node_modules/
+.git/
+.gitignore
