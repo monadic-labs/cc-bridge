@@ -1,22 +1,21 @@
 {
   "providers": [
     {
-      "url": "https://api.z.ai/api/anthropic",
-      "apiKey": "ENV:ZAI_KEY",
+      "id": "corp-gateway",
+      "url": "https://api.internal-enterprise.com/v1/anthropic-mirror",
       "models": {
-        "glm-4.7": "glm-4.7",
-        "glm-5.1": "glm-5.1"
-      },
-      "anthropicCompliant": false
-    },
-    {
-      "url": "https://my-anthropic-mirror.example.com/v1",
-      "apiKey": "sk-your-key-here",
-      "models": {
-        "mirror-sonnet": "claude-sonnet-4-6",
-        "mirror-opus": "claude-opus-4-6"
+        "sonnet-internal": "claude-sonnet-4-6",
+        "opus-internal": "claude-opus-4-6"
       },
       "anthropicCompliant": true
+    },
+    {
+      "id": "local-dev",
+      "url": "http://localhost:11434/v1",
+      "models": {
+        "offline-model": "llama3.2"
+      },
+      "anthropicCompliant": false
     }
   ]
 }
