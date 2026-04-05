@@ -14,7 +14,7 @@ const CCB_BIN = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'b
 
 console.log(`Restarting CC-Bridge on port ${PORT}...`);
 
-runKill({ logsDir: LOGS_DIR, target: undefined, port: PORT });
+runKill();
 
 let attempts = 0;
 const isWin = process.platform === 'win32';

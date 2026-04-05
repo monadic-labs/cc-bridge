@@ -9,7 +9,7 @@ import { ProvidersMap, ProviderConfig } from './core/providers.js';
 import { RequestInfo, RequestSummary, Result, Option, ProxyRequestContext, ProxyResponseContext } from './core/types.js';
 import { ProxyError } from './core/exceptions.js';
 import { copyRequestHeaders, filterResponseHeaders, redactHeaders, ANTHROPIC_HOST } from './core/headers.js';
-import { applyRouting, applyAuthHeaders, extractSessionId } from './core/routing.js';
+import { applyRouting, applyAuthHeaders, extractSessionId, tryParseBody } from './core/routing.js';
 import { parseSseMetadata } from './core/sse-parser.js';
 import { Logger } from './infra/logger.js';
 import { ErrorReporter } from './infra/error-reporter.js';
@@ -57,34 +57,21 @@ function tryParseProviders(data, filepath) {
   }
 }
 
-function tryParseBody(rawBody) {
-  if (rawBody.length === 0) return Option.none();
-  try { return Option.some(JSON.parse(rawBody.toString())); }
-  catch { return Option.none(); }
-}
 
-function buildErrorResponse(res, message) {
-  const payload = JSON.stringify({
-    type: 'error',
-    error: { type: 'invalid_request_error', message }
-  });
+function buildErrorResponse(res, error) {
   if (res.headersSent) return;
+  const payload = typeof error.toResponsePayload === 'function' 
+    ? error.toResponsePayload() 
+    : JSON.stringify({
+        type: 'error',
+        error: { type: 'invalid_request_error', message: error.message || String(error) }
+      });
   res.writeHead(400, {
     'content-type': 'application/json',
     'content-length': Buffer.byteLength(payload),
     'connection': 'close'
   });
   res.end(payload);
-}
-
-function appendPid(pidsFile) {
-  if (!fs.existsSync(pidsFile)) {
-    fs.writeFileSync(pidsFile, process.pid + '\n', 'utf8');
-    return;
-  }
-  const existing = fs.readFileSync(pidsFile, 'utf8').split('\n').filter(Boolean).map(Number);
-  if (existing.includes(process.pid)) return;
-  fs.appendFileSync(pidsFile, process.pid + '\n', 'utf8');
 }
 
 export function createProxyCore({ configDir, port }) {
@@ -98,6 +85,8 @@ export function createProxyCore({ configDir, port }) {
   const errorReporter = new ErrorReporter({ logsDir });
 
   let shellState = new ProxyState(0, new ProvidersMap([]));
+  let activeKeepalives = 0;
+  let hasReceivedKeepalive = false;
 
   function getConfig() {
     try {
@@ -204,7 +193,7 @@ export function createProxyCore({ configDir, port }) {
       activeCtx = await processRequestBody(activeCtx, bodyOpt.value);
     } catch (e) {
       errorReporter.write(e, { requestId: activeCtx.id, method: activeCtx.req.method, url: activeCtx.req.url, headers: activeCtx.req.headers, sessionId: activeCtx.sessionId });
-      buildErrorResponse(activeCtx.res, e.message);
+      buildErrorResponse(activeCtx.res, e);
       return;
     }
 
@@ -304,6 +293,24 @@ export function createProxyCore({ configDir, port }) {
 
   function createRequestHandler() {
     return (req, res) => {
+      if (req.method === 'GET' && req.url === '/__ccb_internal__/keepalive') {
+        hasReceivedKeepalive = true;
+        activeKeepalives++;
+        
+        const cleanup = () => {
+          activeKeepalives--;
+          if (activeKeepalives === 0 && hasReceivedKeepalive) {
+            emit('All keepalives closed, shutting down proxy daemon.').then(() => {
+              process.exit(0);
+            });
+          }
+        };
+        
+        req.on('close', cleanup);
+        // Do not call res.end() - keep the connection hanging open
+        return;
+      }
+      
       if (req.method === 'GET' && req.url === '/v1/models') {
         const models = shellState.providers.allAliases.map((alias) => ({
           id: alias,
@@ -332,6 +339,5 @@ export function createProxyCore({ configDir, port }) {
     emit,
     logsDir,
     port: currentPort,
-    _appendPid: () => appendPid(path.join(logsDir, 'proxy.pids')),
   };
 }

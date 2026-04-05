@@ -143,3 +143,9 @@ export function extractSessionId(body) {
   }
   return body?.metadata?.session_id ?? body?.session_id ?? '';
 }
+
+export function tryParseBody(rawBody) {
+  if (!rawBody || rawBody.length === 0) return Option.none();
+  try { return Option.some(JSON.parse(rawBody.toString())); }
+  catch { return Option.none(); }
+}
