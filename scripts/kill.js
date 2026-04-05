@@ -9,4 +9,4 @@ const config = loadConfigFromFile(USER_CONFIG_DIR);
 const PORT = config.port;
 
 const args = process.argv.slice(2);
-runKill();
+await runKill();

@@ -34,9 +34,21 @@ function getProcesses() {
   }
 }
 
-export function runKill() {
+export async function runKill() {
   const isWin = process.platform === 'win32';
   const currentPid = process.pid;
+
+  async function signalGraceful(pid) {
+    try {
+      // Signal twice as requested for Claude Code to catch it
+      process.kill(pid, 'SIGINT');
+      await sleep(200);
+      try { process.kill(pid, 'SIGINT'); } catch {}
+      return true;
+    } catch {
+      return false;
+    }
+  }
 
   function forceKill(pid) {
     try {
@@ -48,34 +60,52 @@ export function runKill() {
     }
   }
 
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
   let procs = getProcesses();
 
   // Find all ccb processes (excluding the current one)
   const ccbProcs = procs.filter(p => 
     p.pid !== currentPid && 
-    (p.cmd.includes('bin/ccb.js') || p.cmd.includes('bin\\ccb.js') || /\\bccb(\.js|\.cmd)?\\b/.test(p.cmd))
+    (p.cmd.includes('bin/ccb.js') || p.cmd.includes('bin\\ccb.js') || /\bccb(\.js|\.cmd)?\b/.test(p.cmd))
   );
   
   const ccbPids = new Set(ccbProcs.map(p => p.pid));
   
-  // Find claude children of those ccb processes
-  const claudeProcs = procs.filter(p => 
+  if (ccbProcs.length > 0) {
+    console.log(`Sending graceful shutdown signals to ${ccbProcs.length} CCB session(s)...`);
+    for (const p of ccbProcs) {
+      await signalGraceful(p.pid);
+    }
+    
+    console.log('Waiting 5 seconds for sessions to save and exit...');
+    await sleep(5000);
+  }
+
+  // Rescan for survivors
+  procs = getProcesses();
+  
+  // CCB survivors
+  const survivingCcb = procs.filter(p => ccbPids.has(p.pid));
+  
+  // Claude children of survivors or orphaned survivors
+  const survivingClaude = procs.filter(p => 
     p.pid !== currentPid && 
     p.cmd.includes('claude') && 
     ccbPids.has(p.ppid)
   );
   
   let killed = 0;
-  // Kill children first, then parents
-  for (const p of [...claudeProcs, ...ccbProcs]) {
+  // Force kill remaining clients
+  for (const p of [...survivingClaude, ...survivingCcb]) {
     if (forceKill(p.pid)) {
-      console.log(`Killed process ${p.pid} (${p.cmd.substring(0, 50)}...)`);
+      console.log(`Forcefully killed persistent process ${p.pid} (${p.cmd.substring(0, 50)}...)`);
       killed++;
     }
   }
 
-  if (killed === 0) {
-    console.log('No active ccb or claude processes found.');
+  if (killed === 0 && ccbProcs.length > 0) {
+    console.log('All CCB sessions exited gracefully.');
   }
 
   // Rescan for daemons that might be hanging
@@ -93,7 +123,7 @@ export function runKill() {
     }
   }
 
-  if (killed === 0) {
+  if (killed === 0 && daemonProcs.length === 0) {
     console.log('No dangling proxy daemons found.');
   }
 }
