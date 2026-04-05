@@ -1,5 +1,10 @@
 import { ArgumentError } from './exceptions.js';
 
+export function providerIdToEnvKey(providerId) {
+  if (typeof providerId !== 'string' || !providerId) return '';
+  return `${providerId.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_KEY`;
+}
+
 export function normalizeModelsToObject(models) {
   if (Array.isArray(models)) {
     return Object.freeze(Object.fromEntries(models.map((m) => [m, m])));

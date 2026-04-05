@@ -1,5 +1,6 @@
 import { Result } from './types.js';
 import { ArgumentError } from './exceptions.js';
+import { providerIdToEnvKey } from './providers.js';
 
 export function findProviderIndex(providers, identifier) {
   if (typeof identifier !== 'string' || !identifier) return -1;
@@ -16,7 +17,7 @@ export function obfuscateKey(key) {
 
 export function listApiKeys(rawProviders, reveal = false) {
   return rawProviders.map((p) => {
-    const envVar = `${p.id.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_KEY`;
+    const envVar = providerIdToEnvKey(p.id);
     const val = process.env[envVar] || '';
     return {
       id: p.id,

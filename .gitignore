@@ -1,8 +1,10 @@
 CODE_MAP.json
 node_modules/
-logs/*
+logs/
 proxy.log
+*.err
 .env
 config.json
 test_output.txt
 providers.json
+.test-config/

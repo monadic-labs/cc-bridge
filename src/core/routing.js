@@ -2,17 +2,6 @@ import { ANTHROPIC_HOST } from './headers.js';
 import { RoutingResult, Option, Result } from './types.js';
 import { ConfigurationMissingException } from './exceptions.js';
 
-export function resolveApiKey(apiKey) {
-  if (typeof apiKey !== 'string' || !apiKey) return '';
-  if (!apiKey.startsWith('ENV:')) return apiKey;
-  const envKey = apiKey.slice(4);
-  const val = process.env[envKey];
-  if (val === undefined || val === null || val === '') {
-    throw new ConfigurationMissingException(`Missing environment variable: ${envKey}`, { context: { envKey } });
-  }
-  return val;
-}
-
 function processThinkingBlock(block) {
   if (typeof block !== 'object' || block === null) return block;
   if (block.type !== 'thinking') return block;
@@ -104,24 +93,20 @@ export function applyRouting(body, providersMap) {
   return routeToProvider(body, match);
 }
 
-export function applyAuthHeaders(headers, match, env = process.env) {
+export function applyAuthHeaders({ headers, match, apiKey = '' }) {
   if (!match) return { ...headers };
   const { provider } = match;
   const { authorization: _, 'anthropic-beta': beta, ...rest } = headers;
-  
+
   const updated = { ...rest };
-  if (provider.id) {
-    const envVar = `${provider.id.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_KEY`;
-    const val = env[envVar];
-    if (val !== undefined && val !== null && val !== '') {
-      updated['x-api-key'] = val;
-    }
+  if (provider.id && apiKey) {
+    updated['x-api-key'] = apiKey;
   }
 
   if (provider.anthropicCompliant && beta !== undefined) {
     updated['anthropic-beta'] = beta;
   }
-  
+
   return updated;
 }
 
