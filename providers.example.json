@@ -1,11 +1,11 @@
 {
   "providers": [
     {
-      "id": "corp-gateway",
-      "url": "https://api.internal-enterprise.com/v1/anthropic-mirror",
+      "id": "my-mirror",
+      "url": "https://api.anthropic-mirror.example.com/v1",
       "models": {
-        "sonnet-internal": "claude-sonnet-4-6",
-        "opus-internal": "claude-opus-4-6"
+        "my-sonnet": "claude-sonnet-4-6",
+        "my-opus": "claude-opus-4-6"
       },
       "anthropicCompliant": true
     },
