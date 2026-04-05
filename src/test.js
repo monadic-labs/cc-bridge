@@ -43,6 +43,17 @@ async function runUnitTests() {
   const { applyRouting, applyAuthHeaders, extractSessionId, stripSignatures, cleanForNonCompliant } = await import('../src/core/routing.js');
   const { Result, Option, RequestInfo, RequestSummary, RoutingResult } = await import('../src/core/types.js');
   const { ProvidersMap, ProviderConfig, ProviderMatch } = await import('../src/core/providers.js');
+
+  // ── providerIdToEnvKey ──
+  console.log('\nproviderIdToEnvKey:');
+  const { providerIdToEnvKey } = await import('../src/core/providers.js');
+  assert(providerIdToEnvKey('zai') === 'ZAI_KEY', 'simple id');
+  assert(providerIdToEnvKey('my-provider') === 'MY_PROVIDER_KEY', 'hyphenated id');
+  assert(providerIdToEnvKey('z_ai') === 'Z_AI_KEY', 'underscored id');
+  assert(providerIdToEnvKey('z-ai') === 'Z_AI_KEY', 'hyphen normalizes to underscore');
+  assert(providerIdToEnvKey('') === '', 'empty string returns empty');
+  assert(providerIdToEnvKey(null) === '', 'null returns empty');
+  assert(providerIdToEnvKey(undefined) === '', 'undefined returns empty');
   const { ResultAccessError, ArgumentError, ConfigError } = await import('../src/core/exceptions.js');
   const { parseSseMetadata } = await import('../src/core/sse-parser.js');
   const { ProxyConfig } = await import('../src/core/config.js');
@@ -123,20 +134,20 @@ async function runUnitTests() {
 
   // ── applyAuthHeaders ──
   console.log('\napplyAuthHeaders:');
-  const headersNoMatch = applyAuthHeaders({ authorization: 'Bearer token', 'x-api-key': 'old' }, null);
+  const headersNoMatch = applyAuthHeaders({ headers: { authorization: 'Bearer token', 'x-api-key': 'old' }, match: null });
   assert(headersNoMatch['x-api-key'] === 'old', 'no match preserves headers');
   assert(headersNoMatch.authorization === 'Bearer token', 'no match preserves auth');
 
   const matchGlm = pmap.resolve('glm');
-  const headersMatch = applyAuthHeaders({ authorization: 'Bearer token', 'anthropic-beta': 'b1' }, matchGlm, { P1_KEY: 'key-p1' });
+  const headersMatch = applyAuthHeaders({ headers: { authorization: 'Bearer token', 'anthropic-beta': 'b1' }, match: matchGlm, apiKey: 'key-p1' });
   assert(headersMatch.authorization === undefined, 'match strips authorization');
-  assert(headersMatch['x-api-key'] === 'key-p1', 'match injects x-api-key from ID-based env');
+  assert(headersMatch['x-api-key'] === 'key-p1', 'match injects x-api-key from apiKey');
   assert(headersMatch['anthropic-beta'] === undefined, 'non-compliant strips anthropic-beta');
 
   const matchLocal = pmap.resolve('local-model');
-  const headersCompliant = applyAuthHeaders({ authorization: 'Bearer tok', 'anthropic-beta': 'b1' }, matchLocal, {});
+  const headersCompliant = applyAuthHeaders({ headers: { authorization: 'Bearer tok', 'anthropic-beta': 'b1' }, match: matchLocal, apiKey: '' });
   assert(headersCompliant['anthropic-beta'] === 'b1', 'compliant preserves anthropic-beta');
-  assert(headersCompliant['x-api-key'] === undefined, 'missing env var results in no x-api-key');
+  assert(headersCompliant['x-api-key'] === undefined, 'empty apiKey results in no x-api-key');
 
   // ── stripSignatures ──
   console.log('\nstripSignatures:');
@@ -512,8 +523,31 @@ async function runIntegrationTests() {
   let cliSuccess = true;
   let providers;
 
+  const assertCli = (res, expectedStatus, expectedStdout, expectedStderr, label) => {
+    let ok = res.status === expectedStatus;
+    if (ok && expectedStdout) ok = (res.stdout || '').includes(expectedStdout);
+    if (ok && expectedStderr) ok = (res.stderr || '').includes(expectedStderr);
+    if (ok) {
+      console.log(`  ✅ ${label} passed`);
+    } else {
+      console.error(`  ❌ ${label} failed (status: ${res.status}, out: ${res.stdout?.trim()}, err: ${res.stderr?.trim()})`);
+      cliSuccess = false;
+    }
+  };
+
+  // Test --x-help
+  console.log('  Testing --x-help...');
+  assertCli(runCcb(['--x-help']), 0, 'CCB (Claude Code Bridge) Management Commands', null, '--x-help');
+
+  // Test --x-init
+  console.log('  Testing --x-init...');
+  assertCli(runCcb(['--x-init']), 0, null, null, '--x-init');
+
   // Test --x-provider
-  console.log('  Testing --x-provider add/remove...');
+  console.log('  Testing --x-provider add/remove/exceptions...');
+  assertCli(runCcb(['--x-provider', 'add']), 1, null, 'Usage:', '--x-provider add missing args');
+  assertCli(runCcb(['--x-provider', 'remove']), 1, null, 'Usage:', '--x-provider remove missing args');
+
   const addRes = runCcb(['--x-provider', 'add', 'new-p', 'http://new.com', '--non-compliant']);
   if (addRes.status !== 0) console.error('    Error output:', addRes.stderr);
   providers = JSON.parse(fs.readFileSync(path.join(TEST_CONFIG_DIR, 'providers.json'), 'utf8'));
@@ -524,6 +558,8 @@ async function runIntegrationTests() {
     console.error('  ❌ --x-provider add failed');
     cliSuccess = false;
   }
+
+  assertCli(runCcb(['--x-provider', 'add', 'new-p', 'http://new2.com']), 1, null, 'Error:', '--x-provider add duplicate id');
 
   runCcb(['--x-provider', 'remove', 'new-p']);
   providers = JSON.parse(fs.readFileSync(path.join(TEST_CONFIG_DIR, 'providers.json'), 'utf8'));
@@ -536,7 +572,11 @@ async function runIntegrationTests() {
   }
 
   // Test --x-model
-  console.log('  Testing --x-model add/remove...');
+  console.log('  Testing --x-model add/remove/list/providers/tree/exceptions...');
+  assertCli(runCcb(['--x-model', 'add']), 1, null, 'Usage:', '--x-model add missing args');
+  assertCli(runCcb(['--x-model', 'remove']), 1, null, 'Usage:', '--x-model remove missing args');
+  assertCli(runCcb(['--x-model', 'list']), 1, null, 'Usage:', '--x-model list missing args');
+
   runCcb(['--x-model', 'add', 'test-alias', 'test-real', 'provider', 'zai']);
   providers = JSON.parse(fs.readFileSync(path.join(TEST_CONFIG_DIR, 'providers.json'), 'utf8'));
   let zai = providers.providers.find(p => p.id === 'zai');
@@ -546,6 +586,11 @@ async function runIntegrationTests() {
     console.error('  ❌ --x-model add failed');
     cliSuccess = false;
   }
+
+  assertCli(runCcb(['--x-model', 'list', 'zai']), 0, 'glm-4.7', null, '--x-model list');
+  assertCli(runCcb(['--x-model', 'list', 'nonexistent']), 1, null, 'Error:', '--x-model list nonexistent');
+  assertCli(runCcb(['--x-model', 'providers']), 0, 'https://api.z.ai/api/anthropic', null, '--x-model providers');
+  assertCli(runCcb(['--x-model', 'tree']), 0, 'api.z.ai', null, '--x-model tree');
 
   runCcb(['--x-model', 'remove', 'test-alias', 'provider', 'zai']);
   providers = JSON.parse(fs.readFileSync(path.join(TEST_CONFIG_DIR, 'providers.json'), 'utf8'));
@@ -558,7 +603,12 @@ async function runIntegrationTests() {
   }
 
   // Test --x-key
-  console.log('  Testing --x-key set/remove/prune...');
+  console.log('  Testing --x-key set/remove/list/prune/exceptions...');
+  assertCli(runCcb(['--x-key', 'set']), 1, null, 'Usage:', '--x-key set missing args');
+  assertCli(runCcb(['--x-key', 'remove']), 1, null, 'Usage:', '--x-key remove missing args');
+
+  assertCli(runCcb(['--x-key', 'list']), 0, '[zai]', null, '--x-key list');
+  assertCli(runCcb(['--x-key', 'list', '--reveal']), 0, '[zai]', null, '--x-key list --reveal');
 
   runCcb(['--x-key', 'set', 'zai', 'sk-test-key']);
   let envContent = fs.readFileSync(path.join(TEST_CONFIG_DIR, '.env'), 'utf8');

@@ -11,12 +11,32 @@ import { loadConfigFromFile, resolveUserConfigDir } from '../src/core/config.js'
 import { addModel, removeModel, listModels, listProviders, formatTree, findProviderIndex, addProvider, removeProvider } from '../src/core/model-manager.js';
 import { listApiKeys, obfuscateKey } from '../src/core/key-manager.js';
 import { ensureCompleteConfig, ensureCompleteProviders } from '../src/core/migrator.js';
+import { providerIdToEnvKey } from '../src/core/providers.js';
 
 const PROXY_FLAG = '--__cc-proxy-daemon__';
 
 const USER_CONFIG_DIR = resolveUserConfigDir();
 const LOGS_DIR = path.join(USER_CONFIG_DIR, 'logs');
 const providersPath = path.join(USER_CONFIG_DIR, 'providers.json');
+
+function readJsonFile(filePath) {
+  if (!fs.existsSync(filePath)) return null;
+  try { return JSON.parse(fs.readFileSync(filePath, 'utf8')); }
+  catch { console.warn(`Warning: Could not parse ${path.basename(filePath)}. Preserving it and starting fresh.`); return null; }
+}
+
+function writeJsonIfNeeded(filePath, newJson) {
+  if (!fs.existsSync(filePath)) {
+    fs.writeFileSync(filePath, newJson, 'utf8');
+    return `Created: ${filePath}`;
+  }
+  const existingRaw = fs.readFileSync(filePath, 'utf8').trim();
+  if (existingRaw !== newJson.trim()) {
+    fs.writeFileSync(filePath, newJson, 'utf8');
+    return `Updated: ${filePath}`;
+  }
+  return `No changes needed for: ${filePath}`;
+}
 
 function init() {
   if (!fs.existsSync(USER_CONFIG_DIR)) fs.mkdirSync(USER_CONFIG_DIR, { recursive: true });
@@ -26,62 +46,14 @@ function init() {
   const examplePath = path.join(pkgRoot, 'providers.example.json');
   const configPath = path.join(USER_CONFIG_DIR, 'config.json');
 
-  let providersData = {};
-  let providersExisted = fs.existsSync(providersPath);
-  if (providersExisted) {
-    try {
-      providersData = JSON.parse(fs.readFileSync(providersPath, 'utf8'));
-    } catch (e) {
-      console.warn(`Warning: Could not parse existing providers.json. Preserving it and starting fresh.`);
-    }
-  } else if (fs.existsSync(examplePath)) {
-    try {
-      providersData = JSON.parse(fs.readFileSync(examplePath, 'utf8'));
-    } catch (e) {}
-  }
-  
+  const providersData = readJsonFile(providersPath) ?? readJsonFile(examplePath) ?? {};
   const mergedProviders = ensureCompleteProviders(providersData);
   validateIds(mergedProviders.providers);
-  const providersJson = JSON.stringify(mergedProviders, null, 2);
-  
-  if (!providersExisted) {
-    fs.writeFileSync(providersPath, providersJson, 'utf8');
-    process.stdout.write(`Created: ${providersPath}\n`);
-  } else {
-    const existingRaw = fs.readFileSync(providersPath, 'utf8').trim();
-    if (existingRaw !== providersJson.trim()) {
-      fs.writeFileSync(providersPath, providersJson, 'utf8');
-      process.stdout.write(`Updated: ${providersPath}\n`);
-    } else {
-      process.stdout.write(`No changes needed for: ${providersPath}\n`);
-    }
-  }
+  process.stdout.write(writeJsonIfNeeded(providersPath, JSON.stringify(mergedProviders, null, 2)) + '\n');
 
-  let configData = {};
-  let configExisted = fs.existsSync(configPath);
-  if (configExisted) {
-    try {
-      configData = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-    } catch (e) {
-      console.warn(`Warning: Could not parse existing config.json. Preserving it and starting fresh.`);
-    }
-  }
-  
+  const configData = readJsonFile(configPath) ?? {};
   const mergedConfig = ensureCompleteConfig(configData);
-  const configJson = JSON.stringify(mergedConfig, null, 2);
-  
-  if (!configExisted) {
-    fs.writeFileSync(configPath, configJson, 'utf8');
-    process.stdout.write(`Created: ${configPath}\n`);
-  } else {
-    const existingRaw = fs.readFileSync(configPath, 'utf8').trim();
-    if (existingRaw !== configJson.trim()) {
-      fs.writeFileSync(configPath, configJson, 'utf8');
-      process.stdout.write(`Updated: ${configPath}\n`);
-    } else {
-      process.stdout.write(`No changes needed for: ${configPath}\n`);
-    }
-  }
+  process.stdout.write(writeJsonIfNeeded(configPath, JSON.stringify(mergedConfig, null, 2)) + '\n');
 }
 
 function ensureDaemonConfig() {
@@ -326,7 +298,7 @@ export function validateIds(providers) {
       throw new ConfigError(`Duplicate provider ID: "${p.id}" in providers.json`);
     }
     
-    const envKey = `${p.id.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_KEY`;
+    const envKey = providerIdToEnvKey(p.id);
     if (envKeys.has(envKey)) {
       throw new ConfigError(`Provider ID collision: "${p.id}" maps to same environment variable "${envKey}" as another provider.`);
     }
@@ -393,7 +365,7 @@ function handleKeyCommand() {
 
 function handleKeyPrune() {
   const data = readProvidersJson();
-  const validEnvKeys = new Set(data.providers.map(p => `${p.id.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_KEY`));
+  const validEnvKeys = new Set(data.providers.map(p => providerIdToEnvKey(p.id)));
   
   const envPath = path.join(USER_CONFIG_DIR, '.env');
   if (!fs.existsSync(envPath)) {
@@ -435,10 +407,7 @@ function handleKeyPrune() {
 
 function updateEnvFile(key, value) {
   const envPath = path.join(USER_CONFIG_DIR, '.env');
-  let content = '';
-  if (fs.existsSync(envPath)) {
-    content = fs.readFileSync(envPath, 'utf8');
-  }
+  const content = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
 
   const lines = content.split('\n');
   let found = false;
@@ -474,7 +443,7 @@ function handleKeySet(args) {
   }
 
   const provider = data.providers[idx];
-  const envVar = `${provider.id.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_KEY`;
+  const envVar = providerIdToEnvKey(provider.id);
   updateEnvFile(envVar, apiKey);
   console.log(`Updated environment variable ${envVar} in .env for provider "${provider.id}"`);
 }
@@ -494,7 +463,7 @@ function handleKeyRemove(args) {
   }
 
   const provider = data.providers[idx];
-  const envVar = `${provider.id.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_KEY`;
+  const envVar = providerIdToEnvKey(provider.id);
   updateEnvFile(envVar, '');
   console.log(`Cleared environment variable ${envVar} in .env for provider "${provider.id}"`);
 }
@@ -507,7 +476,7 @@ function handleKeyList(args) {
     return;
   }
   for (const p of data.providers) {
-    const envVar = `${p.id.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_KEY`;
+    const envVar = providerIdToEnvKey(p.id);
     const val = process.env[envVar] || '';
     const keyDisplay = reveal ? (val || '(none)') : obfuscateKey(val);
     console.log(`[${p.id}] ${p.url}  ${keyDisplay} (env: ${envVar})`);
@@ -617,7 +586,7 @@ function handleTree() {
 }
 
 async function entry() {
-  loadEnv(path.join(USER_CONFIG_DIR, '.env'));
+  Object.assign(process.env, loadEnv(path.join(USER_CONFIG_DIR, '.env')));
   
   if (process.argv.includes(PROXY_FLAG)) {
     runProxyDaemon();

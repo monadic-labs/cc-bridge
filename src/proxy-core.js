@@ -10,6 +10,7 @@ import { RequestInfo, RequestSummary, Result, Option, ProxyRequestContext, Proxy
 import { ProxyError } from './core/exceptions.js';
 import { copyRequestHeaders, filterResponseHeaders, redactHeaders, ANTHROPIC_HOST } from './core/headers.js';
 import { applyRouting, applyAuthHeaders, extractSessionId, tryParseBody } from './core/routing.js';
+import { providerIdToEnvKey } from './core/providers.js';
 import { parseSseMetadata } from './core/sse-parser.js';
 import { Logger } from './infra/logger.js';
 import { ErrorReporter } from './infra/error-reporter.js';
@@ -34,13 +35,17 @@ class ProxyState {
   withProviders(providers) { return new ProxyState(this.#reqCount, providers); }
 }
 
-export function loadEnv(envPath, envSource = process.env) {
-  if (!fs.existsSync(envPath)) return;
+export function loadEnv(envPath) {
+  if (!fs.existsSync(envPath)) return Object.freeze({});
   const env = fs.readFileSync(envPath, 'utf8');
+  const result = {};
   for (const line of env.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
     const [key, ...valueParts] = line.split('=');
-    if (key && valueParts.length > 0) envSource[key.trim()] = valueParts.join('=').trim();
+    if (key && valueParts.length > 0) result[key.trim()] = valueParts.join('=').trim();
   }
+  return Object.freeze(result);
 }
 
 function tryParseProviders(data, filepath) {
@@ -79,7 +84,7 @@ export function createProxyCore({ configDir, port }) {
   const providersPath = path.join(configDir, 'providers.json');
   const configPath = path.join(configDir, 'config.json');
 
-  loadEnv(path.join(configDir, '.env'));
+  Object.assign(process.env, loadEnv(path.join(configDir, '.env')));
 
   const logger = new Logger({ logsDir, defaultLog: path.join(logsDir, 'proxy.log'), maxHistory: 10 });
   const errorReporter = new ErrorReporter({ logsDir });
@@ -115,7 +120,7 @@ export function createProxyCore({ configDir, port }) {
 
   async function reloadProviders() {
     try {
-      loadEnv(path.join(configDir, '.env'));
+      Object.assign(process.env, loadEnv(path.join(configDir, '.env')));
       const data = await fs.promises.readFile(providersPath, 'utf8');
       handleProvidersReload(tryParseProviders(data));
     } catch (e) {
@@ -142,7 +147,14 @@ export function createProxyCore({ configDir, port }) {
     const sessionId = extractSessionId(body);
     const routing = applyRouting(body, activeProviders);
     const match = typeof body.model === 'string' ? activeProviders.resolve(body.model) : null;
-    const routedHeaders = applyAuthHeaders(ctx.routedHeaders, match);
+
+    let apiKey = '';
+    if (match) {
+      const envVar = providerIdToEnvKey(match.provider.id);
+      apiKey = process.env[envVar] ?? '';
+    }
+
+    const routedHeaders = applyAuthHeaders({ headers: ctx.routedHeaders, match, apiKey });
 
     return { reqModel, sessionId, routing, routedHeaders, match };
   }
