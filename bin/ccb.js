@@ -229,17 +229,11 @@ const CCB_CMDS = {
     runKill();
     process.exit(0);
   },
-  '--x-restartall': () => {
-    const restartScript = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'restart.js');
-    spawn(process.execPath, [restartScript], { stdio: 'inherit', env: process.env })
-      .on('exit', (code) => process.exit(code ?? 0));
-  },
   '--x-help': () => {
     process.stdout.write(`
 CCB (Claude Code Bridge) Management Commands:
   --x-init          Initialize the config directory (~/.claude/.ccb)
   --x-killall       Kill all background proxy processes
-  --x-restartall    Force restart the proxy daemon
   --x-model ...     Manage provider models
   --x-provider ...  Manage providers (add/remove)
   --x-key ...       Manage provider API keys
