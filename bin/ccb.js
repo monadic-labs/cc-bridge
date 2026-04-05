@@ -208,6 +208,18 @@ async function main() {
   keepaliveReq.on('error', () => { /* Ignore errors, if it dies it dies */ });
 
   const child = spawn(spawnCmd, spawnArgs, { stdio: 'inherit', env, shell: false });
+
+  let sigintCount = 0;
+  const handleSigInt = () => {
+    sigintCount++;
+    if (sigintCount >= 3) {
+      process.exit(130);
+    }
+    // Forward to child. Claude CLI might need two SIGINTs to exit gracefully.
+    try { child.kill('SIGINT'); } catch {}
+  };
+  process.on('SIGINT', handleSigInt);
+
   child.on('exit', (code) => {
     keepaliveReq.destroy();
     process.exit(code ?? 0);
@@ -225,8 +237,8 @@ const CCB_CMDS = {
     init();
     process.exit(0);
   },
-  '--x-killall': () => {
-    runKill();
+  '--x-killall': async () => {
+    await runKill();
     process.exit(0);
   },
   '--x-help': () => {
