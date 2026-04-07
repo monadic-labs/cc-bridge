@@ -64,6 +64,7 @@ export class ProxyRequestContext {
   #targetBase;
   #isCustom;
   #rawBody;
+  #sanitizationReport;
 
   constructor({ req, res, id, startTime }) {
     this.#req = req;
@@ -78,6 +79,7 @@ export class ProxyRequestContext {
     this.#targetBase = '';
     this.#isCustom = false;
     this.#rawBody = Buffer.alloc(0);
+    this.#sanitizationReport = null;
   }
 
   get req() { return this.#req; }
@@ -92,8 +94,9 @@ export class ProxyRequestContext {
   get targetBase() { return this.#targetBase; }
   get isCustom() { return this.#isCustom; }
   get rawBody() { return this.#rawBody; }
+  get sanitizationReport() { return this.#sanitizationReport; }
 
-  withRouting({ routeLabel, reqModel, sessionId, routedHeaders, forwardBody, targetBase, isCustom, rawBody }) {
+  withRouting({ routeLabel, reqModel, sessionId, routedHeaders, forwardBody, targetBase, isCustom, rawBody, sanitizationReport }) {
     const next = new ProxyRequestContext({ req: this.#req, res: this.#res, id: this.#id, startTime: this.#startTime });
     next.#routeLabel = routeLabel;
     next.#reqModel = reqModel;
@@ -103,6 +106,7 @@ export class ProxyRequestContext {
     next.#targetBase = targetBase;
     next.#isCustom = isCustom ?? false;
     next.#rawBody = rawBody ?? this.#rawBody;
+    next.#sanitizationReport = sanitizationReport ?? this.#sanitizationReport;
     return next;
   }
 }
@@ -120,8 +124,9 @@ export class ProxyResponseContext {
   #isCustom;
   #rawBody;
   #forwardBody;
+  #sanitizationReport;
 
-  constructor({ proxyRes, res, id, startTime, routeLabel, reqModel, sessionId, headers, req, isCustom, rawBody, forwardBody }) {
+  constructor({ proxyRes, res, id, startTime, routeLabel, reqModel, sessionId, headers, req, isCustom, rawBody, forwardBody, sanitizationReport }) {
     this.#proxyRes = proxyRes;
     this.#res = res;
     this.#id = id;
@@ -134,6 +139,7 @@ export class ProxyResponseContext {
     this.#isCustom = isCustom ?? false;
     this.#rawBody = rawBody ?? Buffer.alloc(0);
     this.#forwardBody = forwardBody ?? Buffer.alloc(0);
+    this.#sanitizationReport = sanitizationReport ?? null;
     Object.freeze(this);
   }
 
@@ -149,6 +155,7 @@ export class ProxyResponseContext {
   get isCustom() { return this.#isCustom; }
   get rawBody() { return this.#rawBody; }
   get forwardBody() { return this.#forwardBody; }
+  get sanitizationReport() { return this.#sanitizationReport; }
 }
 
 export class RequestInfo {
@@ -295,12 +302,14 @@ export class RoutingResult {
   #targetBase;
   #label;
   #isCustom;
+  #sanitizationReport;
 
-  constructor({ forwardBody, targetBase, label, isCustom }) {
+  constructor({ forwardBody, targetBase, label, isCustom, sanitizationReport }) {
     this.#forwardBody = forwardBody;
     this.#targetBase = targetBase;
     this.#label = label;
     this.#isCustom = isCustom ?? false;
+    this.#sanitizationReport = sanitizationReport ?? null;
     Object.freeze(this);
   }
 
@@ -308,4 +317,5 @@ export class RoutingResult {
   get targetBase() { return this.#targetBase; }
   get label() { return this.#label; }
   get isCustom() { return this.#isCustom; }
+  get sanitizationReport() { return this.#sanitizationReport; }
 }

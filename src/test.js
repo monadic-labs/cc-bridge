@@ -155,19 +155,46 @@ async function runUnitTests() {
   // ── sanitizeMessages ──
   console.log('\nsanitizeMessages:');
   const withSig = { messages: [{ content: [{ type: 'thinking', thinking: 'hmm', signature: 'abc123' }] }] };
-  const sanitizedWithSig = sanitizeMessages(withSig.messages, true);
+  const { messages: sanitizedWithSig, report: reportSig } = sanitizeMessages(withSig.messages, true);
   assert(sanitizedWithSig[0].content[0].signature === 'abc123', 'signature preserved if compliant and present');
   assert(sanitizedWithSig[0].content[0].type === 'thinking', 'type thinking preserved if compliant and present');
+  assert(reportSig.convertedCount === 0, 'no conversions when signature valid');
+  assert(reportSig.convertedTypes.length === 0, 'no converted types when signature valid');
 
   const withoutSig = { messages: [{ content: [{ type: 'thinking', thinking: 'hmm' }, { type: 'text', text: 'response' }] }] };
-  const sanitizedWithoutSig = sanitizeMessages(withoutSig.messages, true);
+  const { messages: sanitizedWithoutSig, report: reportNoSig } = sanitizeMessages(withoutSig.messages, true);
   assert(sanitizedWithoutSig[0].content[0].type === 'text', 'type converted to text if no signature');
   assert(sanitizedWithoutSig[0].content[0].text.includes('hmm'), 'thinking converted to text if no signature');
   assert(sanitizedWithoutSig[0].content.length === 1, 'adjacent text blocks were merged');
   assert(sanitizedWithoutSig[0].content[0].text.includes('response'), 'merged block contains original text response');
+  assert(reportNoSig.convertedCount === 1, 'one block converted when unsigned');
+  assert(reportNoSig.convertedTypes.includes('thinking'), 'converted type is thinking');
 
-  const noMessages = sanitizeMessages({ model: 'x' }, true);
+  const { messages: noMessages } = sanitizeMessages({ model: 'x' }, true);
   assert(noMessages.model === 'x', 'no messages passthrough');
+
+  // Empty signature (custom provider scenario)
+  const withEmptySig = { messages: [{ content: [{ type: 'thinking', thinking: 'test', signature: '' }] }] };
+  const { messages: sanitizedEmpty, report: reportEmpty } = sanitizeMessages(withEmptySig.messages, true);
+  assert(sanitizedEmpty[0].content[0].type === 'text', 'empty signature converted to text');
+  assert(reportEmpty.convertedCount === 1, 'empty signature counts as conversion');
+
+  // Non-compliant path strips all thinking regardless of signature
+  const withSigNonCompliant = { messages: [{ content: [{ type: 'thinking', thinking: 'hmm', signature: 'valid123' }] }] };
+  const { messages: sanitizedNonComp, report: reportNonComp } = sanitizeMessages(withSigNonCompliant.messages, false);
+  assert(sanitizedNonComp[0].content[0].type === 'text', 'non-compliant converts even with valid signature');
+  assert(reportNonComp.convertedCount === 1, 'non-compliant reports conversion');
+
+  // Multiple block types in one message
+  const mixed = { messages: [{ content: [
+    { type: 'thinking', thinking: 'a', signature: '' },
+    { type: 'redacted_thinking', data: 'b', signature: '' },
+    { type: 'text', text: 'c' }
+  ] }] };
+  const { report: reportMixed } = sanitizeMessages(mixed.messages, true);
+  assert(reportMixed.convertedCount === 2, 'mixed: two blocks converted');
+  assert(reportMixed.convertedTypes.includes('thinking'), 'mixed: thinking in types');
+  assert(reportMixed.convertedTypes.includes('redacted_thinking'), 'mixed: redacted_thinking in types');
 
   // ── extractSessionId ──
   console.log('\nextractSessionId:');
