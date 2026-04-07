@@ -11,7 +11,10 @@ import { ProxyError } from './core/exceptions.js';
 import { copyRequestHeaders, filterResponseHeaders, redactHeaders, ANTHROPIC_HOST } from './core/headers.js';
 import { applyRouting, applyAuthHeaders, extractSessionId, tryParseBody } from './core/routing.js';
 import { providerIdToEnvKey } from './core/providers.js';
+import { decompress, compress } from './core/compression.js';
 import { parseSseMetadata } from './core/sse-parser.js';
+import { SseResponseTransformer } from './core/sse-transformer.js';
+import { DebugLogger } from './core/debug-logger.js';
 import { Logger } from './infra/logger.js';
 import { ErrorReporter } from './infra/error-reporter.js';
 import { runKill } from './infra/process-manager.js';
@@ -86,8 +89,10 @@ export function createProxyCore({ configDir, port }) {
 
   Object.assign(process.env, loadEnv(path.join(configDir, '.env')));
 
-  const logger = new Logger({ logsDir, defaultLog: path.join(logsDir, 'proxy.log'), maxHistory: 10 });
+  const cachedConfig = loadConfigFromFile(configDir);
+  const logger = new Logger({ logsDir, defaultLog: path.join(logsDir, 'proxy.log'), maxHistory: cachedConfig.historySize });
   const errorReporter = new ErrorReporter({ logsDir });
+  const debugLogger = new DebugLogger({ logsDir, level: cachedConfig.loggingLevel });
 
   let shellState = new ProxyState(0, new ProvidersMap([]));
   let activeKeepalives = 0;
@@ -179,32 +184,93 @@ export function createProxyCore({ configDir, port }) {
       sessionId,
       routedHeaders,
       forwardBody: routing.forwardBody,
-      targetBase: routing.targetBase
+      targetBase: routing.targetBase,
+      isCustom: routing.isCustom
     });
   }
 
   async function handleRequestEnd(ctx, chunks) {
-    const rawBody = Buffer.concat(chunks);
+    const rawBuffer = Buffer.concat(chunks);
+    const encoding = ctx.req.headers['content-encoding'];
+    
+    let decompressedBody = rawBuffer;
+    if (encoding) {
+      const decompressRes = await decompress(rawBuffer, encoding);
+      if (decompressRes.isSuccess) {
+        decompressedBody = decompressRes.value;
+      } else {
+        errorReporter.write(decompressRes.error, { operation: 'decompressing request body', headers: ctx.req.headers });
+      }
+    }
 
     let activeCtx = ctx.withRouting({
       routeLabel: `Unknown (${ctx.req.method})`,
       reqModel: 'unknown',
       sessionId: '',
       routedHeaders: copyRequestHeaders(ctx.req.headers),
-      forwardBody: rawBody,
-      targetBase: `https://${ANTHROPIC_HOST}`
+      forwardBody: decompressedBody,
+      targetBase: `https://${ANTHROPIC_HOST}`,
+      rawBody: rawBuffer
     });
 
-    const bodyOpt = tryParseBody(rawBody);
+    const bodyOpt = tryParseBody(decompressedBody);
     if (bodyOpt.isNone) {
+      if (encoding) {
+        delete activeCtx.routedHeaders['content-encoding'];
+      }
+      
+      // Only log as error if there was actually content that failed to parse
+      if (decompressedBody.length > 0) {
+        errorReporter.write(new Error('Failed to parse JSON request body. Bypassing sanitization.'), { 
+          requestId: activeCtx.id, 
+          headers: activeCtx.req.headers,
+          operation: 'parsing request body',
+          debugMode: debugLogger.isDebug
+        });
+      }
+      
       forwardToUpstream(activeCtx);
       return;
     }
 
     try {
       activeCtx = await processRequestBody(activeCtx, bodyOpt.value);
+      
+      const config = getConfig();
+      if (config.recompressRequests && encoding) {
+        const compressRes = await compress(activeCtx.forwardBody, encoding);
+        if (compressRes.isSuccess) {
+          activeCtx = activeCtx.withRouting({
+            routeLabel: activeCtx.routeLabel,
+            reqModel: activeCtx.reqModel,
+            sessionId: activeCtx.sessionId,
+            routedHeaders: activeCtx.routedHeaders,
+            forwardBody: compressRes.value,
+            targetBase: activeCtx.targetBase,
+            isCustom: activeCtx.isCustom,
+            rawBody: activeCtx.rawBody
+          });
+        } else {
+          delete activeCtx.routedHeaders['content-encoding'];
+        }
+      } else {
+        delete activeCtx.routedHeaders['content-encoding'];
+      }
+
+      if (debugLogger.isTrace) {
+        await debugLogger.logPayload(activeCtx.id, 'raw', rawBuffer);
+        await debugLogger.logPayload(activeCtx.id, 'sanitized', activeCtx.forwardBody);
+      }
     } catch (e) {
-      errorReporter.write(e, { requestId: activeCtx.id, method: activeCtx.req.method, url: activeCtx.req.url, headers: activeCtx.req.headers, sessionId: activeCtx.sessionId });
+      errorReporter.write(e, { 
+        requestId: activeCtx.id, 
+        method: activeCtx.req.method, 
+        url: activeCtx.req.url, 
+        headers: activeCtx.req.headers, 
+        sessionId: activeCtx.sessionId,
+        requestBody: bodyOpt.value,
+        debugMode: debugLogger.isDebug
+      });
       buildErrorResponse(activeCtx.res, e);
       return;
     }
@@ -215,6 +281,7 @@ export function createProxyCore({ configDir, port }) {
   function forwardToUpstream(ctx) {
     const target = new URL(ctx.targetBase + (ctx.req.url ?? '/'));
     const finalHeaders = { ...ctx.routedHeaders, host: target.host, 'content-length': String(ctx.forwardBody.length) };
+    if (ctx.isCustom) delete finalHeaders['accept-encoding'];
 
     const proxyReq = https.request(
       { hostname: target.hostname, port: 443, path: target.pathname + target.search, method: ctx.req.method, headers: finalHeaders },
@@ -222,9 +289,15 @@ export function createProxyCore({ configDir, port }) {
     );
 
     proxyReq.on('error', (err) => {
-      errorReporter.write(err, { requestId: ctx.id, route: ctx.routeLabel, method: ctx.req.method, url: ctx.req.url, sessionId: ctx.sessionId, headers: finalHeaders });
+      // If client already aborted, don't scream about socket hang ups (ECONNRESET)
+      const isQuietError = err.code === 'ECONNRESET' && (ctx.req.aborted || ctx.req.closed);
+      
+      if (!isQuietError) {
+        errorReporter.write(err, { requestId: ctx.id, route: ctx.routeLabel, method: ctx.req.method, url: ctx.req.url, sessionId: ctx.sessionId, headers: finalHeaders });
+      }
+      
       if (!ctx.res.headersSent) ctx.res.writeHead(502);
-      ctx.res.end(`Proxy error: ${err.message}`);
+      if (!ctx.res.writableEnded) ctx.res.end(`Proxy error: ${err.message}`);
     });
 
     ctx.req.on('aborted', () => proxyReq.destroy());
@@ -235,21 +308,63 @@ export function createProxyCore({ configDir, port }) {
   }
 
   function handleProxyResponse(reqCtx, proxyRes, headers) {
+    const isSse = (proxyRes.headers['content-type'] || '').includes('text/event-stream');
+    const shouldTransform = reqCtx.isCustom && isSse;
+
     const resHeaders = filterResponseHeaders(proxyRes.headers);
+    if (shouldTransform) {
+      delete resHeaders['content-encoding'];
+      delete resHeaders['content-length'];
+    }
+    
     reqCtx.res.writeHead(proxyRes.statusCode, resHeaders);
 
-    const resChunks = [];
-    proxyRes.on('data', (chunk) => { resChunks.push(chunk); reqCtx.res.write(chunk); });
-    proxyRes.on('error', () => reqCtx.res.end());
-
-    proxyRes.on('end', () => {
-      const resCtx = new ProxyResponseContext({
-        proxyRes, res: reqCtx.res, id: reqCtx.id, startTime: reqCtx.startTime,
-        routeLabel: reqCtx.routeLabel, reqModel: reqCtx.reqModel, sessionId: reqCtx.sessionId,
-        headers, req: reqCtx.req
-      });
-      handleResponseEnd(resCtx, resChunks);
+    // Resilience: prevent crashes if the client socket closes abruptly
+    reqCtx.res.on('error', (err) => {
+      if (err.code === 'ECONNRESET') return; // Expected if client aborts
+      errorReporter.write(err, { requestId: reqCtx.id, operation: 'writing to client response' });
     });
+
+    const resChunks = [];
+    
+    if (shouldTransform) {
+      const transformer = new SseResponseTransformer();
+      proxyRes.on('data', (chunk) => {
+        const transformedStr = transformer.transformChunk(chunk.toString('utf8'));
+        if (transformedStr) {
+          const buf = Buffer.from(transformedStr, 'utf8');
+          resChunks.push(buf);
+          reqCtx.res.write(buf);
+        }
+      });
+      proxyRes.on('end', () => {
+        const rest = transformer.flush();
+        if (rest) {
+          const buf = Buffer.from(rest, 'utf8');
+          resChunks.push(buf);
+          reqCtx.res.write(buf);
+        }
+        const resCtx = new ProxyResponseContext({
+          proxyRes, res: reqCtx.res, id: reqCtx.id, startTime: reqCtx.startTime,
+          routeLabel: reqCtx.routeLabel, reqModel: reqCtx.reqModel, sessionId: reqCtx.sessionId,
+          headers, req: reqCtx.req, isCustom: reqCtx.isCustom, rawBody: reqCtx.rawBody, forwardBody: reqCtx.forwardBody
+        });
+        handleResponseEnd(resCtx, resChunks);
+      });
+      proxyRes.on('error', () => { if (!reqCtx.res.writableEnded) reqCtx.res.end(); });
+    } else {
+      proxyRes.on('data', (chunk) => { resChunks.push(chunk); reqCtx.res.write(chunk); });
+      proxyRes.on('error', () => { if (!reqCtx.res.writableEnded) reqCtx.res.end(); });
+
+      proxyRes.on('end', () => {
+        const resCtx = new ProxyResponseContext({
+          proxyRes, res: reqCtx.res, id: reqCtx.id, startTime: reqCtx.startTime,
+          routeLabel: reqCtx.routeLabel, reqModel: reqCtx.reqModel, sessionId: reqCtx.sessionId,
+          headers, req: reqCtx.req, isCustom: reqCtx.isCustom, rawBody: reqCtx.rawBody, forwardBody: reqCtx.forwardBody
+        });
+        handleResponseEnd(resCtx, resChunks);
+      });
+    }
   }
 
   async function decompressBodySafe(resChunks, encoding) {
@@ -296,8 +411,37 @@ export function createProxyCore({ configDir, port }) {
 
     logger.addSummary(new RequestSummary({ id: resCtx.id, route: resCtx.routeLabel, model: resCtx.reqModel, status, duration, inputTokens, outputTokens }));
 
+    // Logging: Notify if sanitization actually changed anything
+    if (resCtx.rawBody.length > 0 && !resCtx.rawBody.equals(resCtx.forwardBody)) {
+      const diffBytes = resCtx.forwardBody.length - resCtx.rawBody.length;
+      const sign = diffBytes > 0 ? '+' : '';
+      await emit(`[DEBUG #${resCtx.id}] Sanitization active: Healed thinking blocks (${sign}${diffBytes} bytes payload shift)`, sessionId);
+    }
+
     if (status >= 400) {
-      errorReporter.write(new ProxyError(`upstream ${status}`, { requestId: resCtx.id, route: resCtx.routeLabel, method: resCtx.req.method, url: resCtx.req.url, model: resCtx.reqModel, sessionId, headers: resCtx.headers, history: logger.getHistory(), responseBody: raw }));
+      const requestBodyOpt = tryParseBody(resCtx.forwardBody);
+      const requestBody = requestBodyOpt.isSome ? requestBodyOpt.value : null;
+      
+      errorReporter.write(new ProxyError(`upstream ${status}`, { 
+        requestId: resCtx.id, 
+        route: resCtx.routeLabel, 
+        method: resCtx.req.method, 
+        url: resCtx.req.url, 
+        model: resCtx.reqModel, 
+        sessionId, 
+        headers: resCtx.headers, 
+        history: logger.getHistory(), 
+        responseBody: raw,
+        requestBody,
+        debugMode: debugLogger.isDebug
+      }));
+
+      if (debugLogger.isDebug) {
+        await debugLogger.dumpErrorPayloads(resCtx.id, { 
+          raw: resCtx.rawBody, 
+          sanitized: resCtx.forwardBody 
+        });
+      }
     }
 
     resCtx.res.end();

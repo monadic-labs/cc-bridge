@@ -14,6 +14,8 @@ export class ProxyConfig {
   #healthCheckTimeout;
   #pollInterval;
   #pollMaxAttempts;
+  #recompressRequests;
+  #loggingLevel;
 
   constructor(raw) {
     if (!raw || typeof raw !== 'object') {
@@ -30,6 +32,11 @@ export class ProxyConfig {
     if (typeof logging.history !== 'number') throw new ConfigError('logging.history must be an explicit number');
     if (typeof logging.maxBodyLog !== 'number') throw new ConfigError('logging.maxBodyLog must be an explicit number');
 
+    const level = logging.level || 'info';
+    if (!['info', 'debug', 'trace'].includes(level)) {
+      throw new ConfigError('logging.level must be "info", "debug", or "trace"');
+    }
+
     const port = raw.port;
     if (port === undefined || port === null) throw new ConfigError('port must be explicitly defined in the config');
     if (typeof port !== 'number' || port < 1 || port > 65535) throw new ConfigError('port must be a valid number between 1 and 65535');
@@ -41,6 +48,9 @@ export class ProxyConfig {
     if (typeof daemon.pollIntervalMs !== 'number') throw new ConfigError('daemon.pollIntervalMs must be an explicit number');
     if (typeof daemon.pollMaxAttempts !== 'number') throw new ConfigError('daemon.pollMaxAttempts must be an explicit number');
 
+    const compression = raw.compression || {};
+    if (typeof compression.recompressRequests !== 'boolean') throw new ConfigError('compression.recompressRequests must be explicitly true or false');
+
     this.#healthCheckTimeout = daemon.healthCheckTimeoutMs;
     this.#pollInterval = daemon.pollIntervalMs;
     this.#pollMaxAttempts = daemon.pollMaxAttempts;
@@ -51,6 +61,8 @@ export class ProxyConfig {
     this.#historySize = logging.history;
     this.#maxBodyLog = logging.maxBodyLog;
     this.#port = port;
+    this.#recompressRequests = compression.recompressRequests;
+    this.#loggingLevel = level;
     Object.freeze(this);
   }
 
@@ -59,10 +71,12 @@ export class ProxyConfig {
   get logResponses() { return this.#logResponses; }
   get historySize() { return this.#historySize; }
   get maxBodyLog() { return this.#maxBodyLog; }
+  get loggingLevel() { return this.#loggingLevel; }
   get port() { return this.#port; }
   get healthCheckTimeoutMs() { return this.#healthCheckTimeout; }
   get pollIntervalMs() { return this.#pollInterval; }
   get pollMaxAttempts() { return this.#pollMaxAttempts; }
+  get recompressRequests() { return this.#recompressRequests; }
 }
 
 export function parseConfig(jsonString) {

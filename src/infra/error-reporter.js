@@ -1,6 +1,21 @@
 import fs from 'fs';
 import path from 'path';
 
+function redactBodyStructure(body) {
+  if (!body || typeof body !== 'object') return body;
+  const redacted = Array.isArray(body) ? [] : {};
+  for (const [k, v] of Object.entries(body)) {
+    if (k === 'text' || k === 'thinking' || k === 'data') {
+      redacted[k] = `[redacted: ${typeof v === 'string' ? v.length : 'complex'} chars]`;
+    } else if (typeof v === 'object' && v !== null) {
+      redacted[k] = redactBodyStructure(v);
+    } else {
+      redacted[k] = v;
+    }
+  }
+  return redacted;
+}
+
 export class ErrorReporter {
   #logsDir;
 
@@ -8,7 +23,7 @@ export class ErrorReporter {
     this.#logsDir = logsDir;
   }
 
-  write(error, { requestId, route, method, url, model, sessionId, headers, history, responseBody, operation } = {}) {
+  write(error, { requestId, route, method, url, model, sessionId, headers, history, responseBody, requestBody, operation, debugMode = false } = {}) {
     try {
       if (!fs.existsSync(this.#logsDir)) fs.mkdirSync(this.#logsDir, { recursive: true });
       const timestamp = new Date().toISOString();
@@ -30,6 +45,12 @@ export class ErrorReporter {
         responseBodyBlock = `\n## Response Body\n${responseBody}\n`;
       }
 
+      let requestBodyBlock = '';
+      if (debugMode && requestBody) {
+        const redactedBody = redactBodyStructure(requestBody);
+        requestBodyBlock = `\n## Request Body Structure (Redacted)\n${JSON.stringify(redactedBody, null, 2)}\n`;
+      }
+
       const content = `# CC-Bridge Error Report
 Generated: ${timestamp}
 
@@ -45,6 +66,7 @@ Generated: ${timestamp}
 ## Error
 - Message: ${error?.message || String(error)}
 - Code: ${error?.code || 'none'}
+${requestBodyBlock}
 ${responseBodyBlock}
 ## Stack
 ${error?.stack || 'no stack available'}
@@ -53,7 +75,6 @@ ${historyBlock}
 ${headersBlock}
 
 ---
-Request body excluded (may contain user prompts).
 API keys and tokens redacted. Safe to share in bug reports.
 `;
       fs.writeFileSync(filePath, content, 'utf8');

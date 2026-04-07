@@ -1,20 +1,9 @@
 import fs from 'fs';
 import path from 'path';
-import zlib from 'zlib';
-import { promisify } from 'util';
 import { redactHeaders } from '../core/headers.js';
 import { parseSseMetadata } from '../core/sse-parser.js';
 import { RequestSummary } from '../core/types.js';
-
-const gunzipAsync = promisify(zlib.gunzip);
-const inflateAsync = promisify(zlib.inflate);
-const brotliDecompressAsync = promisify(zlib.brotliDecompress);
-
-const DECOMPRESSORS = Object.freeze(new Map([
-  ['gzip', gunzipAsync],
-  ['deflate', inflateAsync],
-  ['br', brotliDecompressAsync],
-]));
+import { decompress } from '../core/compression.js';
 
 export class Logger {
   #logsDir;
@@ -100,8 +89,7 @@ export class Logger {
 
   async decompressChunks(chunks, encoding) {
     const buffer = Buffer.concat(chunks);
-    const decompress = DECOMPRESSORS.get(encoding);
-    if (!decompress) return buffer.toString();
-    return (await decompress(buffer)).toString();
+    const res = await decompress(buffer, encoding);
+    return res.isSuccess ? res.value.toString() : buffer.toString();
   }
 }
