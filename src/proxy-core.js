@@ -185,7 +185,8 @@ export function createProxyCore({ configDir, port }) {
       routedHeaders,
       forwardBody: routing.forwardBody,
       targetBase: routing.targetBase,
-      isCustom: routing.isCustom
+      isCustom: routing.isCustom,
+      sanitizationReport: routing.sanitizationReport
     });
   }
 
@@ -347,7 +348,8 @@ export function createProxyCore({ configDir, port }) {
         const resCtx = new ProxyResponseContext({
           proxyRes, res: reqCtx.res, id: reqCtx.id, startTime: reqCtx.startTime,
           routeLabel: reqCtx.routeLabel, reqModel: reqCtx.reqModel, sessionId: reqCtx.sessionId,
-          headers, req: reqCtx.req, isCustom: reqCtx.isCustom, rawBody: reqCtx.rawBody, forwardBody: reqCtx.forwardBody
+          headers, req: reqCtx.req, isCustom: reqCtx.isCustom, rawBody: reqCtx.rawBody, forwardBody: reqCtx.forwardBody,
+          sanitizationReport: reqCtx.sanitizationReport
         });
         handleResponseEnd(resCtx, resChunks);
       });
@@ -360,7 +362,8 @@ export function createProxyCore({ configDir, port }) {
         const resCtx = new ProxyResponseContext({
           proxyRes, res: reqCtx.res, id: reqCtx.id, startTime: reqCtx.startTime,
           routeLabel: reqCtx.routeLabel, reqModel: reqCtx.reqModel, sessionId: reqCtx.sessionId,
-          headers, req: reqCtx.req, isCustom: reqCtx.isCustom, rawBody: reqCtx.rawBody, forwardBody: reqCtx.forwardBody
+          headers, req: reqCtx.req, isCustom: reqCtx.isCustom, rawBody: reqCtx.rawBody, forwardBody: reqCtx.forwardBody,
+          sanitizationReport: reqCtx.sanitizationReport
         });
         handleResponseEnd(resCtx, resChunks);
       });
@@ -411,11 +414,10 @@ export function createProxyCore({ configDir, port }) {
 
     logger.addSummary(new RequestSummary({ id: resCtx.id, route: resCtx.routeLabel, model: resCtx.reqModel, status, duration, inputTokens, outputTokens }));
 
-    // Logging: Notify if sanitization actually changed anything
-    if (resCtx.rawBody.length > 0 && !resCtx.rawBody.equals(resCtx.forwardBody)) {
-      const diffBytes = resCtx.forwardBody.length - resCtx.rawBody.length;
-      const sign = diffBytes > 0 ? '+' : '';
-      await emit(`[DEBUG #${resCtx.id}] Sanitization active: Healed thinking blocks (${sign}${diffBytes} bytes payload shift)`, sessionId);
+    // Logging: Notify only when blocks were actually converted (semantic, not byte-level)
+    const report = resCtx.sanitizationReport;
+    if (report && report.convertedCount > 0) {
+      await emit(`[DEBUG #${resCtx.id}] Sanitized ${report.convertedCount} block(s): [${report.convertedTypes.join(', ')}]`, sessionId);
     }
 
     if (status >= 400) {

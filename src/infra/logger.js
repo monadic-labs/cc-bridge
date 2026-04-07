@@ -58,7 +58,9 @@ export class Logger {
     const tokenInfo = `in:${meta.inputTokens} out:${meta.outputTokens}`;
     await this.emit(`[RES #${id}] ← ${statusCode} | ${tokenInfo} | blocks: ${blockSummary || 'none'}`, sessionId);
     for (const b of meta.blocks) {
-      await this.emit(`  block: ${JSON.stringify({ type: b.type, name: b.name, signature: b.signature })}`, sessionId);
+      // Note: signature may be empty at content_block_start time for streaming responses.
+      // Anthropic attaches real signatures later in the stream. Empty here ≠ unsigned.
+      await this.emit(`  block: ${JSON.stringify({ type: b.type, name: b.name, signature: b.signature || '(stream-start)' })}`, sessionId);
     }
     if (meta.hasError) {
       await this.emit(`[RES #${id}] SSE error: ${JSON.stringify(meta.error)}`, sessionId);
