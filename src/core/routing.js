@@ -1,41 +1,5 @@
 import { ANTHROPIC_HOST } from './headers.js';
-import { RoutingResult, Option, Result } from './types.js';
-import { ConfigurationMissingException } from './exceptions.js';
-
-function processThinkingBlock(block) {
-  if (typeof block !== 'object' || block === null) return block;
-  if (block.type !== 'thinking') return block;
-  const { signature: _, ...rest } = block;
-  return rest;
-}
-
-function processMessageForSignatures(m) {
-  if (!Array.isArray(m.content)) return m;
-  const content = m.content.map(processThinkingBlock);
-  return { ...m, content };
-}
-
-export function stripSignatures(body) {
-  if (!body?.messages || !Array.isArray(body.messages)) return body;
-  const messages = body.messages.map(processMessageForSignatures);
-  return { ...body, messages };
-}
-
-function processToolResultContent(c) {
-  if (typeof c !== 'object' || c === null) return c;
-  const { cache_control: _, ...rest } = c;
-  if (rest.type !== 'tool_result' || !Array.isArray(rest.content)) return rest;
-  const joinedContent = rest.content
-    .map((b) => (typeof b === 'string' ? b : b.text ?? JSON.stringify(b)))
-    .join('\n');
-  return { ...rest, content: joinedContent };
-}
-
-function processMessageForNonCompliant(m) {
-  if (!Array.isArray(m.content)) return m;
-  const content = m.content.map(processToolResultContent);
-  return { ...m, content };
-}
+import { RoutingResult, Option } from './types.js';
 
 function flattenSystemPrompt(system) {
   if (!Array.isArray(system)) return system;
@@ -43,62 +7,169 @@ function flattenSystemPrompt(system) {
     .map((s) => (typeof s === 'string' ? s : s.text ?? ''))
     .join('\n')
     .trim();
-  return flattened || undefined;
+  if (!flattened) return undefined;
+  return flattened;
 }
 
-export function cleanForNonCompliant(body) {
-  const { betas: _, system, messages, ...rest } = body;
+function extractToolResultText(block) {
+  if (typeof block === 'string') return block;
+  if (block.text) return block.text;
+  return JSON.stringify(block);
+}
+
+function sanitizeToolResult(block) {
+  const { cache_control: _, ...rest } = block;
+  if (!Array.isArray(rest.content)) return rest;
+  const joinedContent = rest.content.map(extractToolResultText).join('\n');
+  return { ...rest, content: joinedContent };
+}
+
+function sanitizeThinkingBlock(block, isCompliant) {
+  const hasValidSignature = typeof block.signature === 'string' && block.signature.length > 0;
+  if (isCompliant && hasValidSignature) return block;
   
-  const cleaned = { ...rest };
-  const flatSystem = flattenSystemPrompt(system);
-  if (flatSystem !== undefined) cleaned.system = flatSystem;
+  const textContent = block.thinking || '';
+  return { type: 'text', text: `\`\`\`thinking\n${textContent}\n\`\`\`\n` };
+}
+
+function sanitizeRedactedThinking(block, isCompliant) {
+  const hasValidSignature = typeof block.signature === 'string' && block.signature.length > 0;
+  if (isCompliant && hasValidSignature) return block;
   
-  if (Array.isArray(messages)) {
-    cleaned.messages = messages.map(processMessageForNonCompliant);
+  const data = block.data || '[Redacted Thinking]';
+  return { type: 'text', text: `\`\`\`thinking\n${data}\n\`\`\`\n` };
+}
+
+function sanitizeConnectorText(block, isCompliant) {
+  const hasValidSignature = typeof block.signature === 'string' && block.signature.length > 0;
+  if (isCompliant && hasValidSignature) return block;
+  
+  const textContent = block.text || '';
+  return { type: 'text', text: `[Connector Text]\n${textContent}` };
+}
+
+function sanitizeGenericBlock(block, isCompliant) {
+  if (isCompliant) return block;
+  const { cache_control: _, ...rest } = block;
+  return rest;
+}
+
+function sanitizeBlock(block, isCompliant) {
+  if (typeof block !== 'object' || block === null) return block;
+
+  if (block.type === 'thinking') return sanitizeThinkingBlock(block, isCompliant);
+  if (block.type === 'redacted_thinking') return sanitizeRedactedThinking(block, isCompliant);
+  if (block.type === 'connector_text') return sanitizeConnectorText(block, isCompliant);
+  if (block.type === 'tool_result' && !isCompliant) return sanitizeToolResult(block);
+
+  return sanitizeGenericBlock(block, isCompliant);
+}
+
+function mergeAdjacentTextBlocks(blocks) {
+  const merged = [];
+  for (const block of blocks) {
+    const last = merged[merged.length - 1];
+    if (last && last.type === 'text' && block.type === 'text') {
+      last.text = (last.text || '') + '\n' + (block.text || '');
+    } else {
+      merged.push({ ...block }); 
+    }
   }
-  if (!Array.isArray(messages) && messages) {
-    cleaned.messages = messages;
+  return merged;
+}
+
+function sanitizeContent(content, isCompliant) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    const safeBlocks = content.map(b => sanitizeBlock(b, isCompliant));
+    return mergeAdjacentTextBlocks(safeBlocks);
   }
-  
-  return cleaned;
+  if (typeof content === 'object' && content !== null) {
+    return sanitizeBlock(content, isCompliant);
+  }
+  return content;
+}
+
+function sanitizeMessage(m, isCompliant) {
+  if (!m || typeof m !== 'object') return m;
+  return { ...m, content: sanitizeContent(m.content, isCompliant) };
+}
+
+export function sanitizeMessages(messages, isCompliant) {
+  if (!Array.isArray(messages)) return messages;
+  return messages.map(m => sanitizeMessage(m, isCompliant));
 }
 
 export function routeToAnthropic(body) {
-  const cleaned = stripSignatures(body);
-  const modelStr = cleaned.model ?? 'unknown';
+  const modelStr = body.model ?? 'unknown';
+  const safeBody = { 
+    ...body, 
+    system: sanitizeContent(body.system, true),
+    messages: sanitizeMessages(body.messages, true) 
+  };
+
   return new RoutingResult({
-    forwardBody: Buffer.from(JSON.stringify(cleaned)),
+    forwardBody: Buffer.from(JSON.stringify(safeBody)),
     targetBase: `https://${ANTHROPIC_HOST}`,
     label: `Anthropic (${modelStr})`,
+    isCustom: false
   });
+}
+
+function buildNonCompliantBody(body, realModel) {
+  const { betas: _, system, messages, ...rest } = body;
+  
+  const safeBody = {
+    ...rest,
+    model: realModel,
+    system: flattenSystemPrompt(system),
+    messages: sanitizeMessages(messages, false)
+  };
+  
+  return safeBody;
+}
+
+function buildCompliantBody(body, realModel) {
+  return { 
+    ...body, 
+    model: realModel, 
+    system: sanitizeContent(body.system, true),
+    messages: sanitizeMessages(body.messages, true) 
+  };
 }
 
 export function routeToProvider(body, match) {
   const { provider, realModel, label } = match;
-  const initialRouted = { ...body, model: realModel };
-  const stripped = stripSignatures(initialRouted);
-  const finalRouted = provider.anthropicCompliant ? stripped : cleanForNonCompliant(stripped);
+  const isCompliant = provider.anthropicCompliant;
+  
+  const finalBody = isCompliant 
+    ? buildCompliantBody(body, realModel)
+    : buildNonCompliantBody(body, realModel);
   
   return new RoutingResult({
-    forwardBody: Buffer.from(JSON.stringify(finalRouted)),
+    forwardBody: Buffer.from(JSON.stringify(finalBody)),
     targetBase: provider.url,
     label: `Provider (${label})`,
+    isCustom: true
   });
 }
 
 export function applyRouting(body, providersMap) {
   if (typeof body.model !== 'string') return routeToAnthropic(body);
+  
   const match = providersMap.resolve(body.model);
   if (!match) return routeToAnthropic(body);
+  
   return routeToProvider(body, match);
 }
 
 export function applyAuthHeaders({ headers, match, apiKey = '' }) {
   if (!match) return { ...headers };
+  
   const { provider } = match;
   const { authorization: _, 'anthropic-beta': beta, ...rest } = headers;
-
   const updated = { ...rest };
+  
   if (provider.id && apiKey) {
     updated['x-api-key'] = apiKey;
   }
@@ -114,23 +185,34 @@ function tryParseUserId(userIdStr) {
   if (typeof userIdStr !== 'string') return Option.none();
   try { 
     const parsed = JSON.parse(userIdStr);
-    return Option.some(parsed.session_id ?? '');
+    if (!parsed.session_id) return Option.none();
+    return Option.some(parsed.session_id);
   } catch { 
     return Option.none();
   }
 }
 
 export function extractSessionId(body) {
-  const userIdStr = body?.metadata?.user_id;
+  if (!body) return '';
+  
+  const userIdStr = body.metadata?.user_id;
   const parsedUserId = tryParseUserId(userIdStr);
-  if (parsedUserId.isSome && parsedUserId.value !== '') {
-    return parsedUserId.value;
-  }
-  return body?.metadata?.session_id ?? body?.session_id ?? '';
+  
+  if (parsedUserId.isSome) return parsedUserId.value;
+  
+  if (body.metadata?.session_id) return body.metadata.session_id;
+  if (body.session_id) return body.session_id;
+  
+  return '';
 }
 
 export function tryParseBody(rawBody) {
-  if (!rawBody || rawBody.length === 0) return Option.none();
-  try { return Option.some(JSON.parse(rawBody.toString())); }
-  catch { return Option.none(); }
+  if (!rawBody) return Option.none();
+  if (rawBody.length === 0) return Option.none();
+  
+  try { 
+    return Option.some(JSON.parse(rawBody.toString())); 
+  } catch { 
+    return Option.none(); 
+  }
 }

@@ -10,7 +10,11 @@ export const DEFAULT_RAW_CONFIG = {
     requests: true,
     responses: true,
     history: 5,
-    maxBodyLog: 10000
+    maxBodyLog: 10000,
+    level: 'info'
+  },
+  compression: {
+    recompressRequests: true
   }
 };
 

@@ -5,16 +5,15 @@
   "description": "A local HTTP proxy for Claude Code to route requests to multiple providers.",
   "main": "src/proxy-core.js",
   "bin": {
-    "ccb": "bin/ccb.js"
+    "ccb": "bin/ccb.js",
+    "cc-bridge": "bin/ccb.js"
   },
   "scripts": {
     "proxy": "node src/proxy.js",
     "test": "node src/test.js",
     "install-cmd": "npm install -g .",
-    "install-alias": "node scripts/install.js",
     "kill": "node scripts/kill.js",
     "killall": "node scripts/kill.js all",
-    "restartall": "node scripts/restart.js",
     "postinstall": "node scripts/setup-user-dir.js"
   },
   "keywords": [

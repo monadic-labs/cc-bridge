@@ -112,10 +112,21 @@ async function pollUntilReady(config) {
 
 function startProxyDaemon(config) {
   return new Promise((resolve, reject) => {
+    const logsDir = path.join(USER_CONFIG_DIR, 'logs');
+    if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
+    
+    const out = fs.openSync(path.join(logsDir, 'daemon.log'), 'a');
+    const err = fs.openSync(path.join(logsDir, 'daemon.err'), 'a');
+
     const child = spawn(
       process.execPath,
       [fileURLToPath(import.meta.url), PROXY_FLAG],
-      { detached: true, stdio: 'ignore', windowsHide: true, env: process.env }
+      { 
+        detached: true, 
+        stdio: ['ignore', out, err], 
+        windowsHide: true, 
+        env: { ...process.env, CCB_CONFIG_DIR: USER_CONFIG_DIR }
+      }
     );
     child.unref();
 
