@@ -1,99 +1,207 @@
 import { Result } from './types.js';
 import { ArgumentError } from './exceptions.js';
-import { normalizeModelsToObject } from './providers.js';
+import { parseTarget } from './config-adapter.js';
 
-export function findProviderIndex(providers, identifier) {
-  if (typeof identifier !== 'string' || !identifier) return -1;
-  const byId = providers.findIndex((p) => p.id === identifier);
-  if (byId !== -1) return byId;
-  return providers.findIndex((p) => p.url.includes(identifier));
+/**
+ * Find a provider key in an object-keyed providers map.
+ *
+ * Searches by key name first, then by URL substring match.
+ *
+ * @param {object} providers - Object-keyed providers map
+ * @param {string} identifier - Provider ID or URL substring
+ * @returns {string|null} Provider key or null
+ */
+export function findProviderKey(providers, identifier) {
+  if (typeof identifier !== 'string' || !identifier) return null;
+  if (typeof providers !== 'object' || !providers) return null;
+
+  // Direct key match
+  if (providers[identifier]) return identifier;
+
+  // URL substring match
+  for (const [key, cfg] of Object.entries(providers)) {
+    if (cfg.url && typeof cfg.url === 'string' && cfg.url.includes(identifier)) {
+      return key;
+    }
+  }
+  return null;
 }
 
-export function addModel(rawProviders, providerId, alias, realModel) {
-  const providers = rawProviders.map((p) => ({ ...p }));
-  const idx = findProviderIndex(providers, providerId);
-  if (idx === -1) return Result.fail(new ArgumentError(`No provider matching "${providerId}"`));
+/**
+ * Add a route entry to routes.models.
+ *
+ * @param {object} config - Full v2 config object
+ * @param {string} name - Route key (model name or wildcard pattern)
+ * @param {string} targetDot - Target in "provider.model" notation
+ * @param {string[]} [fallback] - Optional fallback targets
+ * @returns {Result<object>} Updated config
+ */
+export function addRouteModel(config, name, targetDot, fallback) {
+  const updated = JSON.parse(JSON.stringify(config));
+  if (!updated.routes) updated.routes = { models: {}, properties: {}, payloadSize: {} };
+  if (!updated.routes.models) updated.routes.models = {};
 
-  const models = { ...normalizeModelsToObject(providers[idx].models) };
-  if (models[alias] !== undefined) {
-    return Result.fail(new ArgumentError(`Model "${alias}" already exists on "${providers[idx].url}"`));
+  if (updated.routes.models[name] !== undefined) {
+    return Result.fail(new ArgumentError(`Route "${name}" already exists`));
   }
 
-  models[alias] = realModel;
-  providers[idx].models = models;
-  return Result.ok(providers);
-}
+  parseTarget(targetDot); // validate format
 
-export function removeModel(rawProviders, providerId, alias) {
-  const providers = rawProviders.map((p) => ({ ...p }));
-  const idx = findProviderIndex(providers, providerId);
-  if (idx === -1) return Result.fail(new ArgumentError(`No provider matching "${providerId}"`));
-
-  const models = { ...normalizeModelsToObject(providers[idx].models) };
-  if (models[alias] === undefined) {
-    return Result.fail(new ArgumentError(`Model "${alias}" not found on "${providers[idx].url}"`));
+  if (fallback && fallback.length > 0) {
+    for (const fb of fallback) parseTarget(fb);
+    updated.routes.models[name] = { target: targetDot, fallback };
+  } else {
+    updated.routes.models[name] = targetDot;
   }
 
-  delete models[alias];
-  providers[idx].models = models;
-  return Result.ok(providers);
+  return Result.ok(updated);
 }
 
-export function addProvider(rawProviders, id, url, compliant = true) {
-  const providers = rawProviders.map((p) => ({ ...p }));
-  if (providers.some((p) => p.id === id)) {
+/**
+ * Remove a route entry from routes.models.
+ *
+ * @param {object} config - Full v2 config object
+ * @param {string} name - Route key to remove
+ * @returns {Result<object>} Updated config
+ */
+export function removeRouteModel(config, name) {
+  const updated = JSON.parse(JSON.stringify(config));
+  if (!updated.routes?.models || updated.routes.models[name] === undefined) {
+    return Result.fail(new ArgumentError(`Route "${name}" not found`));
+  }
+
+  delete updated.routes.models[name];
+  return Result.ok(updated);
+}
+
+/**
+ * Add a provider to the object-keyed providers map.
+ *
+ * @param {object} providers - Object-keyed providers map
+ * @param {string} id - Provider ID
+ * @param {string} url - Provider URL
+ * @param {boolean} [compliant=true] - Whether provider is Anthropic-compliant
+ * @returns {Result<object>} Updated providers map
+ */
+export function addProvider(providers, id, url, compliant = true) {
+  const updated = { ...providers };
+  if (updated[id]) {
     return Result.fail(new ArgumentError(`Provider ID "${id}" already exists`));
   }
-  if (providers.some((p) => p.url === url)) {
-    return Result.fail(new ArgumentError(`Provider URL "${url}" already exists`));
+  for (const [key, cfg] of Object.entries(updated)) {
+    if (cfg.url === url) {
+      return Result.fail(new ArgumentError(`Provider URL "${url}" already exists (provider "${key}")`));
+    }
   }
-  providers.push({ id, url, models: {}, anthropicCompliant: compliant });
-  return Result.ok(providers);
+
+  updated[id] = { url, anthropicCompliant: compliant };
+  return Result.ok(updated);
 }
 
-export function removeProvider(rawProviders, id) {
-  const idx = findProviderIndex(rawProviders, id);
-  if (idx === -1) {
+/**
+ * Remove a provider from the object-keyed providers map.
+ *
+ * @param {object} providers - Object-keyed providers map
+ * @param {string} id - Provider ID to remove
+ * @returns {Result<object>} Updated providers map
+ */
+export function removeProvider(providers, id) {
+  const key = findProviderKey(providers, id);
+  if (key === null) {
     return Result.fail(new ArgumentError(`No provider matching "${id}"`));
   }
-  const providers = rawProviders.filter((_, i) => i !== idx);
-  return Result.ok(providers);
+
+  const updated = { ...providers };
+  delete updated[key];
+  return Result.ok(updated);
 }
 
-export function listModels(rawProviders, providerId) {
-  const idx = findProviderIndex(rawProviders, providerId);
-  if (idx === -1) return Result.fail(new ArgumentError(`No provider matching "${providerId}"`));
+/**
+ * List models for a specific provider (derived from routes).
+ *
+ * @param {object} config - Full v2 config object
+ * @param {string} providerId - Provider identifier
+ * @returns {Result<{url: string, compliant: boolean, models: [string, string][]}>}
+ */
+export function listModels(config, providerId) {
+  const key = findProviderKey(config.providers, providerId);
+  if (key === null) return Result.fail(new ArgumentError(`No provider matching "${providerId}"`));
 
-  const provider = rawProviders[idx];
-  const entries = Object.entries(normalizeModelsToObject(provider.models));
+  const provider = config.providers[key];
+  const models = [];
 
-  return Result.ok({ url: provider.url, compliant: provider.anthropicCompliant, models: entries });
+  // Find all routes targeting this provider
+  if (config.routes?.models) {
+    for (const [routeName, rawValue] of Object.entries(config.routes.models)) {
+      const value = typeof rawValue === 'string' ? { target: rawValue } : rawValue;
+      try {
+        const target = parseTarget(value.target);
+        if (target.providerId === key) {
+          models.push([routeName, target.model]);
+        }
+      } catch { /* skip malformed routes */ }
+    }
+  }
+
+  return Result.ok({ url: provider.url, compliant: provider.anthropicCompliant, models });
 }
 
-export function listProviders(rawProviders) {
-  return rawProviders.map((p) => {
-    const models = normalizeModelsToObject(p.models);
-    return { url: p.url, compliant: p.anthropicCompliant, modelCount: Object.keys(models).length };
-  });
+/**
+ * List all providers with summary info.
+ *
+ * @param {object} providers - Object-keyed providers map
+ * @returns {Array<{id: string, url: string, compliant: boolean}>}
+ */
+export function listProviders(providers) {
+  return Object.entries(providers).map(([id, cfg]) => ({
+    id,
+    url: cfg.url,
+    compliant: cfg.anthropicCompliant
+  }));
 }
 
-export function formatTree(rawProviders) {
+/**
+ * Format a tree view of providers and their routes.
+ *
+ * @param {object} config - Full v2 config object
+ * @returns {string}
+ */
+export function formatTree(config) {
   const lines = [];
-  for (let i = 0; i < rawProviders.length; i++) {
-    const p = rawProviders[i];
-    const tag = p.anthropicCompliant ? 'compliant' : 'non-compliant';
-    lines.push(`${p.url} (${tag})`);
+  const providers = config.providers ?? {};
 
-    const entries = Object.entries(normalizeModelsToObject(p.models));
+  // Build reverse map: provider → routes targeting it
+  const providerRoutes = {};
+  for (const key of Object.keys(providers)) providerRoutes[key] = [];
 
-    for (let j = 0; j < entries.length; j++) {
-      const [alias, real] = entries[j];
-      const branch = j === entries.length - 1 ? '└──' : '├──';
-      const label = alias === real ? alias : `${alias} → ${real}`;
-      lines.push(`${branch} ${label}`);
+  if (config.routes?.models) {
+    for (const [routeName, rawValue] of Object.entries(config.routes.models)) {
+      const value = typeof rawValue === 'string' ? { target: rawValue } : rawValue;
+      try {
+        const target = parseTarget(value.target);
+        if (providerRoutes[target.providerId]) {
+          const fb = value.fallback ? ` [fallback: ${value.fallback.join(', ')}]` : '';
+          const label = routeName === target.model ? routeName : `${routeName} → ${target.model}${fb}`;
+          providerRoutes[target.providerId].push(label);
+        }
+      } catch { /* skip */ }
+    }
+  }
+
+  const entries = Object.entries(providers);
+  for (let i = 0; i < entries.length; i++) {
+    const [id, cfg] = entries[i];
+    const tag = cfg.anthropicCompliant ? 'compliant' : 'non-compliant';
+    lines.push(`${id}: ${cfg.url} (${tag})`);
+
+    const routes = providerRoutes[id] ?? [];
+    for (let j = 0; j < routes.length; j++) {
+      const branch = j === routes.length - 1 ? '└──' : '├──';
+      lines.push(`${branch} ${routes[j]}`);
     }
 
-    if (i < rawProviders.length - 1) lines.push('');
+    if (i < entries.length - 1) lines.push('');
   }
+
   return lines.join('\n');
 }

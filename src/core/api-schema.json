@@ -1,0 +1,51 @@
+{
+  "_version": "2026-04-11",
+  "_source": "xorespesp-leak/src/services/api/claude.ts + Anthropic Messages API streaming protocol",
+  "_note": "Terminal field names in Anthropic API JSON structures. When Anthropic renames a field, update the mapping here and fix the one function in api-adapter.js that reads it. Nothing else in cc-bridge touches these names directly.",
+
+  "requestBody": {
+    "model": "model",
+    "messages": "messages",
+    "system": "system",
+    "betas": "betas"
+  },
+
+  "contentBlock": {
+    "type": "type",
+    "signature": "signature",
+    "name": "name",
+    "text": "text",
+    "thinkingContent": "thinking",
+    "redactedData": "data",
+    "cacheControl": "cache_control",
+    "toolResultContent": "content"
+  },
+
+  "systemBlock": {
+    "text": "text"
+  },
+
+  "sseEvent": {
+    "type": "type",
+    "index": "index",
+    "contentBlock": "content_block",
+    "delta": "delta",
+    "errorPayload": "error"
+  },
+
+  "sseDelta": {
+    "type": "type",
+    "thinkingContent": "thinking",
+    "redactedData": "data",
+    "stopReason": "stop_reason"
+  },
+
+  "messageStartEvent": {
+    "model": "model",
+    "inputTokens": "input_tokens"
+  },
+
+  "messageDeltaEvent": {
+    "outputTokens": "output_tokens"
+  }
+}

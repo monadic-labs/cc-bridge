@@ -1,3 +1,9 @@
+import { BLOCK_TYPES, SSE_EVENT_TYPES, DELTA_TYPES } from './types.js';
+import {
+  getSseEventType, getSseIndex, getSseContentBlock, getSseDelta,
+  getBlockType, getDeltaType, getDeltaThinking, getDeltaRedactedData,
+} from './api-adapter.js';
+
 export class SseResponseTransformer {
   #buffer = '';
   #thinkingIndexes = new Set();
@@ -15,26 +21,36 @@ export class SseResponseTransformer {
       }
       try {
         const evt = JSON.parse(line.slice(6));
+        const evtType = getSseEventType(evt);
+        const idx = getSseIndex(evt);
         let modified = false;
 
-        if (evt.type === 'content_block_start' && evt.content_block) {
-          if (evt.content_block.type === 'thinking' || evt.content_block.type === 'redacted_thinking') {
-            this.#thinkingIndexes.add(evt.index);
-            evt.content_block = { type: 'text', text: '```thinking\n' };
-            modified = true;
+        if (evtType === SSE_EVENT_TYPES.CONTENT_BLOCK_START) {
+          const contentBlock = getSseContentBlock(evt);
+          if (contentBlock) {
+            const blockType = getBlockType(contentBlock);
+            if (blockType === BLOCK_TYPES.THINKING || blockType === BLOCK_TYPES.REDACTED_THINKING) {
+              this.#thinkingIndexes.add(idx);
+              evt.content_block = { type: BLOCK_TYPES.TEXT, text: '```thinking\n' };
+              modified = true;
+            }
           }
-        } else if (evt.type === 'content_block_delta' && evt.delta && this.#thinkingIndexes.has(evt.index)) {
-          if (evt.delta.type === 'thinking_delta') {
-            evt.delta = { type: 'text_delta', text: evt.delta.thinking || '' };
-            modified = true;
-          } else if (evt.delta.type === 'redacted_thinking_delta') {
-            evt.delta = { type: 'text_delta', text: evt.delta.data || '' };
-            modified = true;
+        } else if (evtType === SSE_EVENT_TYPES.CONTENT_BLOCK_DELTA && this.#thinkingIndexes.has(idx)) {
+          const delta = getSseDelta(evt);
+          if (delta) {
+            const deltaType = getDeltaType(delta);
+            if (deltaType === DELTA_TYPES.THINKING_DELTA) {
+              evt.delta = { type: DELTA_TYPES.TEXT_DELTA, text: getDeltaThinking(delta) };
+              modified = true;
+            } else if (deltaType === DELTA_TYPES.REDACTED_THINKING_DELTA) {
+              evt.delta = { type: DELTA_TYPES.TEXT_DELTA, text: getDeltaRedactedData(delta) };
+              modified = true;
+            }
           }
-        } else if (evt.type === 'content_block_stop' && this.#thinkingIndexes.has(evt.index)) {
-          const extraDelta = { type: 'content_block_delta', index: evt.index, delta: { type: 'text_delta', text: '\n```\n' } };
+        } else if (evtType === SSE_EVENT_TYPES.CONTENT_BLOCK_STOP && this.#thinkingIndexes.has(idx)) {
+          const extraDelta = { type: SSE_EVENT_TYPES.CONTENT_BLOCK_DELTA, index: idx, delta: { type: DELTA_TYPES.TEXT_DELTA, text: '\n```\n' } };
           output += 'data: ' + JSON.stringify(extraDelta) + '\n\n';
-          this.#thinkingIndexes.delete(evt.index);
+          this.#thinkingIndexes.delete(idx);
         }
 
         output += modified ? `data: ${JSON.stringify(evt)}\n` : `${line}\n`;

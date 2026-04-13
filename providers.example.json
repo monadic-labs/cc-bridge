@@ -1,21 +1,33 @@
 {
-  "providers": [
-    {
-      "id": "my-mirror",
+  "providers": {
+    "my-mirror": {
       "url": "https://api.anthropic-mirror.example.com/v1",
-      "models": {
-        "my-sonnet": "claude-sonnet-4-6",
-        "my-opus": "claude-opus-4-6"
-      },
       "anthropicCompliant": true
     },
-    {
-      "id": "local-dev",
-      "url": "http://localhost:11434/v1",
-      "models": {
-        "offline-model": "llama3.2"
-      },
+    "z": {
+      "url": "https://api.z.ai/api/anthropic",
       "anthropicCompliant": false
     }
-  ]
+  },
+  "routes": {
+    "models": {
+      "my-sonnet": "my-mirror.claude-sonnet-4-6",
+      "my-opus": "my-mirror.claude-opus-4-6",
+      "fast": "z.glm-4.7",
+      "*haiku*": {
+        "target": "z.glm-4.7",
+        "fallback": ["my-mirror.claude-haiku-3-5"]
+      },
+      "*sonnet*": {
+        "target": "z.glm-5",
+        "fallback": ["z.glm-4.7"]
+      }
+    },
+    "properties": {
+      "thinking": "z.glm-5.1"
+    },
+    "payloadSize": {
+      ">102400": "my-mirror.claude-opus-4-6"
+    }
+  }
 }

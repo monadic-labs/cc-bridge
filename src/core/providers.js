@@ -6,6 +6,7 @@ export function providerIdToEnvKey(providerId) {
 }
 
 export function normalizeModelsToObject(models) {
+  if (!models) return Object.freeze({});
   if (Array.isArray(models)) {
     return Object.freeze(Object.fromEntries(models.map((m) => [m, m])));
   }
@@ -30,7 +31,7 @@ export class ProviderConfig {
     }
     this.#id = id ?? '';
     this.#url = url;
-    this.#models = normalizeModelsToObject(models);
+    this.#models = normalizeModelsToObject(models ?? {});
     this.#anthropicCompliant = anthropicCompliant;
     Object.freeze(this);
   }

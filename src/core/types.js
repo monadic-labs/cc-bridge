@@ -56,6 +56,7 @@ export class ProxyRequestContext {
   #res;
   #id;
   #startTime;
+  #urlSessionId;
   #routeLabel;
   #reqModel;
   #sessionId;
@@ -65,12 +66,16 @@ export class ProxyRequestContext {
   #isCustom;
   #rawBody;
   #sanitizationReport;
+  #originalBody;
+  #fallbackDepth;
+  #matchedRule;
 
-  constructor({ req, res, id, startTime }) {
+  constructor({ req, res, id, startTime, urlSessionId }) {
     this.#req = req;
     this.#res = res;
     this.#id = id;
     this.#startTime = startTime;
+    this.#urlSessionId = urlSessionId ?? '';
     this.#routeLabel = 'Unknown';
     this.#reqModel = 'unknown';
     this.#sessionId = '';
@@ -80,12 +85,17 @@ export class ProxyRequestContext {
     this.#isCustom = false;
     this.#rawBody = Buffer.alloc(0);
     this.#sanitizationReport = null;
+    this.#originalBody = Buffer.alloc(0);
+    this.#fallbackDepth = 0;
+    this.#matchedRule = null;
   }
 
   get req() { return this.#req; }
   get res() { return this.#res; }
   get id() { return this.#id; }
   get startTime() { return this.#startTime; }
+  /** Session ID extracted from the /s/{id}/ URL prefix set by ccb. Primary log-file key. */
+  get urlSessionId() { return this.#urlSessionId; }
   get routeLabel() { return this.#routeLabel; }
   get reqModel() { return this.#reqModel; }
   get sessionId() { return this.#sessionId; }
@@ -95,9 +105,12 @@ export class ProxyRequestContext {
   get isCustom() { return this.#isCustom; }
   get rawBody() { return this.#rawBody; }
   get sanitizationReport() { return this.#sanitizationReport; }
+  get originalBody() { return this.#originalBody; }
+  get fallbackDepth() { return this.#fallbackDepth; }
+  get matchedRule() { return this.#matchedRule; }
 
-  withRouting({ routeLabel, reqModel, sessionId, routedHeaders, forwardBody, targetBase, isCustom, rawBody, sanitizationReport }) {
-    const next = new ProxyRequestContext({ req: this.#req, res: this.#res, id: this.#id, startTime: this.#startTime });
+  withRouting({ routeLabel, reqModel, sessionId, routedHeaders, forwardBody, targetBase, isCustom, rawBody, sanitizationReport, originalBody, fallbackDepth, matchedRule }) {
+    const next = new ProxyRequestContext({ req: this.#req, res: this.#res, id: this.#id, startTime: this.#startTime, urlSessionId: this.#urlSessionId });
     next.#routeLabel = routeLabel;
     next.#reqModel = reqModel;
     next.#sessionId = sessionId;
@@ -107,6 +120,9 @@ export class ProxyRequestContext {
     next.#isCustom = isCustom ?? false;
     next.#rawBody = rawBody ?? this.#rawBody;
     next.#sanitizationReport = sanitizationReport ?? this.#sanitizationReport;
+    next.#originalBody = originalBody ?? this.#originalBody;
+    next.#fallbackDepth = fallbackDepth ?? this.#fallbackDepth;
+    next.#matchedRule = matchedRule ?? this.#matchedRule;
     return next;
   }
 }
@@ -296,6 +312,26 @@ export class ResponseInfo {
   get isSse() { return (this.#headers['content-type'] ?? '').includes('text/event-stream'); }
   get isError() { return this.#statusCode >= 400; }
 }
+
+export const BLOCK_TYPES = Object.freeze({
+  THINKING: 'thinking',
+  REDACTED_THINKING: 'redacted_thinking',
+  CONNECTOR_TEXT: 'connector_text',
+  TEXT: 'text',
+  TOOL_RESULT: 'tool_result',
+});
+
+export const SSE_EVENT_TYPES = Object.freeze({
+  CONTENT_BLOCK_START: 'content_block_start',
+  CONTENT_BLOCK_DELTA: 'content_block_delta',
+  CONTENT_BLOCK_STOP: 'content_block_stop',
+});
+
+export const DELTA_TYPES = Object.freeze({
+  THINKING_DELTA: 'thinking_delta',
+  REDACTED_THINKING_DELTA: 'redacted_thinking_delta',
+  TEXT_DELTA: 'text_delta',
+});
 
 export class RoutingResult {
   #forwardBody;

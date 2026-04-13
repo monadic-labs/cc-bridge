@@ -1,6 +1,6 @@
 {
-  "name": "@monadic/ccb",
-  "version": "1.0.0",
+  "name": "@monadic-labs/ccb",
+  "version": "1.0.1",
   "type": "module",
   "description": "A local HTTP proxy for Claude Code to route requests to multiple providers.",
   "main": "src/proxy-core.js",
@@ -16,6 +16,14 @@
     "killall": "node scripts/kill.js all",
     "postinstall": "node scripts/setup-user-dir.js"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/monadic-labs/cc-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/monadic-labs/cc-bridge/issues"
+  },
+  "homepage": "https://github.com/monadic-labs/cc-bridge#readme",
   "keywords": [
     "claude",
     "anthropic",
@@ -24,7 +32,7 @@
     "gateway",
     "ccb"
   ],
-  "author": "MarctCruz",
+  "author": "MarcTCruz",
   "license": "ISC",
   "engines": {
     "node": ">=18.0.0"
