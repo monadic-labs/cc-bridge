@@ -1,4 +1,11 @@
 import { ContentBlockInfo, SseMetadata } from './types.js';
+import {
+  getSseEventType,
+  getMessageStartModel, getMessageStartInputTokens,
+  getSseContentBlock, getSseDelta, getSseError,
+  getBlockType, getBlockName, getBlockSignature,
+  getDeltaStopReason, getMessageDeltaOutputTokens,
+} from './api-adapter.js';
 
 function parseSseLine(line) {
   if (!line.startsWith('data: ')) return null;
@@ -17,26 +24,26 @@ function parseSseLine(line) {
 function extractBlockInfo(contentBlock) {
   if (!contentBlock) return new ContentBlockInfo({ type: 'unknown' });
   return new ContentBlockInfo({
-    type: contentBlock.type,
-    name: contentBlock.name,
-    signature: contentBlock.signature,
+    type: getBlockType(contentBlock),
+    name: getBlockName(contentBlock),
+    signature: getBlockSignature(contentBlock),
   });
 }
 
 const SSE_HANDLERS = Object.freeze({
   message_start(evt, acc) {
-    acc.model = evt.message?.model ?? '';
-    acc.inputTokens = evt.message?.usage?.input_tokens ?? 0;
+    acc.model = getMessageStartModel(evt);
+    acc.inputTokens = getMessageStartInputTokens(evt);
   },
   content_block_start(evt, acc) {
-    acc.blocks.push(extractBlockInfo(evt.content_block));
+    acc.blocks.push(extractBlockInfo(getSseContentBlock(evt)));
   },
   message_delta(evt, acc) {
-    acc.stopReason = evt.delta?.stop_reason ?? '';
-    acc.outputTokens = evt.usage?.output_tokens ?? 0;
+    acc.stopReason = getDeltaStopReason(getSseDelta(evt));
+    acc.outputTokens = getMessageDeltaOutputTokens(evt);
   },
   error(evt, acc) {
-    acc.error = evt.error ?? evt;
+    acc.error = getSseError(evt);
   },
 });
 
@@ -45,8 +52,10 @@ export function parseSseMetadata(raw) {
   for (const line of raw.split('\n')) {
     const evt = parseSseLine(line);
     if (!evt) continue;
-    const handler = SSE_HANDLERS[evt.type];
-    if (!handler) continue;
+    const handler = SSE_HANDLERS[getSseEventType(evt)];
+    if (!handler) {
+      continue;
+    }
     handler(evt, acc);
   }
   return new SseMetadata(acc);

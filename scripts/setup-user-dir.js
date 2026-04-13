@@ -46,6 +46,9 @@ function main() {
   if (!fs.existsSync(ENV_PATH)) {
     console.log(`Initializing empty .env file...`);
     fs.writeFileSync(ENV_PATH, '# Add your API keys here\n# CUSTOM_GATEWAY_KEY=your_key_here\n');
+    if (process.platform !== 'win32') {
+      try { fs.chmodSync(ENV_PATH, 0o600); } catch { /* best effort */ }
+    }
   }
 
   console.log('✨ CC-Bridge user directory is ready.');

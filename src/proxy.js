@@ -17,7 +17,7 @@ const server = http.createServer(core.createRequestHandler());
 server.listen(PORT, async () => {
   const pidsFile = path.join(core.logsDir, 'proxy.pids');
   if (!fs.existsSync(core.logsDir)) fs.mkdirSync(core.logsDir, { recursive: true });
-  fs.appendFileSync(pidsFile, process.pid + '\n', 'utf8');
+  fs.writeFileSync(pidsFile, process.pid + '\n', 'utf8');
 
   const cfg = await core.getConfig();
   await core.emit(`CC-Bridge proxy listening on http://localhost:${PORT}`);

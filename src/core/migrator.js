@@ -1,9 +1,19 @@
+import { detectFormat, convertV1ToV2 } from './config-adapter.js';
+
 export const DEFAULT_RAW_CONFIG = {
   port: 9099,
+  anthropicBaseUrl: 'https://api.anthropic.com',
   daemon: {
     healthCheckTimeoutMs: 500,
     pollIntervalMs: 300,
     pollMaxAttempts: 10,
+    // 600 000 ms — matches the Claude CLI's own API_TIMEOUT_MS default
+    // (xorespesp-leak/src/services/api/client.ts:144).
+    // proxyReq.setTimeout is an *inactivity* timer: it resets on every received
+    // chunk, so it only fires when the upstream goes completely silent — not
+    // during active streaming. This complements the CLI's hard wall-clock
+    // deadline rather than replacing it. Set to 0 to disable.
+    upstreamTimeoutMs: 600000,
   },
   logging: {
     enabled: true,
@@ -19,22 +29,21 @@ export const DEFAULT_RAW_CONFIG = {
 };
 
 export const DEFAULT_RAW_PROVIDERS = {
-  providers: [
-    {
-      id: "custom-gateway",
+  providers: {
+    "custom-gateway": {
       url: "https://api.example-gateway.internal/v1",
-      models: {
-        "custom-model": "actual-model-name"
-      },
       anthropicCompliant: false
     }
-  ]
+  },
+  routes: {
+    models: {},
+    properties: {},
+    payloadSize: {}
+  }
 };
 
-export const DEFAULT_SINGLE_PROVIDER = {
-  id: "",
+const DEFAULT_PROVIDER_ENTRY = {
   url: "",
-  models: {},
   anthropicCompliant: false
 };
 
@@ -53,7 +62,7 @@ function deepMerge(target, source) {
 
 export function ensureCompleteConfig(existingRaw) {
   const merged = JSON.parse(JSON.stringify(existingRaw || {}));
-  
+
   // Migrate legacy daemon properties
   if (merged.daemon) {
     if (merged.daemon.healthCheckTimeout !== undefined) {
@@ -72,27 +81,27 @@ export function ensureCompleteConfig(existingRaw) {
 
 export function ensureCompleteProviders(existingRaw) {
   const merged = JSON.parse(JSON.stringify(existingRaw || {}));
-  if (!Array.isArray(merged.providers)) {
-    merged.providers = JSON.parse(JSON.stringify(DEFAULT_RAW_PROVIDERS.providers));
+
+  // Detect format and convert v1 → v2 if needed
+  const format = detectFormat(merged);
+  if (format === 'v1') {
+    return convertV1ToV2(merged);
   }
-  
-  merged.providers = merged.providers.map(p => {
-    const pMerged = JSON.parse(JSON.stringify(p));
-    deepMerge(pMerged, DEFAULT_SINGLE_PROVIDER);
-    
-    // If id is missing or empty, try to derive it from the URL
-    if (!pMerged.id && pMerged.url) {
-      try {
-        const u = new URL(pMerged.url);
-        const hostParts = u.hostname.split('.');
-        pMerged.id = hostParts[hostParts.length - 2] || hostParts[0] || 'provider';
-      } catch {
-        pMerged.id = 'provider-' + Math.floor(Math.random() * 1000);
-      }
+
+  // v2 format: merge defaults into providers object
+  if (!merged.providers || typeof merged.providers !== 'object' || Array.isArray(merged.providers)) {
+    merged.providers = JSON.parse(JSON.stringify(DEFAULT_RAW_PROVIDERS.providers));
+  } else {
+    for (const [id, cfg] of Object.entries(merged.providers)) {
+      deepMerge(cfg, DEFAULT_PROVIDER_ENTRY);
     }
-    
-    return pMerged;
-  });
+  }
+
+  // Ensure routes section exists with all sub-sections
+  if (!merged.routes) merged.routes = {};
+  if (!merged.routes.models) merged.routes.models = {};
+  if (!merged.routes.properties) merged.routes.properties = {};
+  if (!merged.routes.payloadSize) merged.routes.payloadSize = {};
 
   return merged;
 }

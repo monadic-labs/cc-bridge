@@ -11,9 +11,11 @@ export class ProxyConfig {
   #historySize;
   #maxBodyLog;
   #port;
+  #anthropicBaseUrl;
   #healthCheckTimeout;
   #pollInterval;
   #pollMaxAttempts;
+  #upstreamTimeoutMs;
   #recompressRequests;
   #loggingLevel;
 
@@ -41,19 +43,27 @@ export class ProxyConfig {
     if (port === undefined || port === null) throw new ConfigError('port must be explicitly defined in the config');
     if (typeof port !== 'number' || port < 1 || port > 65535) throw new ConfigError('port must be a valid number between 1 and 65535');
 
+    const anthropicBaseUrl = raw.anthropicBaseUrl;
+    if (typeof anthropicBaseUrl !== 'string' || !anthropicBaseUrl.match(/^https?:\/\//)) {
+      throw new ConfigError('anthropicBaseUrl must be an http:// or https:// URL string');
+    }
+
     const daemon = raw.daemon;
     if (!daemon || typeof daemon !== 'object') throw new ConfigError('Config must explicitly define a "daemon" object');
 
     if (typeof daemon.healthCheckTimeoutMs !== 'number') throw new ConfigError('daemon.healthCheckTimeoutMs must be an explicit number');
     if (typeof daemon.pollIntervalMs !== 'number') throw new ConfigError('daemon.pollIntervalMs must be an explicit number');
     if (typeof daemon.pollMaxAttempts !== 'number') throw new ConfigError('daemon.pollMaxAttempts must be an explicit number');
+    if (typeof daemon.upstreamTimeoutMs !== 'number' || daemon.upstreamTimeoutMs < 0) throw new ConfigError('daemon.upstreamTimeoutMs must be a non-negative number');
 
     const compression = raw.compression || {};
     if (typeof compression.recompressRequests !== 'boolean') throw new ConfigError('compression.recompressRequests must be explicitly true or false');
 
+    this.#anthropicBaseUrl = anthropicBaseUrl;
     this.#healthCheckTimeout = daemon.healthCheckTimeoutMs;
     this.#pollInterval = daemon.pollIntervalMs;
     this.#pollMaxAttempts = daemon.pollMaxAttempts;
+    this.#upstreamTimeoutMs = daemon.upstreamTimeoutMs;
 
     this.#loggingEnabled = logging.enabled;
     this.#logRequests = logging.requests;
@@ -73,9 +83,11 @@ export class ProxyConfig {
   get maxBodyLog() { return this.#maxBodyLog; }
   get loggingLevel() { return this.#loggingLevel; }
   get port() { return this.#port; }
+  get anthropicBaseUrl() { return this.#anthropicBaseUrl; }
   get healthCheckTimeoutMs() { return this.#healthCheckTimeout; }
   get pollIntervalMs() { return this.#pollInterval; }
   get pollMaxAttempts() { return this.#pollMaxAttempts; }
+  get upstreamTimeoutMs() { return this.#upstreamTimeoutMs; }
   get recompressRequests() { return this.#recompressRequests; }
 }
 

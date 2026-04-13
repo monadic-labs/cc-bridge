@@ -1,5 +1,11 @@
 import { ANTHROPIC_HOST } from './headers.js';
-import { RoutingResult, Option } from './types.js';
+import { RoutingResult, Option, BLOCK_TYPES } from './types.js';
+import {
+  getSystemBlockText,
+  getBlockType, getBlockText, getBlockThinking, getBlockRedactedData, getBlockToolContent,
+  hasValidSignature, omitCacheControl,
+  getModel, getSystem, getMessages,
+} from './api-adapter.js';
 
 /**
  * Message sanitization for multi-provider routing.
@@ -35,7 +41,7 @@ import { RoutingResult, Option } from './types.js';
 function flattenSystemPrompt(system) {
   if (!Array.isArray(system)) return system;
   const flattened = system
-    .map((s) => (typeof s === 'string' ? s : s.text ?? ''))
+    .map((s) => (typeof s === 'string' ? s : getSystemBlockText(s)))
     .join('\n')
     .trim();
   if (!flattened) return undefined;
@@ -44,57 +50,50 @@ function flattenSystemPrompt(system) {
 
 function extractToolResultText(block) {
   if (typeof block === 'string') return block;
-  if (block.text) return block.text;
+  const text = getBlockText(block);
+  if (text) return text;
   return JSON.stringify(block);
 }
 
 function sanitizeToolResult(block) {
-  const { cache_control: _, ...rest } = block;
-  if (!Array.isArray(rest.content)) return rest;
-  const joinedContent = rest.content.map(extractToolResultText).join('\n');
+  const rest = omitCacheControl(block);
+  const toolContent = getBlockToolContent(rest);
+  if (!Array.isArray(toolContent)) return rest;
+  const joinedContent = toolContent.map(extractToolResultText).join('\n');
   return { ...rest, content: joinedContent };
 }
 
 function sanitizeThinkingBlock(block, isCompliant) {
-  const hasValidSignature = typeof block.signature === 'string' && block.signature.length > 0;
-  if (isCompliant && hasValidSignature) return block;
-  
-  const textContent = block.thinking || '';
-  return { type: 'text', text: `\`\`\`thinking\n${textContent}\n\`\`\`\n` };
+  if (isCompliant && hasValidSignature(block)) return block;
+  return { type: BLOCK_TYPES.TEXT, text: `\`\`\`thinking\n${getBlockThinking(block)}\n\`\`\`\n` };
 }
 
 function sanitizeRedactedThinking(block, isCompliant) {
-  const hasValidSignature = typeof block.signature === 'string' && block.signature.length > 0;
-  if (isCompliant && hasValidSignature) return block;
-  
-  const data = block.data || '[Redacted Thinking]';
-  return { type: 'text', text: `\`\`\`thinking\n${data}\n\`\`\`\n` };
+  if (isCompliant && hasValidSignature(block)) return block;
+  const data = getBlockRedactedData(block) || '[Redacted Thinking]';
+  return { type: BLOCK_TYPES.TEXT, text: `\`\`\`thinking\n${data}\n\`\`\`\n` };
 }
 
 function sanitizeConnectorText(block, isCompliant) {
-  const hasValidSignature = typeof block.signature === 'string' && block.signature.length > 0;
-  if (isCompliant && hasValidSignature) return block;
-  
-  const textContent = block.text || '';
-  return { type: 'text', text: `[Connector Text]\n${textContent}` };
+  if (isCompliant && hasValidSignature(block)) return block;
+  return { type: BLOCK_TYPES.TEXT, text: `[Connector Text]\n${getBlockText(block)}` };
 }
 
 function sanitizeGenericBlock(block, isCompliant) {
   if (isCompliant) return block;
-  const { cache_control: _, ...rest } = block;
-  return rest;
+  return omitCacheControl(block);
 }
 
 function sanitizeBlock(block, isCompliant) {
   if (typeof block !== 'object' || block === null) return { block, converted: false };
 
-  const originalType = block.type;
+  const originalType = getBlockType(block);
   let result;
 
-  if (block.type === 'thinking') result = sanitizeThinkingBlock(block, isCompliant);
-  else if (block.type === 'redacted_thinking') result = sanitizeRedactedThinking(block, isCompliant);
-  else if (block.type === 'connector_text') result = sanitizeConnectorText(block, isCompliant);
-  else if (block.type === 'tool_result' && !isCompliant) result = sanitizeToolResult(block);
+  if (originalType === BLOCK_TYPES.THINKING) result = sanitizeThinkingBlock(block, isCompliant);
+  else if (originalType === BLOCK_TYPES.REDACTED_THINKING) result = sanitizeRedactedThinking(block, isCompliant);
+  else if (originalType === BLOCK_TYPES.CONNECTOR_TEXT) result = sanitizeConnectorText(block, isCompliant);
+  else if (originalType === BLOCK_TYPES.TOOL_RESULT && !isCompliant) result = sanitizeToolResult(block);
   else result = sanitizeGenericBlock(block, isCompliant);
 
   const converted = result.type !== originalType;
@@ -163,15 +162,15 @@ export function sanitizeMessages(messages, isCompliant) {
  * backstop for the provider-switching scenario — when session history contains
  * thinking blocks from custom providers with empty signatures.
  */
-export function routeToAnthropic(body) {
-  const modelStr = body.model ?? 'unknown';
-  const { content: safeSystem } = sanitizeContent(body.system, true);
-  const { messages: safeMessages, report } = sanitizeMessages(body.messages, true);
+export function routeToAnthropic(body, anthropicBaseUrl = `https://${ANTHROPIC_HOST}`) {
+  const modelStr = getModel(body);
+  const { content: safeSystem } = sanitizeContent(getSystem(body), true);
+  const { messages: safeMessages, report } = sanitizeMessages(getMessages(body), true);
   const safeBody = { ...body, system: safeSystem, messages: safeMessages };
 
   return new RoutingResult({
     forwardBody: Buffer.from(JSON.stringify(safeBody)),
-    targetBase: `https://${ANTHROPIC_HOST}`,
+    targetBase: anthropicBaseUrl,
     label: `Anthropic (${modelStr})`,
     isCustom: false,
     sanitizationReport: report
@@ -187,18 +186,18 @@ export function routeToAnthropic(body) {
  * tool_result content arrays.
  */
 function buildNonCompliantBody(body, realModel) {
-  const { betas: _, system, messages, ...rest } = body;
-  const { messages: safeMessages, report } = sanitizeMessages(messages, false);
+  const { betas: _, ...rest } = body; // strip betas — not understood by non-compliant providers
+  const { messages: safeMessages, report } = sanitizeMessages(getMessages(body), false);
 
   return {
-    body: { ...rest, model: realModel, system: flattenSystemPrompt(system), messages: safeMessages },
+    body: { ...rest, model: realModel, system: flattenSystemPrompt(getSystem(body)), messages: safeMessages },
     report
   };
 }
 
 function buildCompliantBody(body, realModel) {
-  const { content: safeSystem } = sanitizeContent(body.system, true);
-  const { messages: safeMessages, report } = sanitizeMessages(body.messages, true);
+  const { content: safeSystem } = sanitizeContent(getSystem(body), true);
+  const { messages: safeMessages, report } = sanitizeMessages(getMessages(body), true);
   return {
     body: { ...body, model: realModel, system: safeSystem, messages: safeMessages },
     report
@@ -222,13 +221,26 @@ export function routeToProvider(body, match) {
   });
 }
 
-export function applyRouting(body, providersMap) {
-  if (typeof body.model !== 'string') return routeToAnthropic(body);
-  
+export function applyRouting(body, providersMap, anthropicBaseUrl) {
+  if (typeof body.model !== 'string') return routeToAnthropic(body, anthropicBaseUrl);
+
   const match = providersMap.resolve(body.model);
-  if (!match) return routeToAnthropic(body);
-  
+  if (!match) return routeToAnthropic(body, anthropicBaseUrl);
+
   return routeToProvider(body, match);
+}
+
+/**
+ * Route using a pre-resolved Option<ProviderMatch> from the RoutingPolicy pipeline.
+ *
+ * Accepts the result of `policy.evaluate(body)` directly, avoiding a second
+ * evaluation pass when the caller already has the match (e.g. for auth header
+ * resolution in proxy-core.js).
+ */
+export function applyRoutingWithMatch(body, matchOpt, anthropicBaseUrl) {
+  if (typeof body.model !== 'string') return routeToAnthropic(body, anthropicBaseUrl);
+  if (matchOpt.isNone) return routeToAnthropic(body, anthropicBaseUrl);
+  return routeToProvider(body, matchOpt.value);
 }
 
 export function applyAuthHeaders({ headers, match, apiKey = '' }) {
