@@ -37,6 +37,15 @@ export function forwardToUpstream({ ctx, handleResponseEnd, errorReporter, getCo
     })
   );
 
+  // Track whether the client is still interested in a response.
+  // When Claude Code gives up on a request and retries, it closes the
+  // original connection. The upstream may still be running and eventually
+  // timeout — we must NOT write a 400 to a dead response.
+  let clientGone = false;
+  const markClientGone = () => { clientGone = true; proxyReq.destroy(); };
+  ctx.req.on('aborted', markClientGone);
+  ctx.req.on('close', () => { if (!ctx.res.writableEnded) markClientGone(); });
+
   const upstreamTimeout = getConfig().upstreamTimeoutMs;
   if (upstreamTimeout > 0) {
     proxyReq.setTimeout(upstreamTimeout, () => {
@@ -45,6 +54,11 @@ export function forwardToUpstream({ ctx, handleResponseEnd, errorReporter, getCo
   }
 
   proxyReq.on('error', (err) => {
+    if (clientGone) {
+      // Client already left — log quietly, do NOT touch the response object.
+      return;
+    }
+
     const isQuietError = err.code === 'ECONNRESET' && (ctx.req.aborted || ctx.req.closed);
 
     if (!isQuietError) {
@@ -54,9 +68,6 @@ export function forwardToUpstream({ ctx, handleResponseEnd, errorReporter, getCo
     if (!ctx.res.headersSent) ctx.res.writeHead(400, { 'content-type': 'application/json' });
     if (!ctx.res.writableEnded) ctx.res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: `Upstream connection failed: ${err.message}` } }));
   });
-
-  ctx.req.on('aborted', () => proxyReq.destroy());
-  ctx.req.on('close', () => { if (!ctx.res.writableEnded) proxyReq.destroy(); });
 
   proxyReq.write(ctx.forwardBody);
   proxyReq.end();
