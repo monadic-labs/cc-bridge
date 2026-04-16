@@ -14,6 +14,14 @@ export const DEFAULT_RAW_CONFIG = {
     // during active streaming. This complements the CLI's hard wall-clock
     // deadline rather than replacing it. Set to 0 to disable.
     upstreamTimeoutMs: 600000,
+    retry: {
+      maxAttempts: 2,
+      baseDelayMs: 500,
+      maxDelayMs: 5000,
+      retryOnStatusCodes: [502, 503, 504],
+      retryOnTcpErrors: ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT'],
+      retryOnBodyPatterns: []
+    },
   },
   logging: {
     enabled: true,

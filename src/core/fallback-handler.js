@@ -21,6 +21,24 @@ export function shouldAttemptFallback(statusCode, matchedRule, fallbackDepth) {
 }
 
 /**
+ * Determine whether a TCP-level error (no HTTP response) should trigger fallback.
+ *
+ * Used when retry exhausts all attempts on TCP errors (ECONNRESET, etc.)
+ * and we need to decide whether to try the fallback provider instead of
+ * returning a proxy_error to the client.
+ *
+ * @param {object|null} matchedRule - The routing rule that matched (has hasFallback)
+ * @param {number} fallbackDepth - Current fallback depth (0 = initial request)
+ * @returns {boolean}
+ */
+export function shouldAttemptFallbackForTcpError(matchedRule, fallbackDepth) {
+  if (!matchedRule) return false;
+  if (!matchedRule.hasFallback) return false;
+  if (fallbackDepth >= MAX_FALLBACK_DEPTH) return false;
+  return true;
+}
+
+/**
  * Resolve the fallback ProviderMatch from the routing policy's provider map.
  *
  * @param {RoutingPolicy} policy - Active routing policy

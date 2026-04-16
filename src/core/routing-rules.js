@@ -11,6 +11,13 @@ function requireString(value, fieldName) {
   }
 }
 
+function optionalString(value, fieldName) {
+  if (value === null || value === undefined) return;
+  if (typeof value !== 'string' || !value) {
+    throw new ArgumentError(`${fieldName} must be null or a non-empty string`, { context: { [fieldName]: value } });
+  }
+}
+
 function requirePositiveInt(value, fieldName) {
   if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
     throw new ArgumentError(`${fieldName} must be a positive integer`, { context: { [fieldName]: value } });
@@ -42,12 +49,15 @@ export class ExactRule {
 
   constructor({ match, targetProvider, targetModel, fallback }) {
     requireString(match, 'ExactRule.match');
-    requireString(targetProvider, 'ExactRule.targetProvider');
-    requireString(targetModel, 'ExactRule.targetModel');
-    this.#match = match;
-    this.#targetProviderId = targetProvider;
-    this.#targetModel = targetModel;
+    optionalString(targetProvider, 'ExactRule.targetProvider');
+    optionalString(targetModel, 'ExactRule.targetModel');
     const fb = validateFallback(fallback);
+    if (!targetProvider && !fb.providerId) {
+      throw new ArgumentError('Rule must have a target or a fallback', { context: { match } });
+    }
+    this.#match = match;
+    this.#targetProviderId = targetProvider ?? null;
+    this.#targetModel = targetModel ?? null;
     this.#fallbackProviderId = fb.providerId;
     this.#fallbackModel = fb.model;
     Object.freeze(this);
@@ -60,6 +70,7 @@ export class ExactRule {
   get fallbackProviderId() { return this.#fallbackProviderId; }
   get fallbackModel() { return this.#fallbackModel; }
   get hasFallback() { return this.#fallbackProviderId !== null; }
+  get hasTarget() { return this.#targetProviderId !== null; }
 
   matches(body) {
     return typeof body.model === 'string' && body.model === this.#match;
@@ -68,7 +79,9 @@ export class ExactRule {
   toLabel() { return `exact:${this.#match}`; }
 
   toJSON() {
-    const json = { type: 'exact', match: this.#match, targetProvider: this.#targetProviderId, targetModel: this.#targetModel };
+    const json = { type: 'exact', match: this.#match };
+    if (this.#targetProviderId) json.targetProvider = this.#targetProviderId;
+    if (this.#targetModel) json.targetModel = this.#targetModel;
     if (this.#fallbackProviderId) json.fallback = { providerId: this.#fallbackProviderId, model: this.#fallbackModel };
     return json;
   }
@@ -84,17 +97,20 @@ export class RegexRule {
 
   constructor({ pattern, targetProvider, targetModel, fallback }) {
     requireString(pattern, 'RegexRule.pattern');
-    requireString(targetProvider, 'RegexRule.targetProvider');
-    requireString(targetModel, 'RegexRule.targetModel');
+    optionalString(targetProvider, 'RegexRule.targetProvider');
+    optionalString(targetModel, 'RegexRule.targetModel');
+    const fb = validateFallback(fallback);
+    if (!targetProvider && !fb.providerId) {
+      throw new ArgumentError('Rule must have a target or a fallback', { context: { pattern } });
+    }
     try {
       this.#compiled = new RegExp(pattern);
     } catch (e) {
       throw new ArgumentError(`RegexRule.pattern is not a valid regex: ${e.message}`, { context: { pattern } });
     }
     this.#pattern = pattern;
-    this.#targetProviderId = targetProvider;
-    this.#targetModel = targetModel;
-    const fb = validateFallback(fallback);
+    this.#targetProviderId = targetProvider ?? null;
+    this.#targetModel = targetModel ?? null;
     this.#fallbackProviderId = fb.providerId;
     this.#fallbackModel = fb.model;
     Object.freeze(this);
@@ -107,6 +123,7 @@ export class RegexRule {
   get fallbackProviderId() { return this.#fallbackProviderId; }
   get fallbackModel() { return this.#fallbackModel; }
   get hasFallback() { return this.#fallbackProviderId !== null; }
+  get hasTarget() { return this.#targetProviderId !== null; }
 
   matches(body) {
     return typeof body.model === 'string' && this.#compiled.test(body.model);
@@ -115,7 +132,9 @@ export class RegexRule {
   toLabel() { return `regex:/${this.#pattern}/`; }
 
   toJSON() {
-    const json = { type: 'regex', pattern: this.#pattern, targetProvider: this.#targetProviderId, targetModel: this.#targetModel };
+    const json = { type: 'regex', pattern: this.#pattern };
+    if (this.#targetProviderId) json.targetProvider = this.#targetProviderId;
+    if (this.#targetModel) json.targetModel = this.#targetModel;
     if (this.#fallbackProviderId) json.fallback = { providerId: this.#fallbackProviderId, model: this.#fallbackModel };
     return json;
   }
@@ -130,12 +149,15 @@ export class PropertyRule {
 
   constructor({ property, targetProvider, targetModel, fallback }) {
     requireString(property, 'PropertyRule.property');
-    requireString(targetProvider, 'PropertyRule.targetProvider');
-    requireString(targetModel, 'PropertyRule.targetModel');
-    this.#property = property;
-    this.#targetProviderId = targetProvider;
-    this.#targetModel = targetModel;
+    optionalString(targetProvider, 'PropertyRule.targetProvider');
+    optionalString(targetModel, 'PropertyRule.targetModel');
     const fb = validateFallback(fallback);
+    if (!targetProvider && !fb.providerId) {
+      throw new ArgumentError('Rule must have a target or a fallback', { context: { property } });
+    }
+    this.#property = property;
+    this.#targetProviderId = targetProvider ?? null;
+    this.#targetModel = targetModel ?? null;
     this.#fallbackProviderId = fb.providerId;
     this.#fallbackModel = fb.model;
     Object.freeze(this);
@@ -148,6 +170,7 @@ export class PropertyRule {
   get fallbackProviderId() { return this.#fallbackProviderId; }
   get fallbackModel() { return this.#fallbackModel; }
   get hasFallback() { return this.#fallbackProviderId !== null; }
+  get hasTarget() { return this.#targetProviderId !== null; }
 
   matches(body) {
     return body[this.#property] !== undefined;
@@ -156,7 +179,9 @@ export class PropertyRule {
   toLabel() { return `property:${this.#property}`; }
 
   toJSON() {
-    const json = { type: 'property', property: this.#property, targetProvider: this.#targetProviderId, targetModel: this.#targetModel };
+    const json = { type: 'property', property: this.#property };
+    if (this.#targetProviderId) json.targetProvider = this.#targetProviderId;
+    if (this.#targetModel) json.targetModel = this.#targetModel;
     if (this.#fallbackProviderId) json.fallback = { providerId: this.#fallbackProviderId, model: this.#fallbackModel };
     return json;
   }
@@ -172,17 +197,20 @@ export class PayloadSizeRule {
 
   constructor({ thresholdBytes, operator, targetProvider, targetModel, fallback }) {
     requirePositiveInt(thresholdBytes, 'PayloadSizeRule.thresholdBytes');
-    requireString(targetProvider, 'PayloadSizeRule.targetProvider');
-    requireString(targetModel, 'PayloadSizeRule.targetModel');
+    optionalString(targetProvider, 'PayloadSizeRule.targetProvider');
+    optionalString(targetModel, 'PayloadSizeRule.targetModel');
+    const fb = validateFallback(fallback);
+    if (!targetProvider && !fb.providerId) {
+      throw new ArgumentError('Rule must have a target or a fallback', { context: { thresholdBytes } });
+    }
     const op = operator || 'gt';
     if (!VALID_OPERATORS.includes(op)) {
       throw new ArgumentError(`PayloadSizeRule.operator must be one of ${VALID_OPERATORS.join(', ')}`, { context: { operator: op } });
     }
     this.#thresholdBytes = thresholdBytes;
     this.#operator = op;
-    this.#targetProviderId = targetProvider;
-    this.#targetModel = targetModel;
-    const fb = validateFallback(fallback);
+    this.#targetProviderId = targetProvider ?? null;
+    this.#targetModel = targetModel ?? null;
     this.#fallbackProviderId = fb.providerId;
     this.#fallbackModel = fb.model;
     Object.freeze(this);
@@ -196,6 +224,7 @@ export class PayloadSizeRule {
   get fallbackProviderId() { return this.#fallbackProviderId; }
   get fallbackModel() { return this.#fallbackModel; }
   get hasFallback() { return this.#fallbackProviderId !== null; }
+  get hasTarget() { return this.#targetProviderId !== null; }
 
   matches(body) {
     const messages = body.messages;
@@ -209,7 +238,9 @@ export class PayloadSizeRule {
   toLabel() { return `payloadSize:${this.#operator}${this.#thresholdBytes}`; }
 
   toJSON() {
-    const json = { type: 'payloadSize', thresholdBytes: this.#thresholdBytes, targetProvider: this.#targetProviderId, targetModel: this.#targetModel };
+    const json = { type: 'payloadSize', thresholdBytes: this.#thresholdBytes };
+    if (this.#targetProviderId) json.targetProvider = this.#targetProviderId;
+    if (this.#targetModel) json.targetModel = this.#targetModel;
     if (this.#operator !== 'gt') json.operator = this.#operator;
     if (this.#fallbackProviderId) json.fallback = { providerId: this.#fallbackProviderId, model: this.#fallbackModel };
     return json;
@@ -257,8 +288,10 @@ export class RoutingPolicy {
       if (pid && !providerMap.has(pid)) {
         throw new ArgumentError(`Rule ${rule.toLabel()} references unknown provider "${pid}"`, { context: { rule: rule.toJSON() } });
       }
-      if (rule.hasFallback && !providerMap.has(rule.fallbackProviderId)) {
-        throw new ArgumentError(`Rule ${rule.toLabel()} fallback references unknown provider "${rule.fallbackProviderId}"`, { context: { rule: rule.toJSON() } });
+      if (rule.hasFallback) {
+        if (!providerMap.has(rule.fallbackProviderId)) {
+          throw new ArgumentError(`Rule ${rule.toLabel()} fallback references unknown provider "${rule.fallbackProviderId}"`, { context: { rule: rule.toJSON() } });
+        }
       }
       if (rule.type === 'exact') {
         if (exactMatches.has(rule.match)) {
@@ -277,6 +310,7 @@ export class RoutingPolicy {
   evaluate(body) {
     for (const rule of this.#rules) {
       if (rule.matches(body)) {
+        if (!rule.hasTarget) continue; // Passthrough — skip to next rule or legacy
         const provider = this.#providerMap.get(rule.targetProviderId);
         if (provider) return Option.some(new ProviderMatch(provider, rule.toLabel(), rule.targetModel));
       }
@@ -302,6 +336,10 @@ export class RoutingPolicy {
   evaluateWithRule(body) {
     for (const rule of this.#rules) {
       if (rule.matches(body)) {
+        if (!rule.hasTarget) {
+          // Passthrough rule — no primary target, but keep rule for fallback
+          return Option.some({ match: null, rule });
+        }
         const provider = this.#providerMap.get(rule.targetProviderId);
         if (provider) return Option.some({ match: new ProviderMatch(provider, rule.toLabel(), rule.targetModel), rule });
       }

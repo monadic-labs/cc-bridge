@@ -22,11 +22,15 @@ export function resolveRouting({ policy, body, urlSessionId, routedHeaders, anth
   const sessionId = urlSessionId || extractSessionId(body);
 
   const evalOpt = policy.evaluateWithRule(body);
-  const matchOpt = evalOpt.isSome ? Option.some(evalOpt.value.match) : Option.none();
+  const rawMatch = evalOpt.isSome ? evalOpt.value.match : null;
   const matchedRule = evalOpt.isSome ? evalOpt.value.rule : null;
 
+  // Passthrough rules (no target) have null match — route to Anthropic,
+  // but keep matchedRule for fallback detection
+  const matchOpt = rawMatch ? Option.some(rawMatch) : Option.none();
+
   const routing = applyRoutingWithMatch(body, matchOpt, anthropicBaseUrl);
-  const match = matchOpt.isSome ? matchOpt.value : null;
+  const match = rawMatch;
 
   let apiKey = '';
   if (match) {

@@ -99,5 +99,5 @@ export async function handleResponseEnd({ resCtx, resChunks, deps }) {
     }
   }
 
-  resCtx.res.end();
+  if (!resCtx.res.writableEnded) resCtx.res.end();
 }
