@@ -1,13 +1,60 @@
 import http from 'http';
 import https from 'https';
+import { randomBytes } from 'crypto';
 import { URL } from 'url';
 import { ProxyResponseContext } from './types.js';
 import { filterResponseHeaders } from './headers.js';
 import { SseResponseTransformer } from './sse-transformer.js';
-import { shouldAttemptFallback, resolveFallbackMatch, buildFallbackRequest } from './fallback-handler.js';
+import { shouldAttemptFallback, shouldAttemptFallbackForTcpError, resolveFallbackMatch, buildFallbackRequest } from './fallback-handler.js';
 
 /**
- * Forward the processed request to the upstream provider.
+ * Generate a unique cc-bridge error ID.
+ * Format: ccb-{timestamp_base36}-{random_hex}
+ */
+function generateErrorId() {
+  return `ccb-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`;
+}
+
+/**
+ * Sleep for ms, resolving early if the client disconnects.
+ */
+function sleepAbortable(ms, ctx) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    const onGone = () => { clearTimeout(timer); resolve(); };
+    ctx.req.on('close', onGone);
+    ctx.req.on('aborted', onGone);
+  });
+}
+
+/**
+ * Check if an upstream TCP error is retryable.
+ */
+function isRetryableTcpError(err, retryConfig) {
+  return retryConfig.retryOnTcpErrors.includes(err.code);
+}
+
+/**
+ * Check if an HTTP status code is retryable.
+ */
+function isRetryableStatusCode(statusCode, retryConfig) {
+  return retryConfig.retryOnStatusCodes.includes(statusCode);
+}
+
+/**
+ * Check if a response body matches any retryable body pattern.
+ */
+function isRetryableBody(bodyStr, retryConfig) {
+  for (const pattern of retryConfig.retryOnBodyPatterns) {
+    try {
+      if (new RegExp(pattern).test(bodyStr)) return true;
+    } catch { /* invalid regex — skip */ }
+  }
+  return false;
+}
+
+/**
+ * Forward the processed request to the upstream provider with retry support.
  *
  * Selects http or https transport based on targetBase protocol, handles
  * timeout, error forwarding, and pipes the response through SSE
@@ -22,6 +69,140 @@ import { shouldAttemptFallback, resolveFallbackMatch, buildFallbackRequest } fro
  * @param {function} params.emit - Emit function for logging fallback events
  */
 export function forwardToUpstream({ ctx, handleResponseEnd, errorReporter, getConfig, policy, emit }) {
+  const retryConfig = getConfig().retry;
+  if (retryConfig.maxAttempts > 0) {
+    forwardWithRetry({ ctx, handleResponseEnd, errorReporter, getConfig, policy, emit, retryConfig, attempt: 0 });
+  } else {
+    singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, getConfig, policy, emit, retryConfig: null, onRetryNeeded: null });
+  }
+}
+
+/**
+ * Retry wrapper around singleForwardAttempt with exponential backoff.
+ */
+function forwardWithRetry({ ctx, handleResponseEnd, errorReporter, getConfig, policy, emit, retryConfig, attempt }) {
+  let settled = false;
+
+  const retryState = {
+    shouldRetry: false,
+    retryReason: '',
+  };
+
+  singleForwardAttempt({
+    ctx,
+    handleResponseEnd: ({ resCtx, resChunks }) => {
+      if (!retryState.shouldRetry) {
+        handleResponseEnd({ resCtx, resChunks });
+        return;
+      }
+      settled = true;
+      attemptRetry();
+    },
+    errorReporter,
+    getConfig,
+    policy,
+    emit,
+    retryConfig,
+    onTcpError: (err) => {
+      if (isRetryableTcpError(err, retryConfig) && attempt < retryConfig.maxAttempts) {
+        retryState.shouldRetry = true;
+        retryState.retryReason = err.code;
+        settled = true;
+        attemptRetry();
+        return true; // signal: suppress error response, retry instead
+      }
+      // Retries exhausted — try fallback before sending proxy_error
+      if (shouldAttemptFallbackForTcpError(ctx.matchedRule, ctx.fallbackDepth)) {
+        settled = true;
+        emit(`[#${ctx.id}] Retry exhausted (${retryConfig.maxAttempts} attempts), falling back: ${err.code}`, ctx.sessionId).catch(() => {});
+        attemptFallbackFromTcpError(ctx, err, handleResponseEnd, errorReporter, getConfig, policy, emit);
+        return true; // suppress normal error handling
+      }
+      return false;
+    },
+    onUpstreamResponse: (statusCode, bodyStr) => {
+      if (attempt >= retryConfig.maxAttempts) return false;
+      if (isRetryableStatusCode(statusCode, retryConfig)) {
+        retryState.shouldRetry = true;
+        retryState.retryReason = `HTTP ${statusCode}`;
+        return true;
+      }
+      if (isRetryableBody(bodyStr, retryConfig)) {
+        retryState.shouldRetry = true;
+        retryState.retryReason = `body pattern match`;
+        return true;
+      }
+      return false;
+    },
+    onRetryNeeded: () => {
+      settled = true;
+      attemptRetry();
+    },
+  });
+
+  function attemptRetry() {
+    if (ctx.clientAborted) {
+      emit(`[#${ctx.id}] Retry aborted (client gone) after attempt ${attempt}`, ctx.sessionId).catch(() => {});
+      return;
+    }
+
+    const nextAttempt = attempt + 1;
+    const delay = Math.min(retryConfig.baseDelayMs * Math.pow(2, attempt), retryConfig.maxDelayMs);
+
+    emit(`[#${ctx.id}] Retrying (attempt ${nextAttempt}/${retryConfig.maxAttempts}, ${delay}ms): ${retryState.retryReason}`, ctx.sessionId).catch(() => {});
+
+    sleepAbortable(delay, ctx).then(() => {
+      if (ctx.clientAborted) {
+        emit(`[#${ctx.id}] Retry aborted (client gone) during backoff`, ctx.sessionId).catch(() => {});
+        return;
+      }
+      forwardWithRetry({ ctx, handleResponseEnd, errorReporter, getConfig, policy, emit, retryConfig, attempt: nextAttempt });
+    });
+  }
+}
+
+/**
+ * Attempt fallback after retry-exhausted TCP error.
+ *
+ * Reuses the same fallback resolution as processProxyResponse:
+ * resolveFallbackMatch → buildFallbackRequest → forwardToUpstream.
+ */
+function attemptFallbackFromTcpError(ctx, err, handleResponseEnd, errorReporter, getConfig, policy, emit) {
+  const fallbackMatchOpt = resolveFallbackMatch(policy, ctx.matchedRule);
+  if (fallbackMatchOpt.isNone) {
+    // Should not happen — shouldAttemptFallbackForTcpError already checked hasFallback
+    return;
+  }
+
+  const fallbackResult = buildFallbackRequest(ctx.originalBody, fallbackMatchOpt.value, ctx.routedHeaders);
+  if (!fallbackResult) return;
+
+  const fallbackCtx = ctx.withRouting({
+    routeLabel: fallbackResult.label,
+    reqModel: ctx.reqModel,
+    sessionId: ctx.sessionId,
+    routedHeaders: fallbackResult.routedHeaders,
+    forwardBody: fallbackResult.forwardBody,
+    targetBase: fallbackResult.targetBase,
+    isCustom: true,
+    rawBody: ctx.rawBody,
+    originalBody: ctx.originalBody,
+    sanitizationReport: fallbackResult.sanitizationReport,
+    fallbackDepth: ctx.fallbackDepth + 1,
+    matchedRule: null
+  });
+
+  forwardToUpstream({ ctx: fallbackCtx, handleResponseEnd, errorReporter, getConfig, policy, emit });
+}
+
+/**
+ * Single attempt to forward the request upstream.
+ *
+ * @param {object} params
+ * @param {function|null} params.onTcpError - Called on TCP error; return true to suppress error response
+ * @param {function|null} params.onUpstreamResponse - Called with (statusCode, bodyStr) for 4xx/5xx; return true to buffer instead of stream
+ */
+function singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, getConfig, policy, emit, retryConfig, onTcpError, onUpstreamResponse, onRetryNeeded }) {
   const target = new URL(ctx.targetBase + (ctx.req.url ?? '/'));
   const finalHeaders = { ...ctx.routedHeaders, host: target.host, 'content-length': String(ctx.forwardBody.length) };
   if (ctx.isCustom) delete finalHeaders['accept-encoding'];
@@ -33,7 +214,9 @@ export function forwardToUpstream({ ctx, handleResponseEnd, errorReporter, getCo
     { hostname: target.hostname, port: target.port || defaultPort, path: target.pathname + target.search, method: ctx.req.method, headers: finalHeaders },
     (proxyRes) => handleProxyResponse({
       reqCtx: ctx, proxyRes, headers: finalHeaders, handleResponseEnd, errorReporter, getConfig, policy, emit,
-      forwardToUpstream: ({ ctx: fallbackCtx }) => forwardToUpstream({ ctx: fallbackCtx, handleResponseEnd, errorReporter, getConfig, policy, emit })
+      forwardToUpstream: ({ ctx: fallbackCtx }) => forwardToUpstream({ ctx: fallbackCtx, handleResponseEnd, errorReporter, getConfig, policy, emit }),
+      onUpstreamResponse,
+      onRetryNeeded
     })
   );
 
@@ -54,8 +237,16 @@ export function forwardToUpstream({ ctx, handleResponseEnd, errorReporter, getCo
   }
 
   proxyReq.on('error', (err) => {
+    const errorId = generateErrorId();
+
+    // Check if retry wants to handle this TCP error
+    if (onTcpError && onTcpError(err)) {
+      emit(`[#${ctx.id}] ${errorId} Retriable TCP error: ${err.code}`, ctx.sessionId).catch(() => {});
+      return;
+    }
+
     if (clientGone) {
-      // Client already left — log quietly, do NOT touch the response object.
+      emit(`[#${ctx.id}] ${errorId} proxy_error (client gone): ${err.message}`, ctx.sessionId).catch(() => {});
       return;
     }
 
@@ -65,8 +256,10 @@ export function forwardToUpstream({ ctx, handleResponseEnd, errorReporter, getCo
       errorReporter.write(err, { requestId: ctx.id, route: ctx.routeLabel, method: ctx.req.method, url: ctx.req.url, sessionId: ctx.sessionId, headers: finalHeaders });
     }
 
+    emit(`[#${ctx.id}] ${errorId} proxy_error: ${err.message}`, ctx.sessionId).catch(() => {});
+
     if (!ctx.res.headersSent) ctx.res.writeHead(400, { 'content-type': 'application/json' });
-    if (!ctx.res.writableEnded) ctx.res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: `Upstream connection failed: ${err.message}` } }));
+    if (!ctx.res.writableEnded) ctx.res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: `Upstream connection failed: ${err.message}`, error_id: errorId } }));
   });
 
   proxyReq.write(ctx.forwardBody);
@@ -79,16 +272,51 @@ export function forwardToUpstream({ ctx, handleResponseEnd, errorReporter, getCo
  *
  * When the upstream returns an error (4xx/5xx) and the matched rule has a fallback,
  * buffers the error response and re-routes to the fallback provider instead.
+ *
+ * When retry is configured and the error matches retry criteria, buffers the
+ * response and signals retry instead of streaming to the client.
  */
-export function handleProxyResponse({ reqCtx, proxyRes, headers, handleResponseEnd, errorReporter, getConfig, policy, emit, forwardToUpstream }) {
+export function handleProxyResponse({ reqCtx, proxyRes, headers, handleResponseEnd, errorReporter, getConfig, policy, emit, forwardToUpstream, onUpstreamResponse, onRetryNeeded }) {
+  if (reqCtx.clientAborted) {
+    proxyRes.resume(); // drain the response
+    return;
+  }
+
   const statusCode = proxyRes.statusCode;
   const matchedRule = reqCtx.matchedRule;
 
-  // ── Fallback interception ──
-  if (shouldAttemptFallback(statusCode, matchedRule, reqCtx.fallbackDepth)) {
+  // ── Retry interception for error responses ──
+  if (onUpstreamResponse && statusCode >= 400) {
     const errorChunks = [];
     proxyRes.on('data', (chunk) => errorChunks.push(chunk));
     proxyRes.on('end', () => {
+      const bodyStr = Buffer.concat(errorChunks).toString('utf8');
+      if (onUpstreamResponse(statusCode, bodyStr)) {
+        if (onRetryNeeded) onRetryNeeded();
+        return;
+      }
+      // Not retryable — fall through to fallback or normal streaming
+      processProxyResponse(reqCtx, proxyRes, statusCode, headers, errorChunks, handleResponseEnd, errorReporter, getConfig, policy, emit, forwardToUpstream, matchedRule);
+    });
+    proxyRes.on('error', () => { if (!reqCtx.res.writableEnded && !reqCtx.clientAborted) reqCtx.res.end(); });
+    return;
+  }
+
+  processProxyResponse(reqCtx, proxyRes, statusCode, headers, null, handleResponseEnd, errorReporter, getConfig, policy, emit, forwardToUpstream, matchedRule);
+}
+
+/**
+ * Process an upstream response: fallback interception, streaming, SSE transformation.
+ */
+function processProxyResponse(reqCtx, proxyRes, statusCode, headers, bufferedChunks, handleResponseEnd, errorReporter, getConfig, policy, emit, forwardToUpstream, matchedRule) {
+  // ── Fallback interception ──
+  if (shouldAttemptFallback(statusCode, matchedRule, reqCtx.fallbackDepth)) {
+    const errorChunks = bufferedChunks ?? [];
+    if (!bufferedChunks) {
+      proxyRes.on('data', (chunk) => errorChunks.push(chunk));
+    }
+
+    const afterBuffer = () => {
       const fallbackMatchOpt = resolveFallbackMatch(policy, matchedRule);
       if (fallbackMatchOpt.isNone) {
         streamBufferedError(reqCtx, proxyRes, errorChunks, handleResponseEnd, headers);
@@ -121,9 +349,15 @@ export function handleProxyResponse({ reqCtx, proxyRes, headers, handleResponseE
       });
 
       forwardToUpstream({ ctx: fallbackCtx });
-    });
+    };
+
+    if (bufferedChunks) {
+      afterBuffer();
+    } else {
+      proxyRes.on('end', afterBuffer);
+    }
     proxyRes.on('error', () => {
-      if (!reqCtx.res.headersSent) {
+      if (!reqCtx.res.headersSent && !reqCtx.clientAborted) {
         streamBufferedError(reqCtx, proxyRes, [], handleResponseEnd, headers);
       }
     });
@@ -134,12 +368,19 @@ export function handleProxyResponse({ reqCtx, proxyRes, headers, handleResponseE
   const isSse = (proxyRes.headers['content-type'] || '').includes('text/event-stream');
   const shouldTransform = reqCtx.isCustom && isSse;
 
+  // If we already buffered the response (from retry check), stream it directly
+  if (bufferedChunks) {
+    streamBufferedResponse(reqCtx, proxyRes, bufferedChunks, handleResponseEnd, headers);
+    return;
+  }
+
   const resHeaders = filterResponseHeaders(proxyRes.headers);
   if (shouldTransform) {
     delete resHeaders['content-encoding'];
     delete resHeaders['content-length'];
   }
 
+  if (reqCtx.clientAborted) return;
   reqCtx.res.writeHead(proxyRes.statusCode, resHeaders);
 
   reqCtx.res.on('error', (err) => {
@@ -152,19 +393,21 @@ export function handleProxyResponse({ reqCtx, proxyRes, headers, handleResponseE
   if (shouldTransform) {
     const transformer = new SseResponseTransformer();
     proxyRes.on('data', (chunk) => {
+      if (reqCtx.clientAborted) return;
       const transformedStr = transformer.transformChunk(chunk.toString('utf8'));
       if (transformedStr) {
         const buf = Buffer.from(transformedStr, 'utf8');
         resChunks.push(buf);
-        reqCtx.res.write(buf);
+        if (!reqCtx.clientAborted) reqCtx.res.write(buf);
       }
     });
     proxyRes.on('end', () => {
+      if (reqCtx.clientAborted) return;
       const rest = transformer.flush();
       if (rest) {
         const buf = Buffer.from(rest, 'utf8');
         resChunks.push(buf);
-        reqCtx.res.write(buf);
+        if (!reqCtx.clientAborted) reqCtx.res.write(buf);
       }
       const resCtx = new ProxyResponseContext({
         proxyRes, res: reqCtx.res, id: reqCtx.id, startTime: reqCtx.startTime,
@@ -174,12 +417,16 @@ export function handleProxyResponse({ reqCtx, proxyRes, headers, handleResponseE
       });
       handleResponseEnd({ resCtx, resChunks });
     });
-    proxyRes.on('error', () => { if (!reqCtx.res.writableEnded) reqCtx.res.end(); });
+    proxyRes.on('error', () => { if (!reqCtx.res.writableEnded && !reqCtx.clientAborted) reqCtx.res.end(); });
   } else {
-    proxyRes.on('data', (chunk) => { resChunks.push(chunk); reqCtx.res.write(chunk); });
-    proxyRes.on('error', () => { if (!reqCtx.res.writableEnded) reqCtx.res.end(); });
+    proxyRes.on('data', (chunk) => {
+      resChunks.push(chunk);
+      if (!reqCtx.clientAborted) reqCtx.res.write(chunk);
+    });
+    proxyRes.on('error', () => { if (!reqCtx.res.writableEnded && !reqCtx.clientAborted) reqCtx.res.end(); });
 
     proxyRes.on('end', () => {
+      if (reqCtx.clientAborted) return;
       const resCtx = new ProxyResponseContext({
         proxyRes, res: reqCtx.res, id: reqCtx.id, startTime: reqCtx.startTime,
         routeLabel: reqCtx.routeLabel, reqModel: reqCtx.reqModel, sessionId: reqCtx.sessionId,
@@ -192,9 +439,36 @@ export function handleProxyResponse({ reqCtx, proxyRes, headers, handleResponseE
 }
 
 /**
+ * Stream a buffered response to the client (used after retry/fallback buffering).
+ */
+function streamBufferedResponse(reqCtx, proxyRes, chunks, handleResponseEnd, headers) {
+  if (reqCtx.clientAborted) return;
+
+  if (reqCtx.res.headersSent) {
+    if (!reqCtx.res.writableEnded) reqCtx.res.end();
+    return;
+  }
+  const resHeaders = filterResponseHeaders(proxyRes.headers);
+  reqCtx.res.writeHead(proxyRes.statusCode, resHeaders);
+  for (const chunk of chunks) {
+    reqCtx.res.write(chunk);
+  }
+
+  const resCtx = new ProxyResponseContext({
+    proxyRes, res: reqCtx.res, id: reqCtx.id, startTime: reqCtx.startTime,
+    routeLabel: reqCtx.routeLabel, reqModel: reqCtx.reqModel, sessionId: reqCtx.sessionId,
+    headers, req: reqCtx.req, isCustom: reqCtx.isCustom, rawBody: reqCtx.rawBody, forwardBody: reqCtx.forwardBody,
+    sanitizationReport: reqCtx.sanitizationReport
+  });
+  handleResponseEnd({ resCtx, resChunks: chunks });
+}
+
+/**
  * Stream a buffered upstream error to the client when fallback is not possible.
  */
 function streamBufferedError(reqCtx, proxyRes, chunks, handleResponseEnd, headers) {
+  if (reqCtx.clientAborted) return;
+
   if (reqCtx.res.headersSent) {
     if (!reqCtx.res.writableEnded) reqCtx.res.end();
     return;

@@ -108,6 +108,8 @@ export class ProxyRequestContext {
   get originalBody() { return this.#originalBody; }
   get fallbackDepth() { return this.#fallbackDepth; }
   get matchedRule() { return this.#matchedRule; }
+  /** True when the client has disconnected (aborted or closed the request). Checked live, no propagation needed. */
+  get clientAborted() { return this.#req.aborted || this.#res.destroyed || (this.#req.socket?.destroyed ?? false); }
 
   withRouting({ routeLabel, reqModel, sessionId, routedHeaders, forwardBody, targetBase, isCustom, rawBody, sanitizationReport, originalBody, fallbackDepth, matchedRule }) {
     const next = new ProxyRequestContext({ req: this.#req, res: this.#res, id: this.#id, startTime: this.#startTime, urlSessionId: this.#urlSessionId });

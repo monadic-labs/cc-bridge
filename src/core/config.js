@@ -4,6 +4,32 @@ import os from 'os';
 import { ConfigError } from './exceptions.js';
 import { ensureCompleteConfig } from './migrator.js';
 
+export class RetryConfig {
+  #maxAttempts;
+  #baseDelayMs;
+  #maxDelayMs;
+  #retryOnStatusCodes;
+  #retryOnTcpErrors;
+  #retryOnBodyPatterns;
+
+  constructor(raw) {
+    this.#maxAttempts = raw.maxAttempts ?? 0;
+    this.#baseDelayMs = raw.baseDelayMs ?? 500;
+    this.#maxDelayMs = raw.maxDelayMs ?? 5000;
+    this.#retryOnStatusCodes = Object.freeze([...(raw.retryOnStatusCodes ?? [])]);
+    this.#retryOnTcpErrors = Object.freeze([...(raw.retryOnTcpErrors ?? [])]);
+    this.#retryOnBodyPatterns = Object.freeze([...(raw.retryOnBodyPatterns ?? [])]);
+    Object.freeze(this);
+  }
+
+  get maxAttempts() { return this.#maxAttempts; }
+  get baseDelayMs() { return this.#baseDelayMs; }
+  get maxDelayMs() { return this.#maxDelayMs; }
+  get retryOnStatusCodes() { return this.#retryOnStatusCodes; }
+  get retryOnTcpErrors() { return this.#retryOnTcpErrors; }
+  get retryOnBodyPatterns() { return this.#retryOnBodyPatterns; }
+}
+
 export class ProxyConfig {
   #loggingEnabled;
   #logRequests;
@@ -18,6 +44,7 @@ export class ProxyConfig {
   #upstreamTimeoutMs;
   #recompressRequests;
   #loggingLevel;
+  #retry;
 
   constructor(raw) {
     if (!raw || typeof raw !== 'object') {
@@ -73,6 +100,7 @@ export class ProxyConfig {
     this.#port = port;
     this.#recompressRequests = compression.recompressRequests;
     this.#loggingLevel = level;
+    this.#retry = new RetryConfig(daemon.retry ?? {});
     Object.freeze(this);
   }
 
@@ -89,6 +117,7 @@ export class ProxyConfig {
   get pollMaxAttempts() { return this.#pollMaxAttempts; }
   get upstreamTimeoutMs() { return this.#upstreamTimeoutMs; }
   get recompressRequests() { return this.#recompressRequests; }
+  get retry() { return this.#retry; }
 }
 
 export function parseConfig(jsonString) {

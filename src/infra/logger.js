@@ -71,7 +71,7 @@ export class Logger {
     let detail = '';
     try {
       const parsed = JSON.parse(raw);
-      if (parsed.error) detail = ` | error: ${parsed.error.type} "${parsed.error.message}"`;
+      if (parsed.error) detail = ` | error: ${parsed.error.type ?? 'unknown'} "${parsed.error.message}"`;
     } catch { }
     await this.emit(`[RES #${id}] ← ${statusCode}${detail}`, sessionId);
 

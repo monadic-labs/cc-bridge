@@ -88,9 +88,10 @@ export function parsePayloadSizeKey(key) {
 
 /**
  * Normalize a route value — bare string becomes { target }, object passes through.
+ * Object may omit target for passthrough-with-fallback rules.
  *
  * @param {string|object} value
- * @returns {{ target: string, fallback?: string[] }}
+ * @returns {{ target: string|null, fallback?: string[] }}
  */
 export function normalizeRouteValue(value) {
   if (typeof value === 'string') return { target: value };
@@ -129,14 +130,17 @@ export function convertV2ToInternal(v2Json) {
   const models = routes.models ?? {};
   for (const [key, rawValue] of Object.entries(models)) {
     const value = normalizeRouteValue(rawValue);
-    const target = parseTarget(value.target);
     const keyParsed = parseRouteKey(key);
 
     const rule = {
       type: keyParsed.type,
-      targetProvider: target.providerId,
-      targetModel: target.model
     };
+
+    if (value.target) {
+      const target = parseTarget(value.target);
+      rule.targetProvider = target.providerId;
+      rule.targetModel = target.model;
+    }
 
     if (keyParsed.type === 'exact') {
       rule.match = keyParsed.match;
@@ -156,14 +160,17 @@ export function convertV2ToInternal(v2Json) {
   const properties = routes.properties ?? {};
   for (const [prop, rawValue] of Object.entries(properties)) {
     const value = normalizeRouteValue(rawValue);
-    const target = parseTarget(value.target);
 
     const rule = {
       type: 'property',
       property: prop,
-      targetProvider: target.providerId,
-      targetModel: target.model
     };
+
+    if (value.target) {
+      const target = parseTarget(value.target);
+      rule.targetProvider = target.providerId;
+      rule.targetModel = target.model;
+    }
 
     if (value.fallback && value.fallback.length > 0) {
       const fb = parseTarget(value.fallback[0]);
@@ -177,16 +184,19 @@ export function convertV2ToInternal(v2Json) {
   const payloadSizes = routes.payloadSize ?? {};
   for (const [key, rawValue] of Object.entries(payloadSizes)) {
     const value = normalizeRouteValue(rawValue);
-    const target = parseTarget(value.target);
     const sizeParsed = parsePayloadSizeKey(key);
 
     const rule = {
       type: 'payloadSize',
       thresholdBytes: sizeParsed.thresholdBytes,
       operator: sizeParsed.operator,
-      targetProvider: target.providerId,
-      targetModel: target.model
     };
+
+    if (value.target) {
+      const target = parseTarget(value.target);
+      rule.targetProvider = target.providerId;
+      rule.targetModel = target.model;
+    }
 
     if (value.fallback && value.fallback.length > 0) {
       const fb = parseTarget(value.fallback[0]);

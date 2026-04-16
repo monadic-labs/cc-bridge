@@ -491,6 +491,61 @@ async function runUnitTests() {
   assertThrows(() => createRule({ type: 'unknown' }), ArgErr, 'createRule unknown type');
   assertThrows(() => createRule(null), ArgErr, 'createRule null');
 
+  // ── Passthrough-with-fallback rules (no target) ──
+  console.log('\nPassthrough-with-fallback rules:');
+  // ExactRule with fallback only (no target) → passthrough to Anthropic, fallback on error
+  const passExact = new ExactRule({ match: 'glm-5.1', targetProvider: null, targetModel: null, fallback: { providerId: 'local', model: 'glm-5.1' } });
+  assert(passExact.type === 'exact', 'PassthroughRule exact type');
+  assert(passExact.hasTarget === false, 'PassthroughRule hasTarget false');
+  assert(passExact.hasFallback === true, 'PassthroughRule hasFallback true');
+  assert(passExact.targetProviderId === null, 'PassthroughRule targetProviderId null');
+  assert(passExact.targetModel === null, 'PassthroughRule targetModel null');
+  assert(passExact.fallbackProviderId === 'local', 'PassthroughRule fallbackProviderId');
+  assert(passExact.fallbackModel === 'glm-5.1', 'PassthroughRule fallbackModel');
+  assert(passExact.matches({ model: 'glm-5.1' }) === true, 'PassthroughRule matches');
+  assert(passExact.toJSON().targetProvider === undefined, 'PassthroughRule.toJSON omits target');
+
+  // RegexRule passthrough
+  const passRegex = new RegexRule({ pattern: 'opus', targetProvider: null, targetModel: null, fallback: { providerId: 'local', model: 'fallback-opus' } });
+  assert(passRegex.hasTarget === false, 'PassthroughRegexRule hasTarget false');
+  assert(passRegex.hasFallback === true, 'PassthroughRegexRule hasFallback true');
+  assert(passRegex.matches({ model: 'claude-opus-4-6' }) === true, 'PassthroughRegexRule matches');
+
+  // Rule with neither target nor fallback → should throw
+  assertThrows(() => new ExactRule({ match: 'x', targetProvider: null, targetModel: null }), ArgErr, 'Rule no target no fallback throws');
+  assertThrows(() => new ExactRule({ match: 'x' }), ArgErr, 'Rule no args throws');
+
+  // Rule with target but no fallback → still works
+  const targetOnly = new ExactRule({ match: 'has-target', targetProvider: 'p1', targetModel: 'm1' });
+  assert(targetOnly.hasTarget === true, 'TargetOnlyRule hasTarget true');
+  assert(targetOnly.hasFallback === false, 'TargetOnlyRule hasFallback false');
+
+  // Config adapter: fallback-only route value
+  assert(normalizeRouteValue({ fallback: ['z.glm-5.1'] }).target === undefined, 'normalizeRouteValue fallback-only no target');
+  assert(normalizeRouteValue({ fallback: ['z.glm-5.1'] }).fallback.length === 1, 'normalizeRouteValue fallback-only has fallback');
+
+  // Config adapter: convertV2ToInternal with fallback-only model
+  const v2Passthrough = {
+    providers: { z: { url: 'https://api.z.ai/api/anthropic', anthropicCompliant: false } },
+    routes: {
+      models: {
+        'glm-5.1': { fallback: ['z.glm-5.1'] },
+        'glm-4.7': 'z.glm-4.7'
+      },
+      properties: {},
+      payloadSize: {}
+    }
+  };
+  const passInternal = convertV2ToInternal(v2Passthrough);
+  assert(passInternal.routingPolicy.length === 2, 'convertV2ToInternal passthrough rules count');
+  const passRule = passInternal.routingPolicy.find(r => r.match === 'glm-5.1');
+  assert(passRule !== undefined, 'convertV2ToInternal passthrough rule exists');
+  assert(passRule.targetProvider === undefined, 'convertV2ToInternal passthrough no targetProvider');
+  assert(passRule.fallback.providerId === 'z', 'convertV2ToInternal passthrough fallback providerId');
+  assert(passRule.fallback.model === 'glm-5.1', 'convertV2ToInternal passthrough fallback model');
+  const normalRule = passInternal.routingPolicy.find(r => r.match === 'glm-4.7');
+  assert(normalRule.targetProvider === 'z', 'convertV2ToInternal normal still has target');
+
   // ── RoutingPolicy ──
   console.log('\nRoutingPolicy:');
   const policyProviders = [
@@ -535,6 +590,32 @@ async function runUnitTests() {
   assert(targets.includes('fast'), 'allTargetModels includes fast');
   assert(targets.includes('mirror-model'), 'allTargetModels includes legacy');
 
+  // RoutingPolicy with passthrough rule
+  const policyWithPassthrough = new RoutingPolicy({
+    rules: [
+      new ExactRule({ match: 'passthrough-model', targetProvider: null, targetModel: null, fallback: { providerId: 'mirror', model: 'fallback-m' } }),
+      new ExactRule({ match: 'normal-model', targetProvider: 'mirror', targetModel: 'real-model' })
+    ],
+    providerConfigs: policyProviders,
+    legacyProvidersMap: legacyMap
+  });
+  // evaluate: passthrough rule returns none (no provider match)
+  const passEval = policyWithPassthrough.evaluate({ model: 'passthrough-model' });
+  assert(passEval.isNone, 'policy evaluate passthrough returns none (routes to Anthropic)');
+  // evaluate: normal rule still works
+  const normalEval = policyWithPassthrough.evaluate({ model: 'normal-model' });
+  assert(normalEval.isSome, 'policy evaluate normal still works');
+  // evaluateWithRule: passthrough returns rule with null match
+  const passWithRule = policyWithPassthrough.evaluateWithRule({ model: 'passthrough-model' });
+  assert(passWithRule.isSome, 'policy evaluateWithRule passthrough isSome');
+  assert(passWithRule.value.match === null, 'policy evaluateWithRule passthrough match null');
+  assert(passWithRule.value.rule !== null, 'policy evaluateWithRule passthrough rule present');
+  assert(passWithRule.value.rule.hasFallback === true, 'policy evaluateWithRule passthrough rule hasFallback');
+  assert(passWithRule.value.rule.hasTarget === false, 'policy evaluateWithRule passthrough rule hasTarget false');
+  // evaluateWithRule: unknown model returns none
+  const unknownWithRule = policyWithPassthrough.evaluateWithRule({ model: 'unknown' });
+  assert(unknownWithRule.isNone, 'policy evaluateWithRule unknown returns none');
+
   // buildRoutingPolicy
   console.log('\nbuildRoutingPolicy:');
   const builtPolicy = buildRoutingPolicy({
@@ -578,6 +659,28 @@ async function runUnitTests() {
   const routedNone = applyRoutingWithMatch({ model: 'unknown', messages: [] }, noneOpt, 'https://api.anthropic.com');
   assert(routedNone.isCustom === false, 'applyRoutingWithMatch falls back to Anthropic');
   assert(routedNone.targetBase === 'https://api.anthropic.com', 'applyRoutingWithMatch Anthropic base');
+
+  // ── Fallback handler ──
+  console.log('\nFallback handler:');
+  const { shouldAttemptFallback, shouldAttemptFallbackForTcpError } = await import('../src/core/fallback-handler.js');
+
+  // Mock rule objects for fallback testing
+  const ruleWithFallback = { hasFallback: true, fallbackProviderId: 'mirror', fallbackModel: 'fb-m' };
+  const ruleNoFallback = { hasFallback: false, fallbackProviderId: null, fallbackModel: null };
+
+  // shouldAttemptFallback — HTTP errors
+  assert(shouldAttemptFallback(500, ruleWithFallback, 0) === true, 'fallback 500 with rule');
+  assert(shouldAttemptFallback(502, ruleWithFallback, 0) === true, 'fallback 502 with rule');
+  assert(shouldAttemptFallback(200, ruleWithFallback, 0) === false, 'fallback 200 skipped');
+  assert(shouldAttemptFallback(400, ruleNoFallback, 0) === false, 'fallback 400 no rule');
+  assert(shouldAttemptFallback(500, null, 0) === false, 'fallback null rule');
+  assert(shouldAttemptFallback(500, ruleWithFallback, 3) === false, 'fallback depth exceeded');
+
+  // shouldAttemptFallbackForTcpError — TCP errors (no HTTP status)
+  assert(shouldAttemptFallbackForTcpError(ruleWithFallback, 0) === true, 'tcp fallback with rule');
+  assert(shouldAttemptFallbackForTcpError(ruleNoFallback, 0) === false, 'tcp fallback no rule');
+  assert(shouldAttemptFallbackForTcpError(null, 0) === false, 'tcp fallback null rule');
+  assert(shouldAttemptFallbackForTcpError(ruleWithFallback, 3) === false, 'tcp fallback depth exceeded');
 
   // ── v1 auto-migration via ensureCompleteProviders ──
   console.log('\nv1 auto-migration:');
@@ -878,7 +981,7 @@ function assertModel(model, expectedPattern) {
 
   const result = spawnSync(process.execPath, [CCB_BIN, ...args], {
     encoding: 'utf8',
-    timeout: 60000,
+    timeout: 20000,
     env: {
       ...process.env,
       CCB_CONFIG_DIR: TEST_CONFIG_DIR
@@ -893,7 +996,7 @@ function assertModel(model, expectedPattern) {
   if (responseLine) console.log(`Response: ${responseLine}`);
 
   if (result.error?.code === 'ETIMEDOUT' || result.status === null) {
-    console.error(`  FAIL: Timed out for ${model} after 60s.`);
+    console.error(`  FAIL: Timed out for ${model} after 20s.`);
     return false;
   }
 
