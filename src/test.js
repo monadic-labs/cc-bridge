@@ -354,6 +354,36 @@ async function runUnitTests() {
   assert(internal.routingPolicy.some(r => r.type === 'regex' && r.pattern.includes('haiku')), 'convertV2ToInternal wildcard rule');
   assert(internal.routingPolicy.some(r => r.type === 'property' && r.property === 'thinking'), 'convertV2ToInternal property rule');
   assert(internal.routingPolicy.some(r => r.type === 'payloadSize' && r.thresholdBytes === 102400), 'convertV2ToInternal payloadSize rule');
+  assert(internal.defaultFallback === null, 'convertV2ToInternal no defaultFallback when absent');
+
+  // convertV2ToInternal with routes.defaults
+  const v2WithDefaults = {
+    providers: { z: { url: 'https://api.z.ai/api/anthropic', anthropicCompliant: false } },
+    routes: {
+      defaults: { fallback: ['z.glm-5.1'] },
+      models: { 'glm-4.7': 'z.glm-4.7' }
+    }
+  };
+  const internalWithDefaults = convertV2ToInternal(v2WithDefaults);
+  assert(internalWithDefaults.defaultFallback !== null, 'convertV2ToInternal parses defaults');
+  assert(internalWithDefaults.defaultFallback.providerId === 'z', 'convertV2ToInternal defaultFallback providerId');
+  assert(internalWithDefaults.defaultFallback.model === 'glm-5.1', 'convertV2ToInternal defaultFallback model');
+
+  // convertV2ToInternal with empty defaults.fallback
+  const v2EmptyDefaults = {
+    providers: { z: { url: 'https://api.z.ai/api/anthropic', anthropicCompliant: false } },
+    routes: { defaults: { fallback: [] } }
+  };
+  const internalEmptyDefaults = convertV2ToInternal(v2EmptyDefaults);
+  assert(internalEmptyDefaults.defaultFallback === null, 'convertV2ToInternal empty fallback array');
+
+  // convertV2ToInternal with defaults object but no fallback
+  const v2DefaultsNoFallback = {
+    providers: { z: { url: 'https://api.z.ai/api/anthropic', anthropicCompliant: false } },
+    routes: { defaults: {} }
+  };
+  const internalDefaultsNoFallback = convertV2ToInternal(v2DefaultsNoFallback);
+  assert(internalDefaultsNoFallback.defaultFallback === null, 'convertV2ToInternal defaults without fallback');
 
   // convertV1ToV2
   const v1Config = {
@@ -646,6 +676,34 @@ async function runUnitTests() {
     legacyProvidersMap: legacyMap
   }), ArgErr, 'RoutingPolicy rejects duplicate exact match');
 
+  // defaultFallbackRule
+  console.log('\ndefaultFallbackRule:');
+  const policyWithDefault = buildRoutingPolicy({
+    rawPolicy: [{ type: 'exact', match: 'test', targetProvider: 'mirror', targetModel: 'm1' }],
+    providerConfigs: policyProviders,
+    legacyProvidersMap: legacyMap,
+    defaultFallback: { providerId: 'mirror', model: 'fallback-model' }
+  });
+  const dfRule = policyWithDefault.defaultFallbackRule;
+  assert(dfRule.isSome, 'defaultFallbackRule returns some when configured');
+  assert(dfRule.value.hasFallback === true, 'defaultFallbackRule hasFallback');
+  assert(dfRule.value.hasTarget === false, 'defaultFallbackRule hasTarget false');
+  assert(dfRule.value.fallbackProviderId === 'mirror', 'defaultFallbackRule fallbackProviderId');
+  assert(dfRule.value.fallbackModel === 'fallback-model', 'defaultFallbackRule fallbackModel');
+  assert(dfRule.value.toLabel() === 'default-fallback', 'defaultFallbackRule toLabel');
+
+  // defaultFallbackRule not configured
+  const dfNone = builtPolicy.defaultFallbackRule;
+  assert(dfNone.isNone, 'defaultFallbackRule returns none when not configured');
+
+  // Validation: default fallback references unknown provider
+  assertThrows(() => buildRoutingPolicy({
+    rawPolicy: [],
+    providerConfigs: policyProviders,
+    legacyProvidersMap: legacyMap,
+    defaultFallback: { providerId: 'nonexistent', model: 'm' }
+  }), ArgErr, 'RoutingPolicy rejects unknown default fallback provider');
+
   // ── applyRoutingWithMatch ──
   console.log('\napplyRoutingWithMatch:');
   const { applyRoutingWithMatch } = await import('../src/core/routing.js');
@@ -816,6 +874,31 @@ async function runUnitTests() {
     anthropicBaseUrl: 'https://api.anthropic.com'
   });
   assert(rrFallback.routing.targetBase === 'https://api.anthropic.com', 'resolveRouting falls back to Anthropic');
+  assert(rrFallback.match === null, 'resolveRouting no match for unknown model');
+  assert(rrFallback.matchedRule === null, 'resolveRouting no matchedRule without default fallback');
+
+  // resolveRouting with default fallback
+  const fallbackProvCfg = new ProviderConfig({ id: 'fb-p', url: 'https://fallback.example.com/v1', anthropicCompliant: true });
+  const policyWithDefaultFallback = buildRoutingPolicy({
+    rawPolicy: [],
+    providerConfigs: [testProvCfg, fallbackProvCfg],
+    legacyProvidersMap: new ProvidersMap([testProvCfg, fallbackProvCfg]),
+    defaultFallback: { providerId: 'fb-p', model: 'safe-model' }
+  });
+
+  const rrDefault = resolveRoutingFn({
+    policy: policyWithDefaultFallback,
+    body: { model: 'unknown-model', messages: [] },
+    urlSessionId: '',
+    routedHeaders: { authorization: 'Bearer oauth-tok' },
+    anthropicBaseUrl: 'https://api.anthropic.com'
+  });
+  assert(rrDefault.routing.targetBase === 'https://api.anthropic.com', 'resolveRouting with default still routes to Anthropic');
+  assert(rrDefault.match === null, 'resolveRouting with default has null match');
+  assert(rrDefault.matchedRule !== null, 'resolveRouting with default has matchedRule');
+  assert(rrDefault.matchedRule.hasFallback === true, 'resolveRouting default matchedRule hasFallback');
+  assert(rrDefault.matchedRule.fallbackProviderId === 'fb-p', 'resolveRouting default fallbackProviderId');
+  assert(rrDefault.matchedRule.fallbackModel === 'safe-model', 'resolveRouting default fallbackModel');
 
 }
 

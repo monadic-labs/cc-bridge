@@ -78,7 +78,8 @@ function tryParseProviders(data, filepath) {
     const policy = buildRoutingPolicy({
       rawPolicy: internal.routingPolicy ?? [],
       providerConfigs,
-      legacyProvidersMap: legacyMap
+      legacyProvidersMap: legacyMap,
+      defaultFallback: internal.defaultFallback ?? null
     });
     return Result.ok(policy);
   } catch (e) {

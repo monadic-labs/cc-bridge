@@ -206,7 +206,18 @@ export function convertV2ToInternal(v2Json) {
     routingPolicy.push(rule);
   }
 
-  return { providers, routingPolicy };
+  // routes.defaults → default fallback for unmatched (Anthropic-passthrough) requests
+  let defaultFallback = null;
+  const defaults = routes.defaults;
+  if (defaults && typeof defaults === 'object') {
+    const fallbackArr = defaults.fallback;
+    if (Array.isArray(fallbackArr) && fallbackArr.length > 0) {
+      const fb = parseTarget(fallbackArr[0]);
+      defaultFallback = { providerId: fb.providerId, model: fb.model };
+    }
+  }
+
+  return { providers, routingPolicy, defaultFallback };
 }
 
 /**

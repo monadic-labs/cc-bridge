@@ -22,13 +22,25 @@ export function resolveRouting({ policy, body, urlSessionId, routedHeaders, anth
   const sessionId = urlSessionId || extractSessionId(body);
 
   const evalOpt = policy.evaluateWithRule(body);
-  const rawMatch = evalOpt.isSome ? evalOpt.value.match : null;
-  const matchedRule = evalOpt.isSome ? evalOpt.value.rule : null;
+
+  // No rule matched — use default fallback if configured, otherwise pure Anthropic passthrough
+  if (evalOpt.isNone) {
+    const defaultRule = policy.defaultFallbackRule;
+    const routing = applyRoutingWithMatch(body, Option.none(), anthropicBaseUrl);
+    return {
+      reqModel, sessionId, routing,
+      routedHeaders: applyAuthHeaders({ headers: routedHeaders, match: null, apiKey: '' }),
+      match: null,
+      matchedRule: defaultRule.isSome ? defaultRule.value : null
+    };
+  }
+
+  const rawMatch = evalOpt.value.match;
+  const matchedRule = evalOpt.value.rule;
 
   // Passthrough rules (no target) have null match — route to Anthropic,
   // but keep matchedRule for fallback detection
   const matchOpt = rawMatch ? Option.some(rawMatch) : Option.none();
-
   const routing = applyRoutingWithMatch(body, matchOpt, anthropicBaseUrl);
   const match = rawMatch;
 

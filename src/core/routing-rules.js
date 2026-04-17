@@ -267,8 +267,9 @@ export class RoutingPolicy {
   #rules;
   #providerMap;
   #legacyMap;
+  #defaultFallbackRule;
 
-  constructor({ rules, providerConfigs, legacyProvidersMap }) {
+  constructor({ rules, providerConfigs, legacyProvidersMap, defaultFallback }) {
     if (!Array.isArray(rules)) {
       throw new ArgumentError('RoutingPolicy.rules must be an array', { context: { rules } });
     }
@@ -304,6 +305,25 @@ export class RoutingPolicy {
     this.#rules = Object.freeze([...rules]);
     this.#providerMap = Object.freeze(providerMap);
     this.#legacyMap = legacyProvidersMap ?? null;
+
+    if (defaultFallback) {
+      if (!providerMap.has(defaultFallback.providerId)) {
+        throw new ArgumentError(
+          `Default fallback references unknown provider "${defaultFallback.providerId}"`,
+          { context: { defaultFallback } }
+        );
+      }
+      this.#defaultFallbackRule = Object.freeze({
+        hasFallback: true,
+        hasTarget: false,
+        fallbackProviderId: defaultFallback.providerId,
+        fallbackModel: defaultFallback.model,
+        toLabel() { return 'default-fallback'; }
+      });
+    } else {
+      this.#defaultFallbackRule = null;
+    }
+
     Object.freeze(this);
   }
 
@@ -364,6 +384,16 @@ export class RoutingPolicy {
     return provider ? Option.some(provider) : Option.none();
   }
 
+  /**
+   * The default fallback rule for unmatched (Anthropic-passthrough) requests.
+   * Returns Option.some(rule) if configured, Option.none() otherwise.
+   */
+  get defaultFallbackRule() {
+    return this.#defaultFallbackRule
+      ? Option.some(this.#defaultFallbackRule)
+      : Option.none();
+  }
+
   get rules() { return [...this.#rules]; }
   get size() { return this.#rules.length; }
 
@@ -381,7 +411,7 @@ export class RoutingPolicy {
   }
 }
 
-export function buildRoutingPolicy({ rawPolicy, providerConfigs, legacyProvidersMap }) {
+export function buildRoutingPolicy({ rawPolicy, providerConfigs, legacyProvidersMap, defaultFallback }) {
   const rules = (rawPolicy ?? []).map((raw) => createRule(raw));
-  return new RoutingPolicy({ rules, providerConfigs, legacyProvidersMap });
+  return new RoutingPolicy({ rules, providerConfigs, legacyProvidersMap, defaultFallback });
 }
