@@ -10,6 +10,9 @@
     }
   },
   "routes": {
+    "defaults": {
+      "fallback": ["my-mirror.claude-sonnet-4-6"]
+    },
     "models": {
       "my-sonnet": "my-mirror.claude-sonnet-4-6",
       "my-opus": "my-mirror.claude-opus-4-6",
