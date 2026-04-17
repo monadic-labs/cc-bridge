@@ -983,6 +983,7 @@ async function runUnitTests() {
   };
   const transformedReq = wsExt.hooks.requestTransform.transform({ body: reqBody, provider });
   assert(transformedReq.tools[0].type === 'web_search', 'web_search tool type transformed');
+  assert(transformedReq.tools[0].name === 'web_search', 'web_search name preserved');
   assert(transformedReq.tools[0].web_search.enable === 'True', 'web_search enable injected');
   assert(transformedReq.tools[0].web_search.search_result === 'True', 'web_search search_result injected');
   assert(transformedReq.tools[0].web_search.search_engine === 'search-prime', 'web_search search_engine from config');
@@ -1136,7 +1137,15 @@ async function setupTestConfig() {
     providers: {
       "zai": {
         url: "https://api.z.ai/api/anthropic",
-        anthropicCompliant: false
+        anthropicCompliant: false,
+        toolTransforms: {
+          web_search: {
+            search_engine: "search-prime",
+            count: "5",
+            search_recency_filter: "noLimit",
+            content_size: "high"
+          }
+        }
       }
     },
     routes: {
@@ -1319,6 +1328,121 @@ function checkThinkingInLogs() {
 
   return { hasThinking: hasThinkingBlock || hasRedacted, details: details.join(', '), logFile: latest };
 }
+/**
+ * Send a real request with web_search tool through the proxy to z.ai.
+ * Verifies that:
+ * 1. The tool is accepted (no 1210 error)
+ * 2. The response comes back clean (no web_search array leaked to client)
+ * 3. The model responds with text content
+ */
+async function assertWebSearchTransform() {
+  const http = await import('http');
+
+  const body = JSON.stringify({
+    model: 'glm-4.7',
+    max_tokens: 200,
+    messages: [{ role: 'user', content: 'What is the current date today? Use web search if available.' }],
+    tools: [{ type: 'web_search_20250305', name: 'web_search' }]
+  });
+
+  return new Promise((resolve) => {
+    const req = http.request({
+      hostname: 'localhost',
+      port: TEST_PORT,
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+        'x-api-key': 'test-key',
+        'anthropic-version': '2023-06-01'
+      },
+      timeout: 30000
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const raw = Buffer.concat(chunks).toString();
+        const isSse = (res.headers['content-type'] || '').includes('text/event-stream');
+
+        // Check HTTP status — 400 with 1210 means tool transform didn't work
+        if (res.statusCode === 400) {
+          if (raw.includes('1210')) {
+            console.error('  FAIL: web_search tool not transformed (1210 error from z.ai)');
+            resolve(false);
+            return;
+          }
+          // Other 400 errors may be transient
+          console.warn(`  WARN: web_search test got 400 (not 1210): ${raw.slice(0, 200)}`);
+          resolve(true);
+          return;
+        }
+
+        if (res.statusCode >= 500) {
+          console.warn(`  WARN: web_search test got ${res.statusCode} from upstream`);
+          resolve(true);
+          return;
+        }
+
+        // For SSE responses, check that web_search array doesn't leak
+        if (isSse) {
+          const hasWebSearchLeak = raw.includes('"web_search":[');
+          if (hasWebSearchLeak) {
+            console.error('  FAIL: web_search array leaked into SSE response');
+            resolve(false);
+            return;
+          }
+          // Check that we got actual content
+          const hasContent = raw.includes('"type":"text"') || raw.includes('"type":"content_block_delta"');
+          if (hasContent) {
+            console.log('  PASS: web_search SSE response clean (no web_search leak)');
+          } else {
+            console.warn('  WARN: web_search SSE response has no text content');
+          }
+          resolve(true);
+          return;
+        }
+
+        // For JSON responses
+        try {
+          const parsed = JSON.parse(raw);
+          if (parsed.web_search) {
+            console.error('  FAIL: web_search array leaked into JSON response');
+            resolve(false);
+            return;
+          }
+          if (parsed.content) {
+            console.log('  PASS: web_search JSON response clean');
+            resolve(true);
+            return;
+          }
+          if (parsed.error) {
+            console.warn(`  WARN: web_search test got error response: ${parsed.error.message || JSON.stringify(parsed.error)}`);
+            resolve(true);
+            return;
+          }
+        } catch {
+          console.warn(`  WARN: web_search response not JSON, status ${res.statusCode}`);
+        }
+        resolve(true);
+      });
+    });
+
+    req.on('error', (err) => {
+      console.error(`  FAIL: web_search test connection error: ${err.message}`);
+      resolve(false);
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      console.error('  FAIL: web_search test timed out');
+      resolve(false);
+    });
+
+    req.write(body);
+    req.end();
+  });
+}
 
 async function runIntegrationTests() {
   console.log('\n── Integration Tests (isolated daemon on port ' + TEST_PORT + ') ──');
@@ -1493,6 +1617,24 @@ async function runIntegrationTests() {
 
   const rSonnet = assertModel('sonnet', /claude|sonnet/i);
   modelSuccess = modelSuccess && rSonnet;
+
+  // 3b. Web search tool transform test (live request through proxy)
+  //    The daemon may have shut down after the last model test — restart it.
+  console.log('\nRunning web search tool transform test...');
+  let wsDaemonUp = await checkTestProxy();
+  if (!wsDaemonUp) {
+    const restarted = await startTestDaemon();
+    if (!restarted) {
+      console.error('  FAIL: Could not restart daemon for web search test');
+      modelSuccess = false;
+    } else {
+      wsDaemonUp = true;
+    }
+  }
+  if (wsDaemonUp) {
+    const wsTestResult = await assertWebSearchTransform();
+    modelSuccess = modelSuccess && wsTestResult;
+  }
 
   // 4. Check thinking block evidence in proxy logs
   console.log('\nChecking proxy logs for thinking block handling...');

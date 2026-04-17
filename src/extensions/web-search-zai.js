@@ -62,7 +62,7 @@ function transformRequest({ body, provider }, searchConfig) {
   if (tools) {
     for (let i = 0; i < tools.length; i++) {
       if (typeof tools[i]?.type === 'string' && WEB_SEARCH_TOOL_RE.test(tools[i].type)) {
-        tools[i] = { type: 'web_search', web_search: { ...searchConfig } };
+        tools[i] = { type: 'web_search', name: 'web_search', web_search: { ...searchConfig } };
         transformed = true;
       }
     }
