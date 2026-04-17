@@ -15,6 +15,8 @@ import { ErrorReporter } from './infra/error-reporter.js';
 import { DebugLogger } from './core/debug-logger.js';
 import { runKill } from './infra/process-manager.js';
 import { detectFormat, convertV2ToInternal } from './core/config-adapter.js';
+import { ExtensionRegistry } from './core/extension-registry.js';
+import { createWebSearchZaiExtension } from './extensions/web-search-zai.js';
 
 export { runKill };
 export { loadEnv };
@@ -22,18 +24,21 @@ export { loadEnv };
 class ProxyState {
   #reqCount;
   #activeProviders;
+  #extensions;
 
-  constructor(reqCount, activeProviders) {
+  constructor(reqCount, activeProviders, extensions) {
     this.#reqCount = reqCount;
     this.#activeProviders = activeProviders;
+    this.#extensions = extensions;
     Object.freeze(this);
   }
 
   get reqCount() { return this.#reqCount; }
   get providers() { return this.#activeProviders; }
+  get extensions() { return this.#extensions; }
 
-  withIncrement() { return new ProxyState(this.#reqCount + 1, this.#activeProviders); }
-  withProviders(providers) { return new ProxyState(this.#reqCount, providers); }
+  withIncrement() { return new ProxyState(this.#reqCount + 1, this.#activeProviders, this.#extensions); }
+  withProviders(providers, extensions) { return new ProxyState(this.#reqCount, providers, extensions ?? this.#extensions); }
 }
 
 /**
@@ -81,7 +86,15 @@ function tryParseProviders(data, filepath) {
       legacyProvidersMap: legacyMap,
       defaultFallback: internal.defaultFallback ?? null
     });
-    return Result.ok(policy);
+
+    const extensions = new ExtensionRegistry();
+    for (const cfg of providerConfigs) {
+      if (cfg.toolTransforms?.web_search) {
+        extensions.register(createWebSearchZaiExtension(cfg.toolTransforms.web_search));
+      }
+    }
+
+    return Result.ok({ policy, extensions });
   } catch (e) {
     return Result.fail(e);
   }
@@ -115,7 +128,7 @@ export function createProxyCore({ configDir, port }) {
   const errorReporter = new ErrorReporter({ logsDir });
   const debugLogger = new DebugLogger({ logsDir, level: cachedConfig.loggingLevel });
 
-  let shellState = new ProxyState(0, buildRoutingPolicy({ rawPolicy: [], providerConfigs: [], legacyProvidersMap: new ProvidersMap([]) }));
+  let shellState = new ProxyState(0, buildRoutingPolicy({ rawPolicy: [], providerConfigs: [], legacyProvidersMap: new ProvidersMap([]) }), new ExtensionRegistry());
   let activeKeepalives = 0;
   let hasReceivedKeepalive = false;
 
@@ -164,6 +177,7 @@ export function createProxyCore({ configDir, port }) {
       errorReporter,
       getConfig,
       policy: shellState.providers,
+      extensions: shellState.extensions,
       emit
     });
   }
@@ -172,8 +186,9 @@ export function createProxyCore({ configDir, port }) {
 
   function handleProvidersReload(parsedResult) {
     if (parsedResult.isSuccess) {
-      shellState = shellState.withProviders(parsedResult.value);
-      process.stdout.write(`[providers] Hot-reloaded: ${shellState.providers.size} rule(s), ${shellState.providers.allTargetModels.length} model(s)\n`);
+      const { policy, extensions } = parsedResult.value;
+      shellState = shellState.withProviders(policy, extensions);
+      process.stdout.write(`[providers] Hot-reloaded: ${shellState.providers.size} rule(s), ${shellState.providers.allTargetModels.length} model(s), ${shellState.extensions.size} extension(s)\n`);
       return;
     }
     process.stderr.write(`[providers] Reload failed: ${parsedResult.error.message}\n`);
@@ -194,7 +209,10 @@ export function createProxyCore({ configDir, port }) {
     if (!fs.existsSync(providersPath)) return;
     const data = fs.readFileSync(providersPath, 'utf8');
     const parsed = tryParseProviders(data, providersPath);
-    if (parsed.isSuccess) shellState = shellState.withProviders(parsed.value);
+    if (parsed.isSuccess) {
+      const { policy, extensions } = parsed.value;
+      shellState = shellState.withProviders(policy, extensions);
+    }
 
     try {
       fs.watch(providersPath, () => { reloadProviders().catch((e) => errorReporter.write(e, { operation: 'providers reload callback' })); });
@@ -255,6 +273,7 @@ export function createProxyCore({ configDir, port }) {
           chunks,
           deps: {
             policy: shellState.providers,
+            extensions: shellState.extensions,
             decompress,
             compress,
             logger,

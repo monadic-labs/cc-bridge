@@ -204,7 +204,7 @@ function buildCompliantBody(body, realModel) {
   };
 }
 
-export function routeToProvider(body, match) {
+export function routeToProvider(body, match, extensions) {
   const { provider, realModel, label } = match;
   const isCompliant = provider.anthropicCompliant;
 
@@ -212,8 +212,14 @@ export function routeToProvider(body, match) {
     ? buildCompliantBody(body, realModel)
     : buildNonCompliantBody(body, realModel);
 
+  // Run extension request transforms
+  let extBody = finalBody;
+  if (extensions && extensions.requestTransformerCount > 0) {
+    extBody = extensions.transformRequest({ body: extBody, provider, isCompliant });
+  }
+
   return new RoutingResult({
-    forwardBody: Buffer.from(JSON.stringify(finalBody)),
+    forwardBody: Buffer.from(JSON.stringify(extBody)),
     targetBase: provider.url,
     label: `Provider (${label})`,
     isCustom: true,
@@ -237,10 +243,10 @@ export function applyRouting(body, providersMap, anthropicBaseUrl) {
  * evaluation pass when the caller already has the match (e.g. for auth header
  * resolution in proxy-core.js).
  */
-export function applyRoutingWithMatch(body, matchOpt, anthropicBaseUrl) {
+export function applyRoutingWithMatch(body, matchOpt, anthropicBaseUrl, extensions) {
   if (typeof body.model !== 'string') return routeToAnthropic(body, anthropicBaseUrl);
   if (matchOpt.isNone) return routeToAnthropic(body, anthropicBaseUrl);
-  return routeToProvider(body, matchOpt.value);
+  return routeToProvider(body, matchOpt.value, extensions);
 }
 
 export function applyAuthHeaders({ headers, match, apiKey = '' }) {

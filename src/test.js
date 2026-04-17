@@ -900,6 +900,170 @@ async function runUnitTests() {
   assert(rrDefault.matchedRule.fallbackProviderId === 'fb-p', 'resolveRouting default fallbackProviderId');
   assert(rrDefault.matchedRule.fallbackModel === 'safe-model', 'resolveRouting default fallbackModel');
 
+  // ── Extension Registry ──
+  console.log('\nExtensionRegistry:');
+  const { ExtensionRegistry } = await import('../src/core/extension-registry.js');
+
+  const emptyReg = new ExtensionRegistry();
+  assert(emptyReg.size === 0, 'ExtensionRegistry starts empty');
+
+  const reg = new ExtensionRegistry();
+  reg.register({
+    name: 'test-ext',
+    hooks: {
+      requestTransform: {
+        order: 100,
+        transform: ({ body }) => ({ ...body, _testExt: true }),
+      }
+    }
+  });
+  assert(reg.size === 1, 'ExtensionRegistry size after register');
+  assert(reg.requestTransformerCount === 1, 'ExtensionRegistry requestTransformerCount');
+
+  const transformed = reg.transformRequest({ body: { model: 'test' } });
+  assert(transformed._testExt === true, 'ExtensionRegistry transformRequest runs');
+  assert(transformed.model === 'test', 'ExtensionRegistry transformRequest preserves body');
+
+  // Order: lower order runs first
+  const reg2 = new ExtensionRegistry();
+  reg2.register({ name: 'late', hooks: { requestTransform: { order: 200, transform: ({ body }) => ({ ...body, _order: (body._order || '') + 'late' }) } } });
+  reg2.register({ name: 'early', hooks: { requestTransform: { order: 50, transform: ({ body }) => ({ ...body, _order: (body._order || '') + 'early' }) } } });
+  const ordered = reg2.transformRequest({ body: {} });
+  assert(ordered._order === 'earlylate', 'ExtensionRegistry respects order');
+
+  // Re-register replaces
+  reg2.register({ name: 'late', hooks: { requestTransform: { order: 200, transform: ({ body }) => ({ ...body, _order: (body._order || '') + 'new-late' }) } } });
+  assert(reg2.size === 2, 'ExtensionRegistry re-register keeps size');
+  const reReg = reg2.transformRequest({ body: {} });
+  assert(reReg._order === 'earlynew-late', 'ExtensionRegistry re-register replaces');
+
+  // Response transform (full)
+  const regResp = new ExtensionRegistry();
+  regResp.register({ name: 'resp-strip', hooks: { responseTransform: { order: 100, transform: ({ response }) => response.replace(/"secret":\s*\d+/, '"secret":0') } } });
+  const stripped = regResp.transformResponse({ response: '{"secret": 42}' });
+  assert(stripped === '{"secret":0}', 'ExtensionRegistry transformResponse works');
+
+  // SSE chunk transform
+  const regSse = new ExtensionRegistry();
+  regSse.register({ name: 'sse-strip', hooks: { sseChunkTransform: { order: 100, transform: ({ chunk }) => chunk.replace(/"web_search":\s*\[.*?\]/, '') } } });
+  const sseChunk = 'data: {"type":"message_start","message":{"web_search":[1,2],"id":"msg_1"}}\n\n';
+  const sseResult = regSse.transformSseChunk({ chunk: sseChunk });
+  assert(!sseResult.includes('"web_search"'), 'ExtensionRegistry transformSseChunk works');
+
+  // ── ProviderConfig.toolTransforms ──
+  console.log('\nProviderConfig.toolTransforms:');
+  const ProvCfg = (await import('../src/core/providers.js')).ProviderConfig;
+
+  const pcNoTransforms = new ProvCfg({ id: 'x', url: 'https://x.com', anthropicCompliant: false });
+  assert(Object.keys(pcNoTransforms.toolTransforms).length === 0, 'ProviderConfig empty toolTransforms when absent');
+
+  const pcWithTransforms = new ProvCfg({
+    id: 'z', url: 'https://z.ai', anthropicCompliant: false,
+    toolTransforms: { web_search: { search_engine: 'search-prime', count: '5' } }
+  });
+  assert(pcWithTransforms.toolTransforms.web_search.count === '5', 'ProviderConfig parses toolTransforms');
+  assert(pcWithTransforms.toolTransforms.web_search.search_engine === 'search-prime', 'ProviderConfig toolTransforms preserves params');
+
+  // ── Web Search z.ai Extension ──
+  console.log('\nWeb Search z.ai Extension:');
+  const { createWebSearchZaiExtension, sanitizeWebSearchHistory } = await import('../src/extensions/web-search-zai.js');
+
+  const wsExt = createWebSearchZaiExtension({ search_engine: 'search-prime', count: '5' });
+  assert(wsExt.name === 'web-search-zai', 'createWebSearchZaiExtension name');
+  assert(wsExt.hooks.requestTransform.order === 80, 'createWebSearchZaiExtension request order');
+  assert(wsExt.hooks.responseTransform.order === 80, 'createWebSearchZaiExtension response order');
+  assert(wsExt.hooks.sseChunkTransform.order === 80, 'createWebSearchZaiExtension sseChunk order');
+
+  // Request transform: web_search tool detected and replaced
+  const provider = pcWithTransforms;
+  const reqBody = {
+    model: 'glm-4.7',
+    messages: [{ role: 'user', content: 'search for foo' }],
+    tools: [{ type: 'web_search_20250305', name: 'web_search' }]
+  };
+  const transformedReq = wsExt.hooks.requestTransform.transform({ body: reqBody, provider });
+  assert(transformedReq.tools[0].type === 'web_search', 'web_search tool type transformed');
+  assert(transformedReq.tools[0].web_search.enable === 'True', 'web_search enable injected');
+  assert(transformedReq.tools[0].web_search.search_result === 'True', 'web_search search_result injected');
+  assert(transformedReq.tools[0].web_search.search_engine === 'search-prime', 'web_search search_engine from config');
+  assert(transformedReq.tools[0].web_search.count === '5', 'web_search count from config');
+
+  // Request transform: no web_search tool → no-op
+  const noWsBody = { model: 'glm-4.7', messages: [], tools: [{ type: 'computer_use', name: 'computer' }] };
+  const noWsResult = wsExt.hooks.requestTransform.transform({ body: noWsBody, provider });
+  assert(noWsResult.tools[0].type === 'computer_use', 'web_search no-op for non-web_search tools');
+
+  // Request transform: no toolTransforms on provider → no-op
+  const noTransformProvider = pcNoTransforms;
+  const noTransformResult = wsExt.hooks.requestTransform.transform({ body: reqBody, provider: noTransformProvider });
+  assert(noTransformResult.tools[0].type === 'web_search_20250305', 'web_search no-op without toolTransforms');
+
+  // Response transform (full): strips web_search array
+  const zaiResponse = JSON.stringify({
+    id: 'msg_1', type: 'message', role: 'assistant',
+    content: [{ type: 'text', text: 'Results [Source: ref_1]' }],
+    web_search: [{ refer: 'ref_1', title: 'Test', link: 'https://example.com' }],
+    stop_reason: 'end_turn'
+  });
+  const strippedResp = wsExt.hooks.responseTransform.transform({ response: zaiResponse, provider });
+  const parsed = JSON.parse(strippedResp);
+  assert(parsed.web_search === undefined, 'web_search stripped from response');
+  assert(parsed.content[0].text === 'Results [Source: ref_1]', 'web_search response preserves content');
+
+  // Response transform: no web_search in response → no-op
+  const cleanResp = JSON.stringify({ id: 'msg_1', content: [{ type: 'text', text: 'hi' }] });
+  const cleanResult = wsExt.hooks.responseTransform.transform({ response: cleanResp, provider });
+  assert(cleanResult === cleanResp, 'web_search response no-op when no web_search field');
+
+  // SSE chunk transform: strips web_search from message_start
+  const sseStartChunk = 'data: {"type":"message_start","message":{"id":"msg_1","web_search":[{"refer":"ref_1"}]}}\n\n';
+  const sseStripped = wsExt.hooks.sseChunkTransform.transform({ chunk: sseStartChunk, provider });
+  assert(!sseStripped.includes('"web_search"'), 'web_search SSE stripped from message_start');
+  assert(sseStripped.includes('"id":"msg_1"'), 'web_search SSE preserves other fields');
+
+  // SSE chunk transform: non-message_start event → no-op
+  const sseDeltaChunk = 'data: {"type":"content_block_delta","delta":{"text":"hello"}}\n\n';
+  const sseDeltaResult = wsExt.hooks.sseChunkTransform.transform({ chunk: sseDeltaChunk, provider });
+  assert(sseDeltaResult === sseDeltaChunk, 'web_search SSE no-op for non-message_start');
+
+  // History sanitization: web_search tool_use → text
+  const history = [
+    { role: 'assistant', content: [
+      { type: 'tool_use', id: 'toolu_ws1', name: 'web_search', input: { query: 'test query' } }
+    ]},
+    { role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 'toolu_ws1', content: 'search result text' }
+    ]},
+    { role: 'assistant', content: [
+      { type: 'tool_use', id: 'toolu_other', name: 'other_tool', input: { x: 1 } }
+    ]},
+    { role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 'toolu_other', content: 'other result' }
+    ]}
+  ];
+  const sanitizedHistory = sanitizeWebSearchHistory(history);
+  assert(sanitizedHistory[0].content[0].type === 'text', 'web_search history tool_use → text');
+  assert(sanitizedHistory[0].content[0].text.includes('test query'), 'web_search history preserves query');
+  assert(sanitizedHistory[1].content[0].type === 'text', 'web_search history tool_result → text');
+  assert(sanitizedHistory[1].content[0].text.includes('search result text'), 'web_search history preserves result');
+  assert(sanitizedHistory[2].content[0].type === 'tool_use', 'web_search history preserves other tool_use');
+  assert(sanitizedHistory[3].content[0].type === 'tool_result', 'web_search history preserves other tool_result');
+
+  // History sanitization: no web_search → no change
+  const noWsHistory = [
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_x', name: 'other', input: {} }] }
+  ];
+  const noWsSanitized = sanitizeWebSearchHistory(noWsHistory);
+  assert(noWsSanitized === noWsHistory, 'web_search history no-op without web_search');
+
+  // Config parsing: toolTransforms in v2 config
+  const v2WithToolTransforms = {
+    providers: { z: { url: 'https://api.z.ai', anthropicCompliant: false, toolTransforms: { web_search: { count: '10' } } } },
+    routes: { models: {} }
+  };
+  const internalTT = convertV2ToInternal(v2WithToolTransforms);
+  assert(internalTT.providers[0].toolTransforms.web_search.count === '10', 'config-adapter parses toolTransforms');
+
 }
 
 // ── Integration test (isolated daemon) ──

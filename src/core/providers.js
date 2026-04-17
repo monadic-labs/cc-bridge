@@ -18,8 +18,9 @@ export class ProviderConfig {
   #url;
   #models;
   #anthropicCompliant;
+  #toolTransforms;
 
-  constructor({ id, url, models, anthropicCompliant }) {
+  constructor({ id, url, models, anthropicCompliant, toolTransforms }) {
     if (id !== undefined && typeof id !== 'string') {
       throw new ArgumentError('ProviderConfig.id must be a string', { context: { id: typeof id } });
     }
@@ -33,6 +34,7 @@ export class ProviderConfig {
     this.#url = url;
     this.#models = normalizeModelsToObject(models ?? {});
     this.#anthropicCompliant = anthropicCompliant;
+    this.#toolTransforms = toolTransforms ? Object.freeze({ ...toolTransforms }) : Object.freeze({});
     Object.freeze(this);
   }
 
@@ -40,6 +42,7 @@ export class ProviderConfig {
   get url() { return this.#url; }
   get models() { return this.#models; }
   get anthropicCompliant() { return this.#anthropicCompliant; }
+  get toolTransforms() { return this.#toolTransforms; }
 }
 
 export class ProviderMatch {
