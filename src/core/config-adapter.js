@@ -120,7 +120,8 @@ export function convertV2ToInternal(v2Json) {
       url: cfg.url ?? '',
       models: {},
       anthropicCompliant: cfg.anthropicCompliant ?? false,
-      apiKey: cfg.apiKey
+      apiKey: cfg.apiKey,
+      toolTransforms: cfg.toolTransforms ?? null
     });
   }
 

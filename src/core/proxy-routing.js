@@ -17,7 +17,7 @@ import { providerIdToEnvKey } from './providers.js';
  * @param {string} params.anthropicBaseUrl - Fallback Anthropic API base URL
  * @returns {{ reqModel: string, sessionId: string, routing: RoutingResult, routedHeaders: object, match: ProviderMatch|null }}
  */
-export function resolveRouting({ policy, body, urlSessionId, routedHeaders, anthropicBaseUrl }) {
+export function resolveRouting({ policy, body, urlSessionId, routedHeaders, anthropicBaseUrl, extensions }) {
   const reqModel = body.model ?? 'unknown';
   const sessionId = urlSessionId || extractSessionId(body);
 
@@ -26,7 +26,7 @@ export function resolveRouting({ policy, body, urlSessionId, routedHeaders, anth
   // No rule matched — use default fallback if configured, otherwise pure Anthropic passthrough
   if (evalOpt.isNone) {
     const defaultRule = policy.defaultFallbackRule;
-    const routing = applyRoutingWithMatch(body, Option.none(), anthropicBaseUrl);
+    const routing = applyRoutingWithMatch(body, Option.none(), anthropicBaseUrl, extensions);
     return {
       reqModel, sessionId, routing,
       routedHeaders: applyAuthHeaders({ headers: routedHeaders, match: null, apiKey: '' }),
@@ -41,7 +41,7 @@ export function resolveRouting({ policy, body, urlSessionId, routedHeaders, anth
   // Passthrough rules (no target) have null match — route to Anthropic,
   // but keep matchedRule for fallback detection
   const matchOpt = rawMatch ? Option.some(rawMatch) : Option.none();
-  const routing = applyRoutingWithMatch(body, matchOpt, anthropicBaseUrl);
+  const routing = applyRoutingWithMatch(body, matchOpt, anthropicBaseUrl, extensions);
   const match = rawMatch;
 
   let apiKey = '';
@@ -67,13 +67,14 @@ export function resolveRouting({ policy, body, urlSessionId, routedHeaders, anth
  * @param {function} params.getConfig - Config accessor
  * @returns {Promise<ProxyRequestContext>} Context with routing applied
  */
-export async function processRequestBody({ ctx, body, policy, anthropicBaseUrl, logger, getConfig }) {
+export async function processRequestBody({ ctx, body, policy, extensions, anthropicBaseUrl, logger, getConfig }) {
   const { reqModel, sessionId, routing, routedHeaders, matchedRule } = resolveRouting({
     policy,
     body,
     urlSessionId: ctx.urlSessionId,
     routedHeaders: ctx.routedHeaders,
-    anthropicBaseUrl
+    anthropicBaseUrl,
+    extensions
   });
 
   const requestInfo = new RequestInfo({

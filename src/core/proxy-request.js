@@ -23,7 +23,7 @@ import { processRequestBody } from './proxy-routing.js';
  * @param {function} params.deps.buildErrorResponse - Error response builder
  */
 export async function handleRequestEnd({ ctx, chunks, deps }) {
-  const { decompress, compress, errorReporter, debugLogger, getConfig, forwardToUpstream, buildErrorResponse, policy, logger } = deps;
+  const { decompress, compress, errorReporter, debugLogger, getConfig, forwardToUpstream, buildErrorResponse, policy, extensions, logger } = deps;
 
   const rawBuffer = Buffer.concat(chunks);
   const encoding = ctx.req.headers['content-encoding'];
@@ -73,6 +73,7 @@ export async function handleRequestEnd({ ctx, chunks, deps }) {
       ctx: activeCtx,
       body: bodyOpt.value,
       policy,
+      extensions,
       anthropicBaseUrl: getConfig().anthropicBaseUrl,
       logger,
       getConfig
