@@ -17,6 +17,10 @@ import { runKill } from './infra/process-manager.js';
 import { detectFormat, convertV2ToInternal } from './core/config-adapter.js';
 import { ExtensionRegistry } from './core/extension-registry.js';
 import { createWebSearchZaiExtension } from './extensions/web-search-zai.js';
+import { createThinkingSseExtension } from './extensions/thinking-sse.js';
+import { createSanitizationExtension } from './extensions/sanitization.js';
+import { createNonCompliantTransformExtension } from './extensions/non-compliant-transform.js';
+import { createFallbackExtension } from './extensions/fallback.js';
 
 export { runKill };
 export { loadEnv };
@@ -70,9 +74,7 @@ function tryParseProviders(data, filepath) {
     const merged = ensureCompleteProviders(raw);
 
     // Write v2 back to disk if it was v1 (auto-migration)
-    if (filepath && format === 'v1') {
-      fs.writeFileSync(filepath, JSON.stringify(merged, null, 2) + '\n', 'utf8');
-    } else if (filepath && JSON.stringify(raw) !== JSON.stringify(merged)) {
+    if (filepath && (format === 'v1' || JSON.stringify(raw) !== JSON.stringify(merged))) {
       fs.writeFileSync(filepath, JSON.stringify(merged, null, 2) + '\n', 'utf8');
     }
 
@@ -88,6 +90,10 @@ function tryParseProviders(data, filepath) {
     });
 
     const extensions = new ExtensionRegistry();
+    extensions.register(createSanitizationExtension());
+    extensions.register(createNonCompliantTransformExtension());
+    extensions.register(createThinkingSseExtension());
+    extensions.register(createFallbackExtension());
     for (const cfg of providerConfigs) {
       if (cfg.toolTransforms?.web_search) {
         extensions.register(createWebSearchZaiExtension(cfg.toolTransforms.web_search));

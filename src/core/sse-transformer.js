@@ -1,64 +1,37 @@
-import { BLOCK_TYPES, SSE_EVENT_TYPES, DELTA_TYPES } from './types.js';
-import {
-  getSseEventType, getSseIndex, getSseContentBlock, getSseDelta,
-  getBlockType, getDeltaType, getDeltaThinking, getDeltaRedactedData,
-} from './api-adapter.js';
-
+/**
+ * SSE response transformer — buffers partial lines and delegates
+ * per-chunk transformation to the extension registry.
+ *
+ * Previously contained hardcoded thinking-block conversion logic.
+ * Now serves as a thin SSE line-buffering layer: accumulated partial
+ * lines are joined, split on '\n', and each complete line is handed
+ * to extensions via `transformSseChunk()`.
+ */
 export class SseResponseTransformer {
   #buffer = '';
-  #thinkingIndexes = new Set();
+  #extensions;
+  #sseStates;
+  #provider;
+
+  constructor(extensions, provider) {
+    this.#extensions = extensions;
+    this.#provider = provider ?? null;
+    this.#sseStates = extensions ? extensions.createSseStates() : null;
+  }
 
   transformChunk(chunkStr) {
     this.#buffer += chunkStr;
     const lines = this.#buffer.split('\n');
-    this.#buffer = lines.pop(); // keep last partial line
+    this.#buffer = lines.pop();
 
-    let output = '';
-    for (const line of lines) {
-      if (!line.startsWith('data: ')) {
-        output += line + '\n';
-        continue;
-      }
-      try {
-        const evt = JSON.parse(line.slice(6));
-        const evtType = getSseEventType(evt);
-        const idx = getSseIndex(evt);
-        let modified = false;
+    if (lines.length === 0) return '';
 
-        if (evtType === SSE_EVENT_TYPES.CONTENT_BLOCK_START) {
-          const contentBlock = getSseContentBlock(evt);
-          if (contentBlock) {
-            const blockType = getBlockType(contentBlock);
-            if (blockType === BLOCK_TYPES.THINKING || blockType === BLOCK_TYPES.REDACTED_THINKING) {
-              this.#thinkingIndexes.add(idx);
-              evt.content_block = { type: BLOCK_TYPES.TEXT, text: '```thinking\n' };
-              modified = true;
-            }
-          }
-        } else if (evtType === SSE_EVENT_TYPES.CONTENT_BLOCK_DELTA && this.#thinkingIndexes.has(idx)) {
-          const delta = getSseDelta(evt);
-          if (delta) {
-            const deltaType = getDeltaType(delta);
-            if (deltaType === DELTA_TYPES.THINKING_DELTA) {
-              evt.delta = { type: DELTA_TYPES.TEXT_DELTA, text: getDeltaThinking(delta) };
-              modified = true;
-            } else if (deltaType === DELTA_TYPES.REDACTED_THINKING_DELTA) {
-              evt.delta = { type: DELTA_TYPES.TEXT_DELTA, text: getDeltaRedactedData(delta) };
-              modified = true;
-            }
-          }
-        } else if (evtType === SSE_EVENT_TYPES.CONTENT_BLOCK_STOP && this.#thinkingIndexes.has(idx)) {
-          const extraDelta = { type: SSE_EVENT_TYPES.CONTENT_BLOCK_DELTA, index: idx, delta: { type: DELTA_TYPES.TEXT_DELTA, text: '\n```\n' } };
-          output += 'data: ' + JSON.stringify(extraDelta) + '\n\n';
-          this.#thinkingIndexes.delete(idx);
-        }
-
-        output += modified ? `data: ${JSON.stringify(evt)}\n` : `${line}\n`;
-      } catch {
-        output += line + '\n';
-      }
+    if (!this.#extensions || this.#extensions.sseChunkTransformerCount === 0) {
+      return lines.join('\n') + '\n';
     }
-    return output;
+
+    const chunk = lines.join('\n') + '\n';
+    return this.#extensions.transformSseChunk({ chunk, provider: this.#provider }, this.#sseStates);
   }
 
   flush() {

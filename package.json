@@ -1,6 +1,6 @@
 {
   "name": "@monadic-labs/ccb",
-  "version": "1.2.0",
+  "version": "1.5.0",
   "type": "module",
   "description": "A local HTTP proxy for Claude Code to route requests to multiple providers.",
   "main": "src/proxy-core.js",
@@ -10,7 +10,8 @@
   },
   "scripts": {
     "proxy": "node src/proxy.js",
-    "test": "node src/test.js",
+    "lint": "eslint src/ bin/",
+    "test": "eslint src/ bin/ && node src/test.js",
     "install-cmd": "npm install -g .",
     "kill": "node scripts/kill.js",
     "killall": "node scripts/kill.js all",
@@ -39,5 +40,9 @@
   },
   "dependencies": {
     "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.2.0"
   }
 }

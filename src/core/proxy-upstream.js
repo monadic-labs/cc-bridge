@@ -5,7 +5,6 @@ import { URL } from 'url';
 import { ProxyResponseContext } from './types.js';
 import { filterResponseHeaders } from './headers.js';
 import { SseResponseTransformer } from './sse-transformer.js';
-import { shouldAttemptFallback, shouldAttemptFallbackForTcpError, resolveFallbackMatch, buildFallbackRequest } from './fallback-handler.js';
 
 /**
  * Generate a unique cc-bridge error ID.
@@ -71,10 +70,9 @@ function isRetryableBody(bodyStr, retryConfig) {
 export function forwardToUpstream({ ctx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit }) {
   const retryConfig = getConfig().retry;
   if (retryConfig.maxAttempts > 0) {
-    forwardWithRetry({ ctx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, retryConfig, attempt: 0 });
-  } else {
-    singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, retryConfig: null, onRetryNeeded: null });
+    return forwardWithRetry({ ctx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, retryConfig, attempt: 0 });
   }
+  singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, retryConfig: null, onRetryNeeded: null });
 }
 
 /**
@@ -113,10 +111,10 @@ function forwardWithRetry({ ctx, handleResponseEnd, errorReporter, getConfig, po
         return true; // signal: suppress error response, retry instead
       }
       // Retries exhausted — try fallback before sending proxy_error
-      if (shouldAttemptFallbackForTcpError(ctx.matchedRule, ctx.fallbackDepth)) {
+      if (extensions && extensions.hasFallback && extensions.shouldAttemptFallbackForTcpError({ matchedRule: ctx.matchedRule, fallbackDepth: ctx.fallbackDepth })) {
         settled = true;
         emit(`[#${ctx.id}] Retry exhausted (${retryConfig.maxAttempts} attempts), falling back: ${err.code}`, ctx.sessionId).catch(() => {});
-        attemptFallbackFromTcpError(ctx, err, handleResponseEnd, errorReporter, getConfig, policy, emit);
+        attemptFallbackFromTcpError(ctx, extensions, handleResponseEnd, errorReporter, getConfig, policy, emit);
         return true; // suppress normal error handling
       }
       return false;
@@ -164,18 +162,9 @@ function forwardWithRetry({ ctx, handleResponseEnd, errorReporter, getConfig, po
 
 /**
  * Attempt fallback after retry-exhausted TCP error.
- *
- * Reuses the same fallback resolution as processProxyResponse:
- * resolveFallbackMatch → buildFallbackRequest → forwardToUpstream.
  */
-function attemptFallbackFromTcpError(ctx, err, handleResponseEnd, errorReporter, getConfig, policy, emit) {
-  const fallbackMatchOpt = resolveFallbackMatch(policy, ctx.matchedRule);
-  if (fallbackMatchOpt.isNone) {
-    // Should not happen — shouldAttemptFallbackForTcpError already checked hasFallback
-    return;
-  }
-
-  const fallbackResult = buildFallbackRequest(ctx.originalBody, fallbackMatchOpt.value, ctx.routedHeaders);
+function attemptFallbackFromTcpError(ctx, extensions, handleResponseEnd, errorReporter, getConfig, policy, emit) {
+  const fallbackResult = extensions.buildFallbackRequest({ originalBody: ctx.originalBody, matchedRule: ctx.matchedRule, policy, routedHeaders: ctx.routedHeaders });
   if (!fallbackResult) return;
 
   const fallbackCtx = ctx.withRouting({
@@ -233,7 +222,7 @@ function singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, getConfig
   const upstreamTimeout = getConfig().upstreamTimeoutMs;
   if (upstreamTimeout > 0) {
     proxyReq.setTimeout(upstreamTimeout, () => {
-      proxyReq.destroy(new Error(`Upstream timed out after ${upstreamTimeout}ms`));
+      proxyReq.destroy(new Error(`Upstream timed out after ${upstreamTimeout}ms`)); // eslint-disable-line local/no-generic-error -- Node.js destroy() requires Error
     });
   }
 
@@ -263,7 +252,7 @@ function singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, getConfig
 
     emit(`[#${ctx.id}] ${errorId} proxy_error: ${err.message}`, ctx.sessionId).catch(() => {});
 
-    if (!ctx.res.headersSent) ctx.res.writeHead(400, { 'content-type': 'application/json' });
+    if (!ctx.res.headersSent) ctx.res.writeHead(400, { 'content-type': 'application/json', 'connection': 'close' });
     if (!ctx.res.writableEnded) ctx.res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: `Upstream connection failed: ${err.message}`, error_id: errorId } }));
   });
 
@@ -310,25 +299,31 @@ export function handleProxyResponse({ reqCtx, proxyRes, headers, handleResponseE
   processProxyResponse(reqCtx, proxyRes, statusCode, headers, null, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, forwardToUpstream, matchedRule);
 }
 
+function identityChunk(chunk) { return chunk; }
+
+function createChunkTransformer(extensions) {
+  const transformer = new SseResponseTransformer(extensions);
+  const fn = (chunk) => {
+    const transformedStr = transformer.transformChunk(chunk.toString('utf8'));
+    return transformedStr ? Buffer.from(transformedStr, 'utf8') : null;
+  };
+  fn.flush = () => transformer.flush();
+  return fn;
+}
+
 /**
  * Process an upstream response: fallback interception, streaming, SSE transformation.
  */
 function processProxyResponse(reqCtx, proxyRes, statusCode, headers, bufferedChunks, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, forwardToUpstream, matchedRule) {
   // ── Fallback interception ──
-  if (shouldAttemptFallback(statusCode, matchedRule, reqCtx.fallbackDepth)) {
+  if (extensions && extensions.hasFallback && extensions.shouldAttemptFallback({ statusCode, matchedRule, fallbackDepth: reqCtx.fallbackDepth })) {
     const errorChunks = bufferedChunks ?? [];
     if (!bufferedChunks) {
       proxyRes.on('data', (chunk) => errorChunks.push(chunk));
     }
 
     const afterBuffer = () => {
-      const fallbackMatchOpt = resolveFallbackMatch(policy, matchedRule);
-      if (fallbackMatchOpt.isNone) {
-        streamBufferedError(reqCtx, proxyRes, errorChunks, handleResponseEnd, headers);
-        return;
-      }
-
-      const fallbackResult = buildFallbackRequest(reqCtx.originalBody, fallbackMatchOpt.value, reqCtx.routedHeaders);
+      const fallbackResult = extensions.buildFallbackRequest({ originalBody: reqCtx.originalBody, matchedRule, policy, routedHeaders: reqCtx.routedHeaders });
       if (!fallbackResult) {
         streamBufferedError(reqCtx, proxyRes, errorChunks, handleResponseEnd, headers);
         return;
@@ -356,11 +351,11 @@ function processProxyResponse(reqCtx, proxyRes, statusCode, headers, bufferedChu
       forwardToUpstream({ ctx: fallbackCtx });
     };
 
-    if (bufferedChunks) {
-      afterBuffer();
-    } else {
+    if (!bufferedChunks) {
       proxyRes.on('end', afterBuffer);
+      return;
     }
+    afterBuffer();
     proxyRes.on('error', () => {
       if (!reqCtx.res.headersSent && !reqCtx.clientAborted) {
         streamBufferedError(reqCtx, proxyRes, [], handleResponseEnd, headers);
@@ -394,53 +389,33 @@ function processProxyResponse(reqCtx, proxyRes, statusCode, headers, bufferedChu
   });
 
   const resChunks = [];
+  const transformChunk = shouldTransform ? createChunkTransformer(extensions) : identityChunk;
 
-  if (shouldTransform) {
-    const transformer = new SseResponseTransformer();
-    proxyRes.on('data', (chunk) => {
-      if (reqCtx.clientAborted) return;
-      const transformedStr = transformer.transformChunk(chunk.toString('utf8'));
-      if (transformedStr) {
-        const buf = Buffer.from(transformedStr, 'utf8');
-        resChunks.push(buf);
-        if (!reqCtx.clientAborted) reqCtx.res.write(buf);
-      }
+  proxyRes.on('data', (chunk) => {
+    if (reqCtx.clientAborted) return;
+    const transformed = transformChunk(chunk);
+    if (transformed) {
+      resChunks.push(transformed);
+      if (!reqCtx.clientAborted) reqCtx.res.write(transformed);
+    }
+  });
+  proxyRes.on('error', () => { if (!reqCtx.res.writableEnded && !reqCtx.clientAborted) reqCtx.res.end(); });
+  proxyRes.on('end', () => {
+    if (reqCtx.clientAborted) return;
+    const rest = transformChunk.flush ? transformChunk.flush() : null;
+    if (rest) {
+      const buf = Buffer.from(rest, 'utf8');
+      resChunks.push(buf);
+      if (!reqCtx.clientAborted) reqCtx.res.write(buf);
+    }
+    const resCtx = new ProxyResponseContext({
+      proxyRes, res: reqCtx.res, id: reqCtx.id, startTime: reqCtx.startTime,
+      routeLabel: reqCtx.routeLabel, reqModel: reqCtx.reqModel, sessionId: reqCtx.sessionId,
+      headers, req: reqCtx.req, isCustom: reqCtx.isCustom, rawBody: reqCtx.rawBody, forwardBody: reqCtx.forwardBody,
+      sanitizationReport: reqCtx.sanitizationReport
     });
-    proxyRes.on('end', () => {
-      if (reqCtx.clientAborted) return;
-      const rest = transformer.flush();
-      if (rest) {
-        const buf = Buffer.from(rest, 'utf8');
-        resChunks.push(buf);
-        if (!reqCtx.clientAborted) reqCtx.res.write(buf);
-      }
-      const resCtx = new ProxyResponseContext({
-        proxyRes, res: reqCtx.res, id: reqCtx.id, startTime: reqCtx.startTime,
-        routeLabel: reqCtx.routeLabel, reqModel: reqCtx.reqModel, sessionId: reqCtx.sessionId,
-        headers, req: reqCtx.req, isCustom: reqCtx.isCustom, rawBody: reqCtx.rawBody, forwardBody: reqCtx.forwardBody,
-        sanitizationReport: reqCtx.sanitizationReport
-      });
-      handleResponseEnd({ resCtx, resChunks });
-    });
-    proxyRes.on('error', () => { if (!reqCtx.res.writableEnded && !reqCtx.clientAborted) reqCtx.res.end(); });
-  } else {
-    proxyRes.on('data', (chunk) => {
-      resChunks.push(chunk);
-      if (!reqCtx.clientAborted) reqCtx.res.write(chunk);
-    });
-    proxyRes.on('error', () => { if (!reqCtx.res.writableEnded && !reqCtx.clientAborted) reqCtx.res.end(); });
-
-    proxyRes.on('end', () => {
-      if (reqCtx.clientAborted) return;
-      const resCtx = new ProxyResponseContext({
-        proxyRes, res: reqCtx.res, id: reqCtx.id, startTime: reqCtx.startTime,
-        routeLabel: reqCtx.routeLabel, reqModel: reqCtx.reqModel, sessionId: reqCtx.sessionId,
-        headers, req: reqCtx.req, isCustom: reqCtx.isCustom, rawBody: reqCtx.rawBody, forwardBody: reqCtx.forwardBody,
-        sanitizationReport: reqCtx.sanitizationReport
-      });
-      handleResponseEnd({ resCtx, resChunks });
-    });
-  }
+    handleResponseEnd({ resCtx, resChunks });
+  });
 }
 
 /**

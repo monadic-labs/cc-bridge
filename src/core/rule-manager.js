@@ -163,12 +163,13 @@ export function formatRuleTree(rawPolicy) {
     const rule = rawPolicy[i];
     const branch = i === rawPolicy.length - 1 ? '\u2514\u2500\u2500' : '\u251C\u2500\u2500';
 
-    let desc;
-    if (rule.type === 'exact') desc = `match="${rule.match}"`;
-    else if (rule.type === 'regex') desc = `pattern=/${rule.pattern}/`;
-    else if (rule.type === 'property') desc = `property="${rule.property}"`;
-    else if (rule.type === 'payloadSize') desc = `size ${rule.operator || '>'} ${rule.thresholdBytes} bytes`;
-    else desc = '(unknown)';
+    const descFormatters = {
+      exact: () => `match="${rule.match}"`,
+      regex: () => `pattern=/${rule.pattern}/`,
+      property: () => `property="${rule.property}"`,
+      payloadSize: () => `size ${rule.operator || '>'} ${rule.thresholdBytes} bytes`,
+    };
+    const desc = (descFormatters[rule.type] ?? (() => '(unknown)'))();
 
     let line = `${branch} [${i}] ${rule.type}: ${desc} \u2192 ${rule.targetProvider}/${rule.targetModel}`;
     if (rule.fallback) line += ` [fallback: ${rule.fallback.providerId}/${rule.fallback.model}]`;

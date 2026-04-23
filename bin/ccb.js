@@ -146,7 +146,7 @@ function startProxyDaemon(config) {
 
 function resolveWindowsCmdPath() {
   try {
-    const stdout = execSync('where claude', { encoding: 'utf8' });
+    const stdout = execSync('where.exe claude', { encoding: 'utf8' });
     const paths = stdout.split('\n').map(p => p.trim()).filter(Boolean);
     const cmdPath = paths.find(p => p.toLowerCase().endsWith('.cmd'));
     if (!cmdPath) return { cmd: paths[0] || 'claude', isNode: false };
@@ -159,8 +159,14 @@ function resolveWindowsCmdPath() {
 function parseCmdWrapper(cmdPath) {
   try {
     const content = fs.readFileSync(cmdPath, 'utf8');
-    const m = content.match(/"?(?:%~dp0%?\\\\?|[%]dp0[%]\\\\?)([^\n"]+\.js)"?/i);
-    if (m) return { cmd: path.resolve(path.dirname(cmdPath), m[1]), isNode: true };
+    // Improved regex to handle various %dp0 variations and both .js and .exe targets.
+    // Uses negative lookahead (?!node\.exe) to avoid matching the node executable itself in wrappers.
+    const m = content.match(/"?(?:%~dp0%?\\?|[%]dp0[%]\\?|%dp0%\\)((?:(?!node\.exe)[^\n"])+\.(?:js|exe))"?/i);
+    if (m) {
+      const targetPath = m[1];
+      const resolved = path.resolve(path.dirname(cmdPath), targetPath);
+      return { cmd: resolved, isNode: targetPath.toLowerCase().endsWith('.js') };
+    }
   } catch {}
   return { cmd: cmdPath, isNode: false };
 }
@@ -206,7 +212,9 @@ async function main() {
   const keepaliveReq = http.get(`http://localhost:${config.port}/__ccb_internal__/keepalive`, keepaliveOptions);
   keepaliveReq.on('error', () => { /* Ignore errors, if it dies it dies */ });
 
-  const child = spawn(spawnCmd, spawnArgs, { stdio: 'inherit', env, shell: false });
+  // On Windows, if we're still pointing to a .cmd file (e.g. resolve failed), we MUST use shell: true
+  const useShell = process.platform === 'win32' && spawnCmd.toLowerCase().endsWith('.cmd');
+  const child = spawn(spawnCmd, spawnArgs, { stdio: 'inherit', env, shell: useShell });
 
   let sigintCount = 0;
   const handleSigInt = () => {
@@ -266,9 +274,15 @@ const CCB_CMDS = {
     clearLogs();
     process.exit(0);
   },
+  '--x-version': () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8'));
+    process.stdout.write(`${pkg.version}\n`);
+    process.exit(0);
+  },
   '--x-help': () => {
     process.stdout.write(`
 CCB (Claude Code Bridge) Management Commands:
+  --x-version       Print the ccb version
   --x-init          Initialize the config directory (~/.claude/.ccb)
   --x-killall       Kill all background proxy processes
   --x-clearlogs     Delete all log files in the logs directory

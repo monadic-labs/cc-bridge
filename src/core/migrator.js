@@ -60,10 +60,10 @@ function deepMerge(target, source) {
     if (source[key] instanceof Object && !Array.isArray(source[key])) {
       if (!target[key]) Object.assign(target, { [key]: {} });
       deepMerge(target[key], source[key]);
-    } else {
-      if (target[key] === undefined) {
-        Object.assign(target, { [key]: source[key] });
-      }
+      continue;
+    }
+    if (target[key] === undefined) {
+      Object.assign(target, { [key]: source[key] });
     }
   }
 }
@@ -99,7 +99,9 @@ export function ensureCompleteProviders(existingRaw) {
   // v2 format: merge defaults into providers object
   if (!merged.providers || typeof merged.providers !== 'object' || Array.isArray(merged.providers)) {
     merged.providers = JSON.parse(JSON.stringify(DEFAULT_RAW_PROVIDERS.providers));
-  } else {
+  }
+
+  if (merged.providers && typeof merged.providers === 'object' && !Array.isArray(merged.providers)) {
     for (const [id, cfg] of Object.entries(merged.providers)) {
       deepMerge(cfg, DEFAULT_PROVIDER_ENTRY);
     }

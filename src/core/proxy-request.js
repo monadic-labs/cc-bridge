@@ -1,6 +1,7 @@
 import { copyRequestHeaders } from './headers.js';
 import { tryParseBody } from './routing.js';
 import { processRequestBody } from './proxy-routing.js';
+import { ProxyError } from './exceptions.js';
 
 /**
  * Handle the end of an incoming request: decompress, parse, route, compress, forward.
@@ -31,10 +32,11 @@ export async function handleRequestEnd({ ctx, chunks, deps }) {
   let decompressedBody = rawBuffer;
   if (encoding) {
     const decompressRes = await decompress(rawBuffer, encoding);
+    if (!decompressRes.isSuccess) {
+      errorReporter.write(decompressRes.error, { operation: 'decompressing request body', headers: ctx.req.headers });
+    }
     if (decompressRes.isSuccess) {
       decompressedBody = decompressRes.value;
-    } else {
-      errorReporter.write(decompressRes.error, { operation: 'decompressing request body', headers: ctx.req.headers });
     }
   }
 
@@ -56,7 +58,7 @@ export async function handleRequestEnd({ ctx, chunks, deps }) {
     }
 
     if (decompressedBody.length > 0) {
-      errorReporter.write(new Error('Failed to parse JSON request body. Bypassing sanitization.'), {
+      errorReporter.write(new ProxyError('Failed to parse JSON request body. Bypassing sanitization.', { operation: 'parsing request body' }), {
         requestId: activeCtx.id,
         headers: activeCtx.req.headers,
         operation: 'parsing request body',
@@ -93,10 +95,12 @@ export async function handleRequestEnd({ ctx, chunks, deps }) {
           isCustom: activeCtx.isCustom,
           rawBody: activeCtx.rawBody
         });
-      } else {
+      }
+      if (!compressRes.isSuccess) {
         delete activeCtx.routedHeaders['content-encoding'];
       }
-    } else {
+    }
+    if (!(config.recompressRequests && encoding)) {
       delete activeCtx.routedHeaders['content-encoding'];
     }
 
