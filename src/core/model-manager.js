@@ -50,9 +50,10 @@ export function addRouteModel(config, name, targetDot, fallback) {
   if (fallback && fallback.length > 0) {
     for (const fb of fallback) parseTarget(fb);
     updated.routes.models[name] = { target: targetDot, fallback };
-  } else {
-    updated.routes.models[name] = targetDot;
+    return Result.ok(updated);
   }
+
+  updated.routes.models[name] = targetDot;
 
   return Result.ok(updated);
 }

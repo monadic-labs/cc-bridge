@@ -145,7 +145,8 @@ export function convertV2ToInternal(v2Json) {
 
     if (keyParsed.type === 'exact') {
       rule.match = keyParsed.match;
-    } else {
+    }
+    if (keyParsed.type === 'regex') {
       rule.pattern = keyParsed.pattern;
     }
 
@@ -265,16 +266,23 @@ export function convertV1ToV2(v1Json) {
 
     if (rule.type === 'exact') {
       models[rule.match] = value;
-    } else if (rule.type === 'regex') {
+      continue;
+    }
+    if (rule.type === 'regex') {
       // Convert regex to wildcard if it's a simple .*pattern.* pattern
       const wildcardKey = regexToWildcard(rule.pattern);
       models[wildcardKey] = value;
-    } else if (rule.type === 'property') {
+      continue;
+    }
+    if (rule.type === 'property') {
       properties[rule.property] = value;
-    } else if (rule.type === 'payloadSize') {
+      continue;
+    }
+    if (rule.type === 'payloadSize') {
       const op = rule.operator === 'gt' || !rule.operator ? '>' : rule.operator === 'lt' ? '<' : rule.operator;
       const key = `${op}${rule.thresholdBytes}`;
       payloadSize[key] = value;
+      continue;
     }
   }
 

@@ -16,19 +16,18 @@ function getProcesses() {
           cmd: parts.slice(1, parts.length - 2).join(',')
         };
       }).filter(Boolean);
-    } else {
-      const out = execSync('ps -A -o pid,ppid,command', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-      const lines = out.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('PID'));
-      return lines.map(line => {
-        const match = line.match(/^(\d+)\s+(\d+)\s+(.+)$/);
-        if (!match) return null;
-        return {
-          pid: parseInt(match[1], 10),
-          ppid: parseInt(match[2], 10),
-          cmd: match[3]
-        };
-      }).filter(Boolean);
     }
+    const out = execSync('ps -A -o pid,ppid,command', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const lines = out.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('PID'));
+    return lines.map(line => {
+      const match = line.match(/^(\d+)\s+(\d+)\s+(.+)$/);
+      if (!match) return null;
+      return {
+        pid: parseInt(match[1], 10),
+        ppid: parseInt(match[2], 10),
+        cmd: match[3]
+      };
+    }).filter(Boolean);
   } catch {
     return [];
   }
@@ -52,8 +51,8 @@ export async function runKill() {
 
   function forceKill(pid) {
     try {
-      if (isWin) execSync(`taskkill /F /PID ${pid} /T`, { stdio: 'ignore' });
-      else process.kill(pid, 'SIGKILL');
+      if (isWin) { execSync(`taskkill /F /PID ${pid} /T`, { stdio: 'ignore' }); return true; }
+      process.kill(pid, 'SIGKILL');
       return true;
     } catch {
       return false;

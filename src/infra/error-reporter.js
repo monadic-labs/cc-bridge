@@ -7,11 +7,13 @@ function redactBodyStructure(body) {
   for (const [k, v] of Object.entries(body)) {
     if (k === 'text' || k === 'thinking' || k === 'data') {
       redacted[k] = `[redacted: ${typeof v === 'string' ? v.length : 'complex'} chars]`;
-    } else if (typeof v === 'object' && v !== null) {
-      redacted[k] = redactBodyStructure(v);
-    } else {
-      redacted[k] = v;
+      continue;
     }
+    if (typeof v === 'object' && v !== null) {
+      redacted[k] = redactBodyStructure(v);
+      continue;
+    }
+    redacted[k] = v;
   }
   return redacted;
 }

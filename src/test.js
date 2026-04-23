@@ -39,7 +39,7 @@ function assertThrows(fn, ErrorClass, label) {
 async function runUnitTests() {
   console.log('\n── Unit Tests ──');
 
-  const { applyRouting, applyAuthHeaders, extractSessionId, sanitizeMessages } = await import('../src/core/routing.js');
+  const { applyRouting, applyAuthHeaders, extractSessionId } = await import('../src/core/routing.js');
   const { Result, Option, RequestInfo, RequestSummary, RoutingResult } = await import('../src/core/types.js');
   const { ProvidersMap, ProviderConfig, ProviderMatch } = await import('../src/core/providers.js');
 
@@ -153,6 +153,17 @@ async function runUnitTests() {
 
   // ── sanitizeMessages ──
   console.log('\nsanitizeMessages:');
+  // sanitization logic now lives in the extension, test via extension registry
+  const { createSanitizationExtension } = await import('../src/extensions/sanitization.js');
+  const { ExtensionRegistry: SanitizeER } = await import('../src/core/extension-registry.js');
+  const sanitizeReg = new SanitizeER();
+  sanitizeReg.register(createSanitizationExtension());
+  function sanitizeMessages(messages, isCompliant) {
+    const body = { messages };
+    const provider = { anthropicCompliant: isCompliant };
+    const result = sanitizeReg.transformRequest({ body, provider });
+    return { messages: result.messages, report: result._ccbSanitizationReport || { convertedCount: 0, convertedTypes: [] } };
+  }
   const withSig = { messages: [{ content: [{ type: 'thinking', thinking: 'hmm', signature: 'abc123' }] }] };
   const { messages: sanitizedWithSig, report: reportSig } = sanitizeMessages(withSig.messages, true);
   assert(sanitizedWithSig[0].content[0].signature === 'abc123', 'signature preserved if compliant and present');
@@ -237,7 +248,11 @@ async function runUnitTests() {
   // ── SseResponseTransformer ──
   console.log('\nSseResponseTransformer:');
   const { SseResponseTransformer } = await import('../src/core/sse-transformer.js');
-  const transformer = new SseResponseTransformer();
+  const { createThinkingSseExtension } = await import('../src/extensions/thinking-sse.js');
+  const { ExtensionRegistry: SseER } = await import('../src/core/extension-registry.js');
+  const sseReg = new SseER();
+  sseReg.register(createThinkingSseExtension());
+  const transformer = new SseResponseTransformer(sseReg);
   const inputSse = [
     'data: {"type":"message_start","message":{"model":"claude-opus"}}',
     'data: {"type":"content_block_start","index":1,"content_block":{"type":"thinking","signature":"xyz"}}',
@@ -720,25 +735,28 @@ async function runUnitTests() {
 
   // ── Fallback handler ──
   console.log('\nFallback handler:');
-  const { shouldAttemptFallback, shouldAttemptFallbackForTcpError } = await import('../src/core/fallback-handler.js');
+  const { createFallbackExtension } = await import('../src/extensions/fallback.js');
+  const { ExtensionRegistry: FallbackER } = await import('../src/core/extension-registry.js');
+  const fallbackReg = new FallbackER();
+  fallbackReg.register(createFallbackExtension());
 
   // Mock rule objects for fallback testing
   const ruleWithFallback = { hasFallback: true, fallbackProviderId: 'mirror', fallbackModel: 'fb-m' };
   const ruleNoFallback = { hasFallback: false, fallbackProviderId: null, fallbackModel: null };
 
   // shouldAttemptFallback — HTTP errors
-  assert(shouldAttemptFallback(500, ruleWithFallback, 0) === true, 'fallback 500 with rule');
-  assert(shouldAttemptFallback(502, ruleWithFallback, 0) === true, 'fallback 502 with rule');
-  assert(shouldAttemptFallback(200, ruleWithFallback, 0) === false, 'fallback 200 skipped');
-  assert(shouldAttemptFallback(400, ruleNoFallback, 0) === false, 'fallback 400 no rule');
-  assert(shouldAttemptFallback(500, null, 0) === false, 'fallback null rule');
-  assert(shouldAttemptFallback(500, ruleWithFallback, 3) === false, 'fallback depth exceeded');
+  assert(fallbackReg.shouldAttemptFallback({ statusCode: 500, matchedRule: ruleWithFallback, fallbackDepth: 0 }) === true, 'fallback 500 with rule');
+  assert(fallbackReg.shouldAttemptFallback({ statusCode: 502, matchedRule: ruleWithFallback, fallbackDepth: 0 }) === true, 'fallback 502 with rule');
+  assert(fallbackReg.shouldAttemptFallback({ statusCode: 200, matchedRule: ruleWithFallback, fallbackDepth: 0 }) === false, 'fallback 200 skipped');
+  assert(fallbackReg.shouldAttemptFallback({ statusCode: 400, matchedRule: ruleNoFallback, fallbackDepth: 0 }) === false, 'fallback 400 no rule');
+  assert(fallbackReg.shouldAttemptFallback({ statusCode: 500, matchedRule: null, fallbackDepth: 0 }) === false, 'fallback null rule');
+  assert(fallbackReg.shouldAttemptFallback({ statusCode: 500, matchedRule: ruleWithFallback, fallbackDepth: 3 }) === false, 'fallback depth exceeded');
 
   // shouldAttemptFallbackForTcpError — TCP errors (no HTTP status)
-  assert(shouldAttemptFallbackForTcpError(ruleWithFallback, 0) === true, 'tcp fallback with rule');
-  assert(shouldAttemptFallbackForTcpError(ruleNoFallback, 0) === false, 'tcp fallback no rule');
-  assert(shouldAttemptFallbackForTcpError(null, 0) === false, 'tcp fallback null rule');
-  assert(shouldAttemptFallbackForTcpError(ruleWithFallback, 3) === false, 'tcp fallback depth exceeded');
+  assert(fallbackReg.shouldAttemptFallbackForTcpError({ matchedRule: ruleWithFallback, fallbackDepth: 0 }) === true, 'tcp fallback with rule');
+  assert(fallbackReg.shouldAttemptFallbackForTcpError({ matchedRule: ruleNoFallback, fallbackDepth: 0 }) === false, 'tcp fallback no rule');
+  assert(fallbackReg.shouldAttemptFallbackForTcpError({ matchedRule: null, fallbackDepth: 0 }) === false, 'tcp fallback null rule');
+  assert(fallbackReg.shouldAttemptFallbackForTcpError({ matchedRule: ruleWithFallback, fallbackDepth: 3 }) === false, 'tcp fallback depth exceeded');
 
   // ── v1 auto-migration via ensureCompleteProviders ──
   console.log('\nv1 auto-migration:');
@@ -1026,6 +1044,84 @@ async function runUnitTests() {
   const sseDeltaChunk = 'data: {"type":"content_block_delta","delta":{"text":"hello"}}\n\n';
   const sseDeltaResult = wsExt.hooks.sseChunkTransform.transform({ chunk: sseDeltaChunk, provider });
   assert(sseDeltaResult === sseDeltaChunk, 'web_search SSE no-op for non-message_start');
+
+  // ── z.ai tool_use → Anthropic server_tool_use format ──
+  // z.ai returns a regular tool_use block with stop_reason "tool_use" for web_search,
+  // but Claude Code expects server_tool_use / web_search_tool_result blocks (Anthropic format).
+  // The extension must transform this so Claude Code doesn't try to handle a client-side tool cycle.
+
+  // Response transform: z.ai tool_use for web_search → server_tool_use format
+  const zaiToolUseResponse = JSON.stringify({
+    id: 'msg_zai_ws1', type: 'message', role: 'assistant', model: 'glm-4.7',
+    content: [
+      { type: 'text', text: 'Let me search for that.' },
+      { type: 'tool_use', id: 'call_ws_abc123', name: 'web_search', input: {} }
+    ],
+    stop_reason: 'tool_use',
+    stop_sequence: null,
+    usage: { input_tokens: 100, output_tokens: 20 }
+  });
+  const transformedWsResp = wsExt.hooks.responseTransform.transform({ response: zaiToolUseResponse, provider });
+  const wsParsed = JSON.parse(transformedWsResp);
+
+  // The tool_use block for web_search should be converted to server_tool_use
+  const wsToolUseBlock = wsParsed.content.find(b => b.name === 'web_search');
+  assert(wsToolUseBlock != null, 'web_search tool_use block exists in response');
+  assert(wsToolUseBlock.type === 'server_tool_use', 'web_search tool_use converted to server_tool_use type');
+  assert(wsToolUseBlock.id === 'call_ws_abc123', 'server_tool_use preserves tool id');
+  assert(wsToolUseBlock.name === 'web_search', 'server_tool_use preserves tool name');
+
+  // A web_search_tool_result placeholder block should follow
+  const wsResultBlock = wsParsed.content.find(b => b.type === 'web_search_tool_result');
+  if (wsResultBlock) {
+    assert(wsResultBlock.tool_use_id === 'call_ws_abc123', 'web_search_tool_result references correct tool id');
+    assert(wsResultBlock.content != null, 'web_search_tool_result has content');
+  }
+
+  // stop_reason should remain end_turn or be changed from tool_use
+  assert(wsParsed.stop_reason !== 'tool_use', 'web_search stop_reason changed from tool_use');
+
+  // Non-web_search tool_use blocks should NOT be transformed
+  const zaiOtherToolResponse = JSON.stringify({
+    id: 'msg_other', type: 'message', role: 'assistant', model: 'glm-4.7',
+    content: [
+      { type: 'tool_use', id: 'call_other', name: 'get_weather', input: { city: 'SF' } }
+    ],
+    stop_reason: 'tool_use',
+    stop_sequence: null,
+    usage: { input_tokens: 50, output_tokens: 10 }
+  });
+  const otherToolResult = wsExt.hooks.responseTransform.transform({ response: zaiOtherToolResponse, provider });
+  const otherParsed = JSON.parse(otherToolResult);
+  assert(otherParsed.content[0].type === 'tool_use', 'non-web_search tool_use unchanged');
+  assert(otherParsed.stop_reason === 'tool_use', 'non-web_search stop_reason unchanged');
+
+  // SSE chunk transform: z.ai tool_use for web_search → server_tool_use in content_block_start
+  // Use a shared state to simulate a real SSE stream
+  const sseState = wsExt.hooks.sseChunkTransform.createState();
+  const sseToolUseStartChunk = 'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_ws_sse1","name":"web_search","input":{}}}\n\n';
+  const sseToolUseTransformed = wsExt.hooks.sseChunkTransform.transform({ chunk: sseToolUseStartChunk, provider }, sseState);
+  assert(sseToolUseTransformed.includes('"server_tool_use"'), 'web_search SSE tool_use → server_tool_use');
+  assert(sseToolUseTransformed.includes('"call_ws_sse1"'), 'web_search SSE server_tool_use preserves id');
+  assert(sseState.sawWebSearchToolUse === true, 'web_search SSE state tracks tool_use');
+
+  // SSE chunk: non-web_search tool_use → no change
+  const sseOtherState = wsExt.hooks.sseChunkTransform.createState();
+  const sseOtherToolChunk = 'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_other","name":"get_weather","input":{}}}\n\n';
+  const sseOtherResult = wsExt.hooks.sseChunkTransform.transform({ chunk: sseOtherToolChunk, provider }, sseOtherState);
+  assert(sseOtherResult === sseOtherToolChunk, 'non-web_search SSE tool_use unchanged');
+  assert(sseOtherState.sawWebSearchToolUse === false, 'non-web_search SSE state unchanged');
+
+  // SSE message_delta: after seeing web_search tool_use, stop_reason tool_use → end_turn
+  const sseDeltaWsChunk = 'data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":20}}\n\n';
+  const sseDeltaWsResult = wsExt.hooks.sseChunkTransform.transform({ chunk: sseDeltaWsChunk, provider }, sseState);
+  assert(!sseDeltaWsResult.includes('"tool_use"'), 'web_search SSE stop_reason transformed away from tool_use');
+  assert(sseDeltaWsResult.includes('"end_turn"'), 'web_search SSE stop_reason becomes end_turn');
+
+  // SSE message_delta: without prior web_search tool_use, stop_reason stays tool_use
+  const sseNoWsState = wsExt.hooks.sseChunkTransform.createState();
+  const sseDeltaNoWsResult = wsExt.hooks.sseChunkTransform.transform({ chunk: sseDeltaWsChunk, provider }, sseNoWsState);
+  assert(sseDeltaNoWsResult === sseDeltaWsChunk, 'non-web_search SSE stop_reason unchanged');
 
   // History sanitization: web_search tool_use → text
   const history = [

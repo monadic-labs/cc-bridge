@@ -306,6 +306,7 @@ export class RoutingPolicy {
     this.#providerMap = Object.freeze(providerMap);
     this.#legacyMap = legacyProvidersMap ?? null;
 
+    this.#defaultFallbackRule = null;
     if (defaultFallback) {
       if (!providerMap.has(defaultFallback.providerId)) {
         throw new ArgumentError(
@@ -320,8 +321,6 @@ export class RoutingPolicy {
         fallbackModel: defaultFallback.model,
         toLabel() { return 'default-fallback'; }
       });
-    } else {
-      this.#defaultFallbackRule = null;
     }
 
     Object.freeze(this);

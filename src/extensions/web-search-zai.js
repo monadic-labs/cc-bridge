@@ -40,6 +40,7 @@ export function createWebSearchZaiExtension(params) {
       },
       sseChunkTransform: {
         order: 80,
+        createState: () => ({ sawWebSearchToolUse: false }),
         transform: transformSseChunk,
       },
     },
@@ -131,9 +132,47 @@ function transformFullResponse({ response, provider }) {
 
   try {
     const parsed = JSON.parse(response);
-    if (!parsed.web_search) return response;
-    delete parsed.web_search;
-    return JSON.stringify(parsed);
+
+    // Strip top-level web_search metadata
+    let changed = false;
+    if (parsed.web_search) {
+      delete parsed.web_search;
+      changed = true;
+    }
+
+    // Convert web_search tool_use → server_tool_use + web_search_tool_result
+    if (Array.isArray(parsed.content)) {
+      const hasWsToolUse = parsed.content.some(
+        b => b.type === 'tool_use' && b.name === 'web_search'
+      );
+      if (hasWsToolUse) {
+        const newContent = [];
+        for (const block of parsed.content) {
+          if (block.type === 'tool_use' && block.name === 'web_search') {
+            newContent.push({ ...block, type: 'server_tool_use' });
+            newContent.push({
+              type: 'web_search_tool_result',
+              tool_use_id: block.id,
+              content: { type: 'web_search_result', url: '', title: '' },
+            });
+          } else {
+            newContent.push(block);
+          }
+        }
+        parsed.content = newContent;
+        changed = true;
+
+        // If ALL tool_use blocks were web_search, change stop_reason
+        const remainingToolUse = parsed.content.some(
+          b => b.type === 'tool_use'
+        );
+        if (!remainingToolUse && parsed.stop_reason === 'tool_use') {
+          parsed.stop_reason = 'end_turn';
+        }
+      }
+    }
+
+    return changed ? JSON.stringify(parsed) : response;
   } catch {
     return response;
   }
@@ -141,9 +180,13 @@ function transformFullResponse({ response, provider }) {
 
 // ── Response Transform (SSE chunk) ────────────────────────────────────────
 
-function transformSseChunk({ chunk, provider }) {
+function transformSseChunk({ chunk, provider }, state) {
   if (!provider?.toolTransforms?.web_search) return chunk;
-  if (!chunk.includes('"web_search"')) return chunk;
+
+  // Fast path: only process chunks that could contain web_search references or tool_use stop_reason
+  const hasWebSearch = chunk.includes('"web_search"');
+  const hasToolUseStop = chunk.includes('"tool_use"');
+  if (!hasWebSearch && !hasToolUseStop) return chunk;
 
   // SSE chunks are multi-line. Process each data: line independently.
   const lines = chunk.split('\n');
@@ -157,8 +200,27 @@ function transformSseChunk({ chunk, provider }) {
     }
     try {
       const evt = JSON.parse(line.slice(6));
+
+      // Strip web_search metadata from message_start
       if (evt.type === 'message_start' && evt.message?.web_search) {
         delete evt.message.web_search;
+        result.push('data: ' + JSON.stringify(evt));
+        modified = true;
+        continue;
+      }
+
+      // Convert web_search tool_use → server_tool_use in content_block_start
+      if (evt.type === 'content_block_start' && evt.content_block?.type === 'tool_use' && evt.content_block?.name === 'web_search') {
+        evt.content_block.type = 'server_tool_use';
+        if (state) state.sawWebSearchToolUse = true;
+        result.push('data: ' + JSON.stringify(evt));
+        modified = true;
+        continue;
+      }
+
+      // Fix stop_reason: tool_use → end_turn when we saw a web_search tool_use in this stream
+      if (evt.type === 'message_delta' && evt.delta?.stop_reason === 'tool_use' && state?.sawWebSearchToolUse) {
+        evt.delta.stop_reason = 'end_turn';
         result.push('data: ' + JSON.stringify(evt));
         modified = true;
         continue;
