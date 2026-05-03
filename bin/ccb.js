@@ -15,6 +15,9 @@ import { ensureCompleteConfig, ensureCompleteProviders } from '../src/core/migra
 import { providerIdToEnvKey } from '../src/core/providers.js';
 import { loadEnv, updateEnvKey, pruneEnvLines } from '../src/core/env-file.js';
 import { parseTarget, detectFormat } from '../src/core/config-adapter.js';
+import net from 'net';
+import { getControlIpcPath } from '../src/core/daemon-constants.js';
+import { serializeIpcMessage, parseIpcMessage } from '../src/core/ipc-protocol.js';
 
 const PROXY_FLAG = '--__cc-proxy-daemon__';
 
@@ -81,6 +84,16 @@ function runProxyDaemon() {
   ensureDaemonConfig();
   ensureLogsDir();
   const config = loadDaemonConfig();
+
+  // Worker mode: watchdog spawned us with CCB_WORKER_MODE flag
+  if (process.env.CCB_WORKER_MODE === '1') {
+    import('../src/proxy-core.js').then(({ runWorkerMode }) => {
+      runWorkerMode({ configDir: USER_CONFIG_DIR, port: config.port });
+    });
+    return;
+  }
+
+  // Standalone mode: existing behavior (no watchdog)
   const core = createProxyCore({ configDir: USER_CONFIG_DIR, port: config.port });
   core.initProviders();
 
@@ -104,6 +117,17 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function connectToControlIpc() {
+  return new Promise((resolve) => {
+    const ipcPath = getControlIpcPath();
+    const socket = net.createConnection(ipcPath, () => {
+      resolve(socket);
+    });
+    socket.on('error', () => resolve(null));
+    socket.setTimeout(2000, () => { socket.destroy(); resolve(null); });
+  });
+}
+
 async function pollUntilReady(config) {
   const { pollMaxAttempts, pollIntervalMs } = config;
   for (let attempt = 0; attempt < pollMaxAttempts; attempt++) {
@@ -121,23 +145,23 @@ function startProxyDaemon(config) {
     const out = fs.openSync(path.join(logsDir, 'daemon.log'), 'a');
     const err = fs.openSync(path.join(logsDir, 'daemon.err'), 'a');
 
-    const keepaliveSecret = randomBytes(32).toString('hex');
+    const watchdogPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'ccb-watchdog.js');
 
     const child = spawn(
       process.execPath,
-      [fileURLToPath(import.meta.url), PROXY_FLAG],
+      [watchdogPath],
       {
         detached: true,
         stdio: ['ignore', out, err],
         windowsHide: true,
-        env: { ...process.env, CCB_CONFIG_DIR: USER_CONFIG_DIR, CCB_KEEPALIVE_SECRET: keepaliveSecret }
+        env: { ...process.env, CCB_CONFIG_DIR: USER_CONFIG_DIR }
       }
     );
     child.unref();
 
     pollUntilReady(config)
       .then(isUp => {
-        if (isUp) return resolve(keepaliveSecret);
+        if (isUp) return resolve('');
         reject(new ReadinessTimeoutException('Proxy daemon failed to start within timeout limit'));
       })
       .catch(reject);
@@ -178,11 +202,7 @@ function getClaudeCommand() {
 
 async function ensureProxyReady(config) {
   if (!fs.existsSync(USER_CONFIG_DIR)) init();
-  if (await checkProxy(config)) {
-    // Daemon already running — read secret it wrote at startup
-    const secretFile = path.join(USER_CONFIG_DIR, 'logs', 'proxy.secret');
-    try { return fs.readFileSync(secretFile, 'utf8').trim(); } catch { return ''; }
-  }
+  if (await checkProxy(config)) return '';
   return await startProxyDaemon(config);
 }
 
@@ -208,9 +228,15 @@ async function main() {
   const spawnCmd = cli.isNode ? process.execPath : cli.cmd;
   const spawnArgs = cli.isNode ? [cli.cmd, ...args] : args;
 
-  const keepaliveOptions = keepaliveSecret ? { headers: { 'x-ccb-keepalive-secret': keepaliveSecret } } : {};
-  const keepaliveReq = http.get(`http://localhost:${config.port}/__ccb_internal__/keepalive`, keepaliveOptions);
-  keepaliveReq.on('error', () => { /* Ignore errors, if it dies it dies */ });
+  const ipcSocket = await connectToControlIpc();
+  if (ipcSocket) {
+    ipcSocket.write(serializeIpcMessage({ cmd: 'keepalive' }));
+    ipcSocket.on('error', () => { /* ignore */ });
+  } else {
+    const keepaliveOptions = keepaliveSecret ? { headers: { 'x-ccb-keepalive-secret': keepaliveSecret } } : {};
+    const keepaliveReq = http.get(`http://localhost:${config.port}/__ccb_internal__/keepalive`, keepaliveOptions);
+    keepaliveReq.on('error', () => { /* ignore */ });
+  }
 
   // On Windows, if we're still pointing to a .cmd file (e.g. resolve failed), we MUST use shell: true
   const useShell = process.platform === 'win32' && spawnCmd.toLowerCase().endsWith('.cmd');
@@ -228,11 +254,11 @@ async function main() {
   process.on('SIGINT', handleSigInt);
 
   child.on('exit', (code) => {
-    keepaliveReq.destroy();
+    if (ipcSocket) ipcSocket.destroy();
     process.exit(code ?? 0);
   });
   child.on('error', (err) => {
-    keepaliveReq.destroy();
+    if (ipcSocket) ipcSocket.destroy();
     process.stderr.write(`ccb: failed to launch claude: ${err.message}\n`);
     process.exit(1);
   });
@@ -270,6 +296,49 @@ const CCB_CMDS = {
     await runKill();
     process.exit(0);
   },
+  '--x-restart': async () => {
+    const socket = await connectToControlIpc();
+    if (!socket) {
+      process.stderr.write('ccb: No running watchdog found. Start a session first with: ccb\n');
+      process.exit(1);
+    }
+
+    socket.write(serializeIpcMessage({ cmd: 'restart' }));
+
+    let buffer = '';
+    socket.on('data', (data) => {
+      buffer += data.toString();
+      const lines = buffer.split('\n');
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const response = parseIpcMessage(line);
+        if (response) {
+          if (response.status === 'ok') {
+            process.stdout.write(`Restarted worker (PID ${response.oldPid} → PID ${response.newPid})\n`);
+          } else {
+            process.stderr.write(`Restart failed: ${response.message}\n`);
+          }
+          socket.end();
+          process.exit(response.status === 'ok' ? 0 : 1);
+        }
+      }
+    });
+
+    socket.on('error', (err) => {
+      process.stderr.write(`ccb: IPC error: ${err.message}\n`);
+      process.exit(1);
+    });
+
+    socket.on('close', () => {
+      process.exit(0);
+    });
+
+    setTimeout(() => {
+      process.stderr.write('ccb: Restart timed out\n');
+      socket.destroy();
+      process.exit(1);
+    }, 15_000);
+  },
   '--x-clearlogs': () => {
     clearLogs();
     process.exit(0);
@@ -285,6 +354,7 @@ CCB (Claude Code Bridge) Management Commands:
   --x-version       Print the ccb version
   --x-init          Initialize the config directory (~/.claude/.ccb)
   --x-killall       Kill all background proxy processes
+  --x-restart      Gracefully restart the proxy daemon (zero-downtime)
   --x-clearlogs     Delete all log files in the logs directory
   --x-provider ...  Manage providers (add/remove)
   --x-route ...     Manage routing rules (model/property/payloadSize)

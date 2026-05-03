@@ -106,7 +106,7 @@ export async function runKill() {
   procs = getProcesses();
   const daemonProcs = procs.filter(p => 
     p.pid !== currentPid && 
-    (p.cmd.includes('--__cc-proxy-daemon__') || p.cmd.includes('src/proxy.js') || p.cmd.includes('src\\proxy.js'))
+    (p.cmd.includes('--__cc-proxy-daemon__') || p.cmd.includes('ccb-watchdog.js') || p.cmd.includes('src/proxy.js') || p.cmd.includes('src\\proxy.js'))
   );
   
   killed = 0;
