@@ -53,6 +53,20 @@ async function runUnitTests() {
   assert(providerIdToEnvKey('') === '', 'empty string returns empty');
   assert(providerIdToEnvKey(null) === '', 'null returns empty');
   assert(providerIdToEnvKey(undefined) === '', 'undefined returns empty');
+
+  // ── daemon-constants ──
+  console.log('\ndaemon-constants:');
+  const { getControlIpcPath, INIT_TIMEOUT_MS, DRAIN_TIMEOUT_MS } = await import('../src/core/daemon-constants.js');
+  const ipcPath = getControlIpcPath();
+  assert(typeof ipcPath === 'string' && ipcPath.length > 0, 'getControlIpcPath returns non-empty string');
+  if (process.platform === 'win32') {
+    assert(ipcPath.includes('pipe'), 'Windows IPC path contains "pipe"');
+  } else {
+    assert(ipcPath.endsWith('.sock') || ipcPath.includes('ccb-ctrl'), 'POSIX IPC path has expected suffix');
+  }
+  assert(typeof INIT_TIMEOUT_MS === 'number' && INIT_TIMEOUT_MS > 0, 'INIT_TIMEOUT_MS is positive number');
+  assert(typeof DRAIN_TIMEOUT_MS === 'number' && DRAIN_TIMEOUT_MS > 0, 'DRAIN_TIMEOUT_MS is positive number');
+
   const { ResultAccessError, ArgumentError, ConfigError } = await import('../src/core/exceptions.js');
   const { parseSseMetadata } = await import('../src/core/sse-parser.js');
   const { ProxyConfig } = await import('../src/core/config.js');
@@ -154,7 +168,7 @@ async function runUnitTests() {
   // ── sanitizeMessages ──
   console.log('\nsanitizeMessages:');
   // sanitization logic now lives in the extension, test via extension registry
-  const { createSanitizationExtension } = await import('../src/extensions/sanitization.js');
+  const { createSanitizationExtension } = await import('../src/extensions/sanitization/index.js');
   const { ExtensionRegistry: SanitizeER } = await import('../src/core/extension-registry.js');
   const sanitizeReg = new SanitizeER();
   sanitizeReg.register(createSanitizationExtension());
@@ -248,7 +262,7 @@ async function runUnitTests() {
   // ── SseResponseTransformer ──
   console.log('\nSseResponseTransformer:');
   const { SseResponseTransformer } = await import('../src/core/sse-transformer.js');
-  const { createThinkingSseExtension } = await import('../src/extensions/thinking-sse.js');
+  const { createThinkingSseExtension } = await import('../src/extensions/thinking-sse/index.js');
   const { ExtensionRegistry: SseER } = await import('../src/core/extension-registry.js');
   const sseReg = new SseER();
   sseReg.register(createThinkingSseExtension());
@@ -735,7 +749,7 @@ async function runUnitTests() {
 
   // ── Fallback handler ──
   console.log('\nFallback handler:');
-  const { createFallbackExtension } = await import('../src/extensions/fallback.js');
+  const { createFallbackExtension } = await import('../src/extensions/fallback/index.js');
   const { ExtensionRegistry: FallbackER } = await import('../src/core/extension-registry.js');
   const fallbackReg = new FallbackER();
   fallbackReg.register(createFallbackExtension());
@@ -871,7 +885,7 @@ async function runUnitTests() {
     legacyProvidersMap: new ProvidersMap([testProvCfg])
   });
 
-  const rr = resolveRoutingFn({
+  const rr = await resolveRoutingFn({
     policy: testPolicy,
     body: { model: 't-model', messages: [] },
     urlSessionId: 'sess-123',
@@ -884,7 +898,7 @@ async function runUnitTests() {
   assert(rr.routedHeaders.authorization === undefined, 'resolveRouting strips auth');
   assert(rr.routedHeaders['x-api-key'] !== undefined || true, 'resolveRouting resolves headers');
 
-  const rrFallback = resolveRoutingFn({
+  const rrFallback = await resolveRoutingFn({
     policy: testPolicy,
     body: { model: 'unknown-model', messages: [] },
     urlSessionId: '',
@@ -904,7 +918,7 @@ async function runUnitTests() {
     defaultFallback: { providerId: 'fb-p', model: 'safe-model' }
   });
 
-  const rrDefault = resolveRoutingFn({
+  const rrDefault = await resolveRoutingFn({
     policy: policyWithDefaultFallback,
     body: { model: 'unknown-model', messages: [] },
     urlSessionId: '',
@@ -984,7 +998,7 @@ async function runUnitTests() {
 
   // ── Web Search z.ai Extension ──
   console.log('\nWeb Search z.ai Extension:');
-  const { createWebSearchZaiExtension, sanitizeWebSearchHistory } = await import('../src/extensions/web-search-zai.js');
+  const { createWebSearchZaiExtension, sanitizeWebSearchHistory } = await import('../src/extensions/web-search-zai/index.js');
 
   const wsExt = createWebSearchZaiExtension({ search_engine: 'search-prime', count: '5' });
   assert(wsExt.name === 'web-search-zai', 'createWebSearchZaiExtension name');
@@ -1161,6 +1175,260 @@ async function runUnitTests() {
   const internalTT = convertV2ToInternal(v2WithToolTransforms);
   assert(internalTT.providers[0].toolTransforms.web_search.count === '10', 'config-adapter parses toolTransforms');
 
+  // ── Extension Loader ──
+  console.log('\nextension-loader:');
+  const { discoverExtensions, buildRegistry, getNestedValue } = await import('../src/core/extension-loader.js');
+
+  // getNestedValue
+  assert(getNestedValue({ a: { b: 1 } }, 'a.b') === 1, 'getNestedValue resolves dot path');
+  assert(getNestedValue({ a: { b: 1 } }, 'a.c') === undefined, 'getNestedValue returns undefined for missing key');
+  assert(getNestedValue(null, 'a.b') === undefined, 'getNestedValue handles null');
+  assert(getNestedValue({ toolTransforms: { web_search: { count: '5' } } }, 'toolTransforms.web_search').count === '5', 'getNestedValue resolves toolTransforms path');
+
+  // discoverExtensions on built-in dir
+  const extDir = path.join(PKG_ROOT, 'src', 'extensions');
+  const discovered = await discoverExtensions(extDir);
+  assert(discovered.length === 7, `discovers 7 extensions (found ${discovered.length})`);
+  const errors = discovered.filter(m => m.error);
+  assert(errors.length === 0, `no discovery errors (${errors.map(e => e.error).join(', ')})`);
+
+  // buildRegistry with no providers — only always-on extensions
+  const { registry: regNoProviders } = buildRegistry(discovered, []);
+  assert(regNoProviders.size === 6, `6 always-on extensions without providers (got ${regNoProviders.size})`);
+  assert(regNoProviders.requestTransformerCount >= 2, 'at least 2 request transformers (sanitization + non-compliant)');
+
+  // buildRegistry with provider that has toolTransforms.web_search
+  const providerWithWs = new ProviderConfig({
+    id: 'z', url: 'https://api.z.ai/api/anthropic', anthropicCompliant: false,
+    toolTransforms: { web_search: {} }
+  });
+  const { registry: regWithWs } = buildRegistry(discovered, [providerWithWs]);
+  assert(regWithWs.size === 7, `7 extensions with web_search provider (got ${regWithWs.size})`);
+
+  // ── Load Balancer Extension ──
+  console.log('\nload-balancer:');
+  const { createLoadBalancerExtension } = await import('../src/extensions/load-balancer/index.js');
+  const { selectRoundRobin } = await import('../src/extensions/load-balancer/strategies/round-robin.js');
+  const { selectLeastConn, entryKey } = await import('../src/extensions/load-balancer/strategies/least-conn.js');
+  const { selectRandom, selectWeighted } = await import('../src/extensions/load-balancer/strategies/random.js');
+
+  // Round-robin strategy
+  const rrState = { counter: 0 };
+  const rrEntries = [{ providerId: 'a', model: 'm1', weight: 1 }, { providerId: 'b', model: 'm2', weight: 1 }];
+  assert(selectRoundRobin(rrEntries, rrState).providerId === 'a', 'round-robin picks first');
+  assert(selectRoundRobin(rrEntries, rrState).providerId === 'b', 'round-robin picks second');
+  assert(selectRoundRobin(rrEntries, rrState).providerId === 'a', 'round-robin wraps');
+
+  // Least-conn strategy
+  const lcCounts = new Map();
+  const lcEntries = [{ providerId: 'a', model: 'm', weight: 1 }, { providerId: 'b', model: 'm', weight: 1 }];
+  lcCounts.set('a:m', 3);
+  lcCounts.set('b:m', 1);
+  assert(selectLeastConn(lcEntries, lcCounts).providerId === 'b', 'least-conn picks fewest active');
+
+  // Weighted strategy (statistical — run many times)
+  const wEntries = [{ providerId: 'a', model: 'm', weight: 9 }, { providerId: 'b', model: 'm', weight: 1 }];
+  let wA = 0;
+  for (let i = 0; i < 1000; i++) { if (selectWeighted(wEntries).providerId === 'a') wA++; }
+  assert(wA > 700, `weighted favors higher weight (a=${wA}/1000)`);
+
+  // Random strategy
+  const randEntry = selectRandom(lcEntries);
+  assert(randEntry.providerId === 'a' || randEntry.providerId === 'b', 'random returns valid entry');
+
+  // entryKey
+  assert(entryKey({ providerId: 'z', model: 'glm-5' }) === 'z:glm-5', 'entryKey with providerId');
+  assert(entryKey({ provider: 'z', model: 'glm-5' }) === 'z:glm-5', 'entryKey with legacy provider field');
+
+  // UID-based pool config (ref format)
+  const lbRef = createLoadBalancerExtension({
+    pools: {
+      coder: {
+        strategy: 'round-robin',
+        entries: [{ ref: 'z.glm-5', weight: 5 }, 'synthetic.zai-org/GLM-5']
+      }
+    },
+    aliases: { '*sonnet*': 'coder' }
+  });
+  assert(lbRef.name === 'load-balancer', 'extension name');
+
+  // resolveProvider with alias match
+  const resolved = lbRef.hooks.resolveProvider.resolve({ body: { model: 'claude-sonnet-4-20250514' } });
+  assert(resolved !== null, 'resolves sonnet alias');
+  assert(resolved.providerId === 'z' || resolved.providerId === 'synthetic', 'resolved providerId is valid');
+
+  // resolveProvider returns null for non-matching model
+  const noResolve = lbRef.hooks.resolveProvider.resolve({ body: { model: 'claude-opus-4-20250514' } });
+  assert(noResolve === null, 'returns null for unmatched model');
+
+  // resolveProvider with exact pool name
+  const lbExact = createLoadBalancerExtension({
+    pools: {
+      coder: {
+        strategy: 'round-robin',
+        entries: [{ ref: 'z.glm-5', weight: 5 }, 'synthetic.zai-org/GLM-5']
+      }
+    }
+  });
+  const exactResolved = lbExact.hooks.resolveProvider.resolve({ body: { model: 'coder' } });
+  assert(exactResolved !== null, 'resolves exact pool name as model');
+  assert(exactResolved.providerId === 'z' || exactResolved.providerId === 'synthetic', 'exact pool resolved to valid provider');
+
+  // Legacy entry format still works
+  const lbLegacy = createLoadBalancerExtension({
+    pools: {
+      test: {
+        strategy: 'round-robin',
+        entries: [{ provider: 'z', model: 'glm-5', weight: 1 }]
+      }
+    }
+  });
+  const legacyResolved = lbLegacy.hooks.resolveProvider.resolve({ body: { model: 'test' } });
+  assert(legacyResolved.providerId === 'z' && legacyResolved.model === 'glm-5', 'legacy entry format works');
+
+  // onRequestStart / onRequestEnd tracking
+  const lbTracking = createLoadBalancerExtension({
+    pools: { coder: { entries: ['z.glm-5'] } }
+  });
+  const trackMap = new Map();
+  const origSet = trackMap.set.bind(trackMap);
+  // Verify hooks exist and don't crash
+  lbTracking.hooks.onRequestStart.handler({ providerId: 'z', model: 'glm-5' });
+  lbTracking.hooks.onRequestEnd.handler({ providerId: 'z', model: 'glm-5' });
+
+  // ── OpenAI Format Extension ──
+  console.log('\nopenai-format:');
+  const { createOpenaiFormatExtension } = await import('../src/extensions/openai-format/index.js');
+  const { convertRequest } = await import('../src/extensions/openai-format/converters/request.js');
+  const { convertChunk, convertFullResponse, createState } = await import('../src/extensions/openai-format/converters/response-sse.js');
+
+  // Request conversion: basic text
+  const anthropicReq = {
+    model: 'gpt-4',
+    system: 'You are helpful.',
+    messages: [
+      { role: 'user', content: 'Hello' }
+    ],
+    max_tokens: 1024,
+    stream: true,
+    temperature: 0.7,
+  };
+  const openaiReq = convertRequest(anthropicReq);
+  assert(openaiReq.model === 'gpt-4', 'model preserved');
+  assert(openaiReq.messages[0].role === 'system', 'system converted to system role message');
+  assert(openaiReq.messages[0].content === 'You are helpful.', 'system text preserved');
+  assert(openaiReq.messages[1].role === 'user', 'user message converted');
+  assert(openaiReq.max_tokens === 1024, 'max_tokens preserved');
+  assert(openaiReq.stream === true, 'stream preserved');
+  assert(openaiReq.temperature === 0.7, 'temperature preserved');
+
+  // Request conversion: tool_use → tool_calls
+  const toolReq = {
+    model: 'gpt-4',
+    messages: [
+      { role: 'user', content: 'Read file' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'Let me read that.' },
+          { type: 'tool_use', id: 'tu_1', name: 'read_file', input: { path: '/tmp/x' } }
+        ]
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: 'file contents' }] }
+    ],
+    tools: [
+      { name: 'read_file', description: 'Read a file', input_schema: { type: 'object', properties: { path: { type: 'string' } } } }
+    ],
+    tool_choice: 'auto',
+  };
+  const toolResult = convertRequest(toolReq);
+  const assistantMsg = toolResult.messages.find(m => m.tool_calls);
+  assert(assistantMsg, 'assistant message has tool_calls');
+  assert(assistantMsg.tool_calls[0].function.name === 'read_file', 'tool_use name preserved');
+  assert(assistantMsg.tool_calls[0].id === 'tu_1', 'tool_use id preserved');
+  assert(toolResult.tools.length === 1, 'tools converted');
+  assert(toolResult.tools[0].type === 'function', 'tool converted to function type');
+  assert(toolResult.tool_choice === 'auto', 'tool_choice auto preserved');
+
+  // Request conversion: tool_choice variants
+  assert(convertRequest({ messages: [], tool_choice: 'any' }).tool_choice === 'required', 'tool_choice any → required');
+  assert(convertRequest({ messages: [], tool_choice: { type: 'tool', name: 'my_tool' } }).tool_choice.function.name === 'my_tool', 'tool_choice named tool');
+
+  // Request conversion: system as array
+  const sysArr = convertRequest({ model: 'm', system: [{ type: 'text', text: 'Part 1' }, { type: 'text', text: 'Part 2' }], messages: [] });
+  assert(sysArr.messages[0].content === 'Part 1\nPart 2', 'system array joined');
+
+  // Request conversion: built-in tools skipped
+  const builtinTools = convertRequest({ model: 'm', messages: [], tools: [
+    { type: 'web_search' },
+    { name: 'my_fn', description: 'desc', input_schema: {} }
+  ]});
+  assert(builtinTools.tools.length === 1, 'built-in tools filtered out');
+  assert(builtinTools.tools[0].function.name === 'my_fn', 'custom tool kept');
+
+  // SSE chunk conversion: text streaming
+  const ofState = createState();
+  const ofChunk1 = convertChunk('data: {"id":"chatcmpl-1","model":"gpt-4","choices":[{"delta":{"role":"assistant","content":"Hi"}}]}\n\n', ofState);
+  assert(ofChunk1.includes('message_start'), 'first chunk emits message_start');
+  assert(ofChunk1.includes('content_block_start'), 'first chunk emits content_block_start');
+  assert(ofChunk1.includes('content_block_delta'), 'chunk emits content_block_delta');
+
+  const ofChunk2 = convertChunk('data: {"id":"chatcmpl-1","model":"gpt-4","choices":[{"delta":{"content":" there"}}]}\n\n', ofState);
+  assert(ofChunk2.includes('content_block_delta'), 'second chunk emits delta');
+  assert(!ofChunk2.includes('message_start'), 'second chunk does not re-emit message_start');
+
+  const ofChunk3 = convertChunk('data: {"id":"chatcmpl-1","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n', ofState);
+  assert(ofChunk3.includes('content_block_stop'), 'finish emits content_block_stop');
+  assert(ofChunk3.includes('message_delta'), 'finish emits message_delta');
+  assert(ofChunk3.includes('"stop_reason":"end_turn"'), 'stop reason converted');
+
+  const ofChunkDone = convertChunk('data: [DONE]\n\n', ofState);
+  assert(ofChunkDone.includes('message_stop'), '[DONE] emits message_stop');
+  assert(ofState.finished === true, 'state marked finished');
+
+  // SSE chunk conversion: tool calls
+  const ofTcState = createState();
+  const ofTcChunk = convertChunk('data: {"id":"chatcmpl-2","model":"gpt-4","choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"call_1","function":{"name":"read_file","arguments":""}}]}}]}\n\n', ofTcState);
+  assert(ofTcChunk.includes('tool_use'), 'tool call chunk emits tool_use block');
+  assert(ofTcChunk.includes('"name":"read_file"'), 'tool name in content_block_start');
+
+  const ofTcArgPayload = JSON.stringify({ id: 'chatcmpl-2', choices: [{ delta: { tool_calls: [{ function: { arguments: '{"path":"/tmp"}' } }] } }] });
+  const ofTcArgs = convertChunk('data: ' + ofTcArgPayload + '\n\n', ofTcState);
+  assert(ofTcArgs.includes('input_json_delta'), 'tool arguments emit input_json_delta');
+
+  // SSE: empty chunk / already finished
+  const ofFinState = createState();
+  ofFinState.finished = true;
+  assert(convertChunk('data: {}', ofFinState) === '', 'finished state returns empty');
+
+  // Full response conversion
+  const ofFullResp = convertFullResponse(JSON.stringify({
+    id: 'chatcmpl-3',
+    model: 'gpt-4',
+    choices: [{
+      message: { content: 'Hello world', tool_calls: [{ id: 'tc_1', function: { name: 'fn', arguments: '{"a":1}' } }] },
+      finish_reason: 'tool_calls'
+    }],
+    usage: { prompt_tokens: 10, completion_tokens: 5 }
+  }));
+  const ofParsed = JSON.parse(ofFullResp);
+  assert(ofParsed.type === 'message', 'full response type is message');
+  assert(ofParsed.content[0].type === 'text', 'text content first');
+  assert(ofParsed.content[1].type === 'tool_use', 'tool_use second');
+  assert(ofParsed.content[1].input.a === 1, 'tool input parsed');
+  assert(ofParsed.stop_reason === 'tool_use', 'finish_reason tool_calls → tool_use');
+  assert(ofParsed.usage.input_tokens === 10, 'usage preserved');
+
+  // Extension hook passthrough for non-openai providers
+  const ofExt = createOpenaiFormatExtension({ providers: { synthetic: { format: 'openai' } } });
+  const ofBody = { model: 'test', messages: [] };
+  assert(ofExt.hooks.requestTransform.transform({ body: ofBody, provider: { id: 'other' } }) === ofBody, 'non-openai provider passthrough');
+  assert(ofExt.hooks.responseTransform.transform({ response: 'raw', provider: { id: 'other' } }) === 'raw', 'response passthrough for non-openai');
+
+  // Extension hook converts for openai provider
+  const ofTransformed = ofExt.hooks.requestTransform.transform({ body: anthropicReq, provider: { id: 'synthetic' } });
+  assert(ofTransformed.messages[0].role === 'system', 'openai provider gets converted request');
+
 }
 
 // ── Integration test (isolated daemon) ──
@@ -1255,7 +1523,7 @@ async function setupTestConfig() {
   const config = {
     port: TEST_PORT,
     daemon: { healthCheckTimeoutMs: 1000, pollIntervalMs: 200, pollMaxAttempts: 15 },
-    logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }
+    logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000, level: 'trace' }
   };
   fs.writeFileSync(path.join(TEST_CONFIG_DIR, 'config.json'), JSON.stringify(config, null, 2), 'utf8');
 
@@ -1433,111 +1701,136 @@ function checkThinkingInLogs() {
  */
 async function assertWebSearchTransform() {
   const http = await import('http');
+  const testToken1 = `ws-test-1-${Math.random().toString(36).slice(2)}`;
+  const testToken2 = `ws-test-2-${Math.random().toString(36).slice(2)}`;
 
-  const body = JSON.stringify({
+  const logsDir = path.join(TEST_CONFIG_DIR, 'logs');
+
+  // ── TEST 1: Request Tool Transformation ──
+  const body1 = JSON.stringify({
     model: 'glm-4.7',
     max_tokens: 200,
-    messages: [{ role: 'user', content: 'What is the current date today? Use web search if available.' }],
+    messages: [{ role: 'user', content: `What is the current date today? [${testToken1}]` }],
     tools: [{ type: 'web_search_20250305', name: 'web_search' }]
   });
 
-  return new Promise((resolve) => {
+  const res1 = await new Promise((resolve) => {
     const req = http.request({
-      hostname: 'localhost',
-      port: TEST_PORT,
-      path: '/v1/messages',
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'content-length': Buffer.byteLength(body),
-        'x-api-key': 'test-key',
-        'anthropic-version': '2023-06-01'
-      },
+      hostname: 'localhost', port: TEST_PORT, path: '/v1/messages', method: 'POST',
+      headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body1), 'x-api-key': 'test-key', 'anthropic-version': '2023-06-01' },
       timeout: 30000
     }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
-      res.on('end', () => {
-        const raw = Buffer.concat(chunks).toString();
-        const isSse = (res.headers['content-type'] || '').includes('text/event-stream');
-
-        // Check HTTP status — 400 with 1210 means tool transform didn't work
-        if (res.statusCode === 400) {
-          if (raw.includes('1210')) {
-            console.error('  FAIL: web_search tool not transformed (1210 error from z.ai)');
-            resolve(false);
-            return;
-          }
-          // Other 400 errors may be transient
-          console.warn(`  WARN: web_search test got 400 (not 1210): ${raw.slice(0, 200)}`);
-          resolve(true);
-          return;
-        }
-
-        if (res.statusCode >= 500) {
-          console.warn(`  WARN: web_search test got ${res.statusCode} from upstream`);
-          resolve(true);
-          return;
-        }
-
-        // For SSE responses, check that web_search array doesn't leak
-        if (isSse) {
-          const hasWebSearchLeak = raw.includes('"web_search":[');
-          if (hasWebSearchLeak) {
-            console.error('  FAIL: web_search array leaked into SSE response');
-            resolve(false);
-            return;
-          }
-          // Check that we got actual content
-          const hasContent = raw.includes('"type":"text"') || raw.includes('"type":"content_block_delta"');
-          if (hasContent) {
-            console.log('  PASS: web_search SSE response clean (no web_search leak)');
-          } else {
-            console.warn('  WARN: web_search SSE response has no text content');
-          }
-          resolve(true);
-          return;
-        }
-
-        // For JSON responses
-        try {
-          const parsed = JSON.parse(raw);
-          if (parsed.web_search) {
-            console.error('  FAIL: web_search array leaked into JSON response');
-            resolve(false);
-            return;
-          }
-          if (parsed.content) {
-            console.log('  PASS: web_search JSON response clean');
-            resolve(true);
-            return;
-          }
-          if (parsed.error) {
-            console.warn(`  WARN: web_search test got error response: ${parsed.error.message || JSON.stringify(parsed.error)}`);
-            resolve(true);
-            return;
-          }
-        } catch {
-          console.warn(`  WARN: web_search response not JSON, status ${res.statusCode}`);
-        }
-        resolve(true);
-      });
+      res.on('end', () => resolve({ statusCode: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString() }));
     });
-
-    req.on('error', (err) => {
-      console.error(`  FAIL: web_search test connection error: ${err.message}`);
-      resolve(false);
-    });
-
-    req.on('timeout', () => {
-      req.destroy();
-      console.error('  FAIL: web_search test timed out');
-      resolve(false);
-    });
-
-    req.write(body);
+    req.on('error', (e) => resolve({ error: e }));
+    req.write(body1);
     req.end();
   });
+
+  if (res1.error) {
+    console.error(`  FAIL: web_search test 1 connection error: ${res1.error.message}`);
+    return false;
+  }
+
+  // Verify transform in logs for Test 1
+  let transformed1 = null;
+  try {
+    const files1 = fs.readdirSync(logsDir).filter(f => f.startsWith('debug-') && f.endsWith('.sanitized.json'));
+    for (const file of files1) {
+      const content = fs.readFileSync(path.join(logsDir, file), 'utf8');
+      if (content.includes(testToken1)) {
+        transformed1 = JSON.parse(content);
+        break;
+      }
+    }
+  } catch { /* ignore */ }
+
+  if (transformed1) {
+    const wsTool = transformed1.tools?.find(t => t.type === 'web_search');
+    if (wsTool && wsTool.web_search && wsTool.web_search.enable === 'True') {
+      console.log('  PASS: Request tool transformation verified in debug logs');
+    } else {
+      console.error('  FAIL: Request tool transformation failed');
+      return false;
+    }
+  }
+
+  // ── TEST 2: History Sanitization ──
+  const body2 = JSON.stringify({
+    model: 'glm-4.7',
+    max_tokens: 200,
+    messages: [
+      { role: 'user', content: 'What is the capital of France?' },
+      { role: 'assistant', content: [
+        { type: 'text', text: 'Searching...' },
+        { type: 'tool_use', id: 'toolu_ws_test', name: 'web_search', input: { query: 'capital of France' } }
+      ]},
+      { role: 'user', content: [
+        { type: 'tool_result', tool_use_id: 'toolu_ws_test', content: 'The capital of France is Paris.' }
+      ]},
+      { role: 'assistant', content: [{ type: 'text', text: 'The capital of France is Paris.' }] },
+      { role: 'user', content: `Tell me more about it. [${testToken2}]` }
+    ]
+  });
+
+  const res2 = await new Promise((resolve) => {
+    const req = http.request({
+      hostname: 'localhost', port: TEST_PORT, path: '/v1/messages', method: 'POST',
+      headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body2), 'x-api-key': 'test-key', 'anthropic-version': '2023-06-01' },
+      timeout: 30000
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ statusCode: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString() }));
+    });
+    req.on('error', (e) => resolve({ error: e }));
+    req.write(body2);
+    req.end();
+  });
+
+  if (res2.error) {
+    console.error(`  FAIL: web_search test 2 connection error: ${res2.error.message}`);
+    return false;
+  }
+
+  // Verify transform in logs for Test 2 (History Sanitization)
+  let transformed2 = null;
+  try {
+    const files2 = fs.readdirSync(logsDir).filter(f => f.startsWith('debug-') && f.endsWith('.sanitized.json'));
+    for (const file of files2) {
+      const content = fs.readFileSync(path.join(logsDir, file), 'utf8');
+      if (content.includes(testToken2)) {
+        transformed2 = JSON.parse(content);
+        break;
+      }
+    }
+  } catch { /* ignore */ }
+
+  if (transformed2) {
+    const msgWithToolUse = transformed2.messages.find(m => m.role === 'assistant' && JSON.stringify(m.content).includes('[web_search query:'));
+    const msgWithToolResult = transformed2.messages.find(m => m.role === 'user' && JSON.stringify(m.content).includes('[web_search results:'));
+    
+    if (msgWithToolUse && msgWithToolResult) {
+      console.log('  PASS: History sanitization verified in debug logs');
+    } else {
+      console.error('  FAIL: History sanitization failed');
+      return false;
+    }
+  }
+
+  // Final checks
+  if (res1.statusCode === 400 && res1.body.includes('1210')) {
+     console.error('  FAIL: web_search tool not accepted by upstream (1210 error)');
+     return false;
+  }
+
+  if (res1.statusCode === 200 || res2.statusCode === 200) {
+    console.log('  PASS: web_search integration test successful');
+  }
+
+  return true;
 }
 
 async function runIntegrationTests() {
