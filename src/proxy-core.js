@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import http from 'http';
 import { fileURLToPath } from 'url';
 import { loadConfigFromFile } from './core/config.js';
 import { ensureCompleteProviders } from './core/migrator.js';
@@ -19,6 +20,7 @@ import { runKill } from './infra/process-manager.js';
 import { detectFormat, convertV2ToInternal } from './core/config-adapter.js';
 import { ExtensionRegistry } from './core/extension-registry.js';
 import { discoverExtensions, buildRegistry, watchExtensions } from './core/extension-loader.js';
+import { serializeIpcMessage } from './core/ipc-protocol.js';
 
 export { runKill };
 export { loadEnv };
@@ -248,9 +250,9 @@ export function createProxyCore({ configDir, port }) {
   }
 
   function initProviders() {
-    if (!fs.existsSync(providersPath)) return;
+    if (!fs.existsSync(providersPath)) return Promise.resolve();
     const data = fs.readFileSync(providersPath, 'utf8');
-    loadAndApplyProviders(data).catch((e) => errorReporter.write(e, { operation: 'initial provider load' }));
+    const loadPromise = loadAndApplyProviders(data);
 
     try {
       fs.watch(providersPath, () => { reloadProviders().catch((e) => errorReporter.write(e, { operation: 'providers reload callback' })); });
@@ -266,6 +268,8 @@ export function createProxyCore({ configDir, port }) {
       process.stdout.write('[extensions] File change detected, reloading...\n');
       reloadProviders().catch((e) => errorReporter.write(e, { operation: 'extension hot-reload' }));
     });
+
+    return loadPromise;
   }
 
   // ── Request handler ──
@@ -426,4 +430,59 @@ export function createProxyCore({ configDir, port }) {
     logsDir,
     port: currentPort,
   };
+}
+
+export function runWorkerMode({ configDir, port }) {
+  const core = createProxyCore({ configDir, port });
+  let drained = false;
+  let server = null;
+
+  process.on('message', (msg, handle) => {
+    if (msg?.type === 'socket' && handle) {
+      server = http.createServer(core.createRequestHandler());
+      server.listen(handle, () => {
+        process.stdout.write('[worker] Listening on passed socket handle\n');
+      });
+
+      core.initProviders().then(() => {
+        const readyMsg = serializeIpcMessage({
+          type: 'ready',
+          pid: process.pid,
+          routes: core.providerCount,
+          extensions: 0
+        });
+        if (process.send) process.send(readyMsg);
+      }).catch((e) => {
+        const errorMsg = serializeIpcMessage({
+          type: 'error',
+          message: e.message
+        });
+        if (process.send) process.send(errorMsg);
+        process.exit(1);
+      });
+    }
+
+    if (msg?.type === 'drain' && !drained) {
+      drained = true;
+      process.stdout.write('[worker] Drain signal received, stopping new connections\n');
+
+      const timeout = setTimeout(() => {
+        process.stdout.write('[worker] Drain timeout exceeded, force exiting\n');
+        process.exit(0);
+      }, msg.timeout || 600_000);
+
+      const checkDrain = () => {
+        if (core.activeConnections <= 0) {
+          clearTimeout(timeout);
+          process.stdout.write('[worker] All in-flight requests completed\n');
+          process.exit(0);
+        }
+      };
+
+      if (server) {
+        server.close(checkDrain);
+      }
+      setInterval(checkDrain, 1000);
+    }
+  });
 }
