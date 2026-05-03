@@ -28,6 +28,14 @@ import { ArgumentError } from './exceptions.js';
  *  - **shouldAttemptFallback** — decides if an HTTP error triggers fallback
  *  - **shouldAttemptFallbackForTcpError** — decides if a TCP error triggers fallback
  *  - **buildFallbackRequest** — builds the fallback request body/headers
+ *
+ * Format conversion hooks (for multi-protocol support):
+ *  - **requestFormatConvert** — converts request body to target API format
+ *  - **responseFormatConvert** — converts response from source API format
+ *
+ * Load balancing hooks:
+ *  - **resolveProvider** — selects a provider from a pool
+ *  - **onRequestStart** / **onRequestEnd** — lifecycle tracking
  */
 export class ExtensionRegistry {
   #extensions = new Map();
@@ -37,6 +45,12 @@ export class ExtensionRegistry {
   #fallbackCheckers = [];
   #fallbackTcpCheckers = [];
   #fallbackBuilders = [];
+  #requestFormatConverters = [];
+  #responseFormatConverters = [];
+  #providerResolvers = [];
+  #unmatchedResolvers = [];
+  #requestStartHandlers = [];
+  #requestEndHandlers = [];
 
   /** Register an extension. Idempotent — re-registering replaces the previous entry. */
   register(extension) {
@@ -66,6 +80,24 @@ export class ExtensionRegistry {
     }
     if (extension.hooks?.buildFallbackRequest) {
       this.#fallbackBuilders = this.#upsert(this.#fallbackBuilders, extension.name, extension.hooks.buildFallbackRequest);
+    }
+    if (extension.hooks?.requestFormatConvert) {
+      this.#requestFormatConverters = this.#upsert(this.#requestFormatConverters, extension.name, extension.hooks.requestFormatConvert);
+    }
+    if (extension.hooks?.responseFormatConvert) {
+      this.#responseFormatConverters = this.#upsert(this.#responseFormatConverters, extension.name, extension.hooks.responseFormatConvert);
+    }
+    if (extension.hooks?.resolveProvider) {
+      this.#providerResolvers = this.#upsert(this.#providerResolvers, extension.name, extension.hooks.resolveProvider);
+    }
+    if (extension.hooks?.resolveUnmatched) {
+      this.#unmatchedResolvers = this.#upsert(this.#unmatchedResolvers, extension.name, extension.hooks.resolveUnmatched);
+    }
+    if (extension.hooks?.onRequestStart) {
+      this.#requestStartHandlers = this.#upsert(this.#requestStartHandlers, extension.name, extension.hooks.onRequestStart);
+    }
+    if (extension.hooks?.onRequestEnd) {
+      this.#requestEndHandlers = this.#upsert(this.#requestEndHandlers, extension.name, extension.hooks.onRequestEnd);
     }
   }
 
@@ -140,6 +172,124 @@ export class ExtensionRegistry {
   get responseTransformerCount() { return this.#fullResponseTransformers.length; }
   get sseChunkTransformerCount() { return this.#sseChunkTransformers.length; }
   get hasFallback() { return this.#fallbackCheckers.length > 0; }
+  get hasProviderResolver() { return this.#providerResolvers.length > 0; }
+  get hasUnmatchedResolver() { return this.#unmatchedResolvers.length > 0; }
+
+  /**
+   * Convert request body to the target API format.
+   * Finds the first converter matching the declared format and returns its output.
+   * Returns null if no converter matches (no conversion needed).
+   */
+  convertRequestFormat(ctx) {
+    for (const c of this.#requestFormatConverters) {
+      if (c.format === ctx.format) {
+        return c.convert(ctx);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Check if a response format converter exists for the given format.
+   */
+  hasResponseFormatConverter(format) {
+    return this.#responseFormatConverters.some(c => c.format === format);
+  }
+
+  /**
+   * Convert a full (buffered) response from the source API format to Anthropic.
+   * Returns the converted response string, or null if no converter matches.
+   */
+  convertFullResponseFormat(ctx) {
+    for (const c of this.#responseFormatConverters) {
+      if (c.format === ctx.format && c.convertFullResponse) {
+        return c.convertFullResponse(ctx);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Create per-stream state objects for response format converters that
+   * have a `createState()` method.
+   */
+  createResponseFormatStates(format) {
+    return this.#responseFormatConverters
+      .filter(c => c.format === format)
+      .map(t => (typeof t.createState === 'function' ? t.createState() : undefined));
+  }
+
+  /**
+   * Convert a single SSE chunk from the source API format to Anthropic SSE.
+   * Runs all matching converters in order, passing state objects.
+   */
+  convertSseChunkFormat(ctx, states) {
+    let { chunk } = ctx;
+    const matching = this.#responseFormatConverters.filter(c => c.format === ctx.format);
+    let i = 0;
+    for (const c of matching) {
+      const state = states ? states[i] : undefined;
+      if (c.convertSseChunk) {
+        chunk = state !== undefined ? c.convertSseChunk({ ...ctx, chunk }, state) : c.convertSseChunk({ ...ctx, chunk });
+      }
+      i++;
+    }
+    return chunk;
+  }
+
+  /**
+   * Resolve a provider from a pool using the first extension that returns non-null.
+   */
+  resolveProvider(ctx) {
+    for (const r of this.#providerResolvers) {
+      const result = r.resolve(ctx);
+      if (result) return result;
+    }
+    return null;
+  }
+
+  /**
+   * Resolve an unmatched model using the first extension that returns non-null.
+   * Called when no routing rule matches the requested model.
+   */
+  async resolveUnmatched(ctx) {
+    for (const r of this.#unmatchedResolvers) {
+      const result = await r.resolve(ctx);
+      if (result) return result;
+    }
+    return null;
+  }
+
+  /**
+   * Get configuration schemas for all registered extensions.
+   */
+  getSchemas() {
+    const schemas = {};
+    for (const [name, ext] of this.#extensions.entries()) {
+      if (ext.schema) {
+        schemas[name] = ext.schema;
+      }
+    }
+    return schemas;
+  }
+
+  /**
+   * Notify all onRequestStart handlers.
+   */
+  emitRequestStart(ctx) {
+    for (const h of this.#requestStartHandlers) {
+      h.handler(ctx);
+    }
+  }
+
+  /**
+   * Notify all onRequestEnd handlers.
+   */
+  emitRequestEnd(ctx) {
+    for (const h of this.#requestEndHandlers) {
+      h.handler(ctx);
+    }
+  }
 
   #upsert(list, name, hook) {
     const filtered = list.filter(t => t.name !== name);
@@ -148,6 +298,12 @@ export class ExtensionRegistry {
     if (hook.createState) entry.createState = hook.createState;
     if (hook.check) entry.check = hook.check;
     if (hook.build) entry.build = hook.build;
+    if (hook.convert) entry.convert = hook.convert;
+    if (hook.resolve) entry.resolve = hook.resolve;
+    if (hook.handler) entry.handler = hook.handler;
+    if (hook.format) entry.format = hook.format;
+    if (hook.convertSseChunk) entry.convertSseChunk = hook.convertSseChunk;
+    if (hook.convertFullResponse) entry.convertFullResponse = hook.convertFullResponse;
     filtered.push(entry);
     filtered.sort((a, b) => a.order - b.order);
     return filtered;

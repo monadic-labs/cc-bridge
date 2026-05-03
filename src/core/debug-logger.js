@@ -25,7 +25,11 @@ export class DebugLogger {
       if (!fs.existsSync(this.#logsDir)) fs.mkdirSync(this.#logsDir, { recursive: true });
       const filename = `debug-${requestId}.${type}.json`;
       const fullPath = path.join(this.#logsDir, filename);
-      const content = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+      
+      let content = JSON.stringify(data, null, 2);
+      if (typeof data === 'string') content = data;
+      if (Buffer.isBuffer(data)) content = data.toString();
+      
       await fs.promises.writeFile(fullPath, content, 'utf8');
     } catch { /* best effort */ }
   }

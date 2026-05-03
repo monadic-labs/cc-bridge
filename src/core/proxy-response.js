@@ -1,7 +1,7 @@
 import { RequestSummary, Result } from './types.js';
 import { ProxyError } from './exceptions.js';
 import { parseSseMetadata } from './sse-parser.js';
-import { extractSessionId, tryParseBody } from './routing.js';
+import { tryParseBody } from './routing.js';
 
 /**
  * Decompress response chunks safely, returning a Result.
@@ -51,15 +51,9 @@ export async function handleResponseEnd({ resCtx, resChunks, deps }) {
     errorReporter.write(decompressRes.error, { requestId: resCtx.id, headers: resCtx.proxyRes.headers });
   }
 
-  let sessionId = resCtx.sessionId;
-  if (!sessionId) {
-    const bodyOpt = tryParseBody(Buffer.from(raw));
-    if (bodyOpt.isSome) sessionId = extractSessionId(bodyOpt.value);
-  }
-
   try {
     const cfg = getConfig();
-    await logger.logResponse(resCtx.id, status, resCtx.proxyRes.headers, raw, sessionId, cfg);
+    await logger.logResponse(resCtx.id, status, resCtx.proxyRes.headers, raw, resCtx.sessionId, cfg);
   } catch (e) {
     errorReporter.write(e, { operation: 'logging response' });
   }
@@ -70,7 +64,7 @@ export async function handleResponseEnd({ resCtx, resChunks, deps }) {
 
   const report = resCtx.sanitizationReport;
   if (report && report.convertedCount > 0) {
-    await emit(`[DEBUG #${resCtx.id}] Sanitized ${report.convertedCount} block(s): [${report.convertedTypes.join(', ')}]`, sessionId);
+    await emit(`[DEBUG #${resCtx.id}] Sanitized ${report.convertedCount} block(s): [${report.convertedTypes.join(', ')}]`, resCtx.sessionId);
   }
 
   if (status >= 400) {
@@ -83,7 +77,7 @@ export async function handleResponseEnd({ resCtx, resChunks, deps }) {
       method: resCtx.req.method,
       url: resCtx.req.url,
       model: resCtx.reqModel,
-      sessionId,
+      sessionId: resCtx.sessionId,
       headers: resCtx.headers,
       history: logger.getHistory(),
       responseBody: raw,

@@ -6,11 +6,11 @@
  * doesn't choke on unsupported block types.
  */
 
-import { BLOCK_TYPES, SSE_EVENT_TYPES, DELTA_TYPES } from '../core/types.js';
+import { BLOCK_TYPES, SSE_EVENT_TYPES, DELTA_TYPES } from '../../core/types.js';
 import {
   getSseEventType, getSseIndex, getSseContentBlock, getSseDelta,
   getBlockType, getDeltaType, getDeltaThinking, getDeltaRedactedData,
-} from '../core/api-adapter.js';
+} from '../../core/api-adapter.js';
 
 export function createThinkingSseExtension() {
   return {

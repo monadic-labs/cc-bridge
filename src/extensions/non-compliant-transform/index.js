@@ -6,7 +6,7 @@
  * the model name is set to the real model.
  */
 
-import { getSystem } from '../core/api-adapter.js';
+import { getSystem } from '../../core/api-adapter.js';
 
 function flattenSystemPrompt(system) {
   if (!Array.isArray(system)) return system;

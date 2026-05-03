@@ -7,7 +7,7 @@ import noHardcodedSleep from "./scripts/eslint-rules/no-hardcoded-sleep.js";
 
 export default defineConfig([
   {
-    ignores: ["node_modules/**", ".test-config/**", "coverage/**"]
+    ignores: ["node_modules/**", ".test-config/**", "coverage/**", "src/infra/gui/**"]
   },
   {
     files: ["src/**/*.js", "bin/**/*.js"],

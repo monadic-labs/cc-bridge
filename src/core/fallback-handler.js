@@ -62,7 +62,7 @@ export function resolveFallbackMatch(policy, matchedRule) {
  * @param {object} routedHeaders - Current routed headers (may contain OAuth)
  * @returns {{ forwardBody: Buffer, routedHeaders: object, targetBase: string, label: string, sanitizationReport: object|null }|null}
  */
-export function buildFallbackRequest(originalBody, fallbackMatch, routedHeaders) {
+export function buildFallbackRequest(originalBody, fallbackMatch, routedHeaders, openaiProviders) {
   const bodyOpt = tryParseBody(originalBody);
   if (bodyOpt.isNone) return null;
 
@@ -72,7 +72,7 @@ export function buildFallbackRequest(originalBody, fallbackMatch, routedHeaders)
 
   const envVar = providerIdToEnvKey(fallbackMatch.provider.id);
   const apiKey = process.env[envVar] ?? '';
-  const finalHeaders = applyAuthHeaders({ headers: routedHeaders, match: fallbackMatch, apiKey });
+  const finalHeaders = applyAuthHeaders({ headers: routedHeaders, match: fallbackMatch, apiKey, openaiProviders });
 
   return {
     forwardBody: routing.forwardBody,

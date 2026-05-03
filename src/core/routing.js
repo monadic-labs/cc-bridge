@@ -57,15 +57,21 @@ export function applyRoutingWithMatch(body, matchOpt, anthropicBaseUrl, extensio
   return routeToProvider(body, matchOpt.value, extensions);
 }
 
-export function applyAuthHeaders({ headers, match, apiKey = '' }) {
+export function applyAuthHeaders({ headers, match, apiKey = '', openaiProviders }) {
   if (!match) return { ...headers };
 
   const { provider } = match;
   const { authorization: _, 'anthropic-beta': beta, ...rest } = headers;
   const updated = { ...rest };
 
+  const isOpenai = openaiProviders && openaiProviders[provider?.id]?.format === 'openai';
+
   if (provider.id && apiKey) {
-    updated['x-api-key'] = apiKey;
+    if (isOpenai) {
+      updated['authorization'] = `Bearer ${apiKey}`;
+    } else {
+      updated['x-api-key'] = apiKey;
+    }
   }
 
   if (provider.anthropicCompliant && beta !== undefined) {
@@ -89,13 +95,20 @@ function tryParseUserId(userIdStr) {
 export function extractSessionId(body) {
   if (!body) return '';
 
+  // 1. Check metadata.user_id (often contains stringified JSON with session_id)
   const userIdStr = body.metadata?.user_id;
-  const parsedUserId = tryParseUserId(userIdStr);
+  if (typeof userIdStr === 'string') {
+    const parsedUserId = tryParseUserId(userIdStr);
+    if (parsedUserId.isSome) return parsedUserId.value;
+  }
 
-  if (parsedUserId.isSome) return parsedUserId.value;
+  // 2. Check direct metadata fields
+  if (body.metadata?.session_id) return String(body.metadata.session_id);
+  if (body.metadata?.sessionId) return String(body.metadata.sessionId);
 
-  if (body.metadata?.session_id) return body.metadata.session_id;
-  if (body.session_id) return body.session_id;
+  // 3. Check root level fields
+  if (body.session_id) return String(body.session_id);
+  if (body.sessionId) return String(body.sessionId);
 
   return '';
 }
