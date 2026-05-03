@@ -193,18 +193,21 @@ function attemptFallbackFromTcpError(ctx, extensions, handleResponseEnd, errorRe
  * @param {function|null} params.onTcpError - Called on TCP error; return true to suppress error response
  * @param {function|null} params.onUpstreamResponse - Called with (statusCode, bodyStr) for 4xx/5xx; return true to buffer instead of stream
  */
-function resolveUpstreamUrl(targetBase, reqUrl, isCustom) {
+function resolveUpstreamUrl(targetBase, reqUrl, isCustom, isOpenaiFormat) {
   const reqPath = reqUrl ?? '/';
   if (!isCustom) return new URL(targetBase + reqPath);
   const parsed = new URL(targetBase);
   if (parsed.pathname === '/' || parsed.pathname === '') {
     return new URL(targetBase + reqPath);
   }
-  // Provider URL already has a path (e.g. https://api.example.com/openai/v1).
-  // Strip the Anthropic /v1 prefix from the incoming request path and append
-  // only the remainder, or use /chat/completions for the messages endpoint.
+  // Provider URL already has a path. Only perform the Anthropic→OpenAI path
+  // substitution (/v1/messages → /chat/completions) for OpenAI-format providers.
+  // Anthropic-format providers (e.g. z.ai at /api/anthropic) must keep the
+  // original request path so the correct endpoint is reached.
+  if (!isOpenaiFormat) {
+    return new URL(targetBase + reqPath);
+  }
   let subPath = reqPath.replace(/^\/v1\/messages/, '/chat/completions');
-  // If nothing matched (path is /v1/something-else or just /v1), append as-is
   if (subPath === reqPath) {
     subPath = reqPath.replace(/^\/v1/, '');
   }
@@ -212,8 +215,21 @@ function resolveUpstreamUrl(targetBase, reqUrl, isCustom) {
   return new URL(targetBase + subPath);
 }
 
+function extractProviderIdFromLabel(label) {
+  if (!label) return null;
+  const arrowMatch = label.match(/:(.+?)→/);
+  if (arrowMatch) return arrowMatch[1];
+  const colonParts = label.split(':');
+  const base = colonParts.length > 1 ? colonParts[1] : colonParts[0];
+  return base.split('.')[0];
+}
+
 function singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, retryConfig, onTcpError, onUpstreamResponse, onRetryNeeded, openaiProviders }) {
-  const target = resolveUpstreamUrl(ctx.targetBase, ctx.req.url, ctx.isCustom);
+  // Determine if the target provider is OpenAI-format by checking the openaiProviders map.
+  // We extract the provider ID from the routeLabel using a helper that handles all label formats.
+  const providerId = extractProviderIdFromLabel(ctx.routeLabel);
+  const isOpenaiFormat = !!(openaiProviders && providerId && openaiProviders[providerId]?.format === 'openai');
+  const target = resolveUpstreamUrl(ctx.targetBase, ctx.req.url, ctx.isCustom, isOpenaiFormat);
   const finalHeaders = { ...ctx.routedHeaders, host: target.host, 'content-length': String(ctx.forwardBody.length) };
   if (ctx.isCustom) delete finalHeaders['accept-encoding'];
 
@@ -406,6 +422,7 @@ function processProxyResponse(reqCtx, proxyRes, statusCode, headers, bufferedChu
     return;
   }
 
+
   const resHeaders = filterResponseHeaders(proxyRes.headers);
   if (shouldTransform) {
     delete resHeaders['content-encoding'];
@@ -449,6 +466,7 @@ function processProxyResponse(reqCtx, proxyRes, statusCode, headers, bufferedChu
     handleResponseEnd({ resCtx, resChunks });
   });
 }
+
 
 /**
  * Stream a buffered response to the client (used after retry/fallback buffering).

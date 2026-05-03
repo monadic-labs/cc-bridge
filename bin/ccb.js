@@ -172,9 +172,18 @@ function resolveWindowsCmdPath() {
   try {
     const stdout = execSync('where.exe claude', { encoding: 'utf8' });
     const paths = stdout.split('\n').map(p => p.trim()).filter(Boolean);
-    const cmdPath = paths.find(p => p.toLowerCase().endsWith('.cmd'));
-    if (!cmdPath) return { cmd: paths[0] || 'claude', isNode: false };
-    return parseCmdWrapper(cmdPath);
+    const cmdPaths = paths.filter(p => p.toLowerCase().endsWith('.cmd'));
+    
+    if (cmdPaths.length === 0) return { cmd: paths[0] || 'claude', isNode: false };
+    
+    for (const cmdPath of cmdPaths) {
+      const parsed = parseCmdWrapper(cmdPath);
+      if (fs.existsSync(parsed.cmd)) {
+        return parsed;
+      }
+    }
+    
+    return parseCmdWrapper(cmdPaths[0]);
   } catch {
     return { cmd: 'claude', isNode: false };
   }
@@ -187,7 +196,10 @@ function parseCmdWrapper(cmdPath) {
     // Uses negative lookahead (?!node\.exe) to avoid matching the node executable itself in wrappers.
     const m = content.match(/"?(?:%~dp0%?\\?|[%]dp0[%]\\?|%dp0%\\)((?:(?!node\.exe)[^\n"])+\.(?:js|exe))"?/i);
     if (m) {
-      const targetPath = m[1];
+      let targetPath = m[1];
+      if (targetPath.startsWith('\\') || targetPath.startsWith('/')) {
+        targetPath = targetPath.slice(1);
+      }
       const resolved = path.resolve(path.dirname(cmdPath), targetPath);
       return { cmd: resolved, isNode: targetPath.toLowerCase().endsWith('.js') };
     }
@@ -232,7 +244,8 @@ async function main() {
   if (ipcSocket) {
     ipcSocket.write(serializeIpcMessage({ cmd: 'keepalive' }));
     ipcSocket.on('error', () => { /* ignore */ });
-  } else {
+  }
+  if (!ipcSocket) {
     const keepaliveOptions = keepaliveSecret ? { headers: { 'x-ccb-keepalive-secret': keepaliveSecret } } : {};
     const keepaliveReq = http.get(`http://localhost:${config.port}/__ccb_internal__/keepalive`, keepaliveOptions);
     keepaliveReq.on('error', () => { /* ignore */ });
@@ -315,11 +328,12 @@ const CCB_CMDS = {
         if (response) {
           if (response.status === 'ok') {
             process.stdout.write(`Restarted worker (PID ${response.oldPid} → PID ${response.newPid})\n`);
-          } else {
-            process.stderr.write(`Restart failed: ${response.message}\n`);
+            socket.end();
+            process.exit(0);
           }
+          process.stderr.write(`Restart failed: ${response.message}\n`);
           socket.end();
-          process.exit(response.status === 'ok' ? 0 : 1);
+          process.exit(1);
         }
       }
     });
