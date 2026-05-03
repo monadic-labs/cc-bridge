@@ -67,6 +67,60 @@ async function runUnitTests() {
   assert(typeof INIT_TIMEOUT_MS === 'number' && INIT_TIMEOUT_MS > 0, 'INIT_TIMEOUT_MS is positive number');
   assert(typeof DRAIN_TIMEOUT_MS === 'number' && DRAIN_TIMEOUT_MS > 0, 'DRAIN_TIMEOUT_MS is positive number');
 
+  // ── ipc-protocol ──
+  console.log('\nipc-protocol:');
+  const { parseIpcMessage, serializeIpcMessage, validateWorkerMessage, validateCommandMessage } = await import('../src/core/ipc-protocol.js');
+
+  // serializeIpcMessage
+  const serialized = serializeIpcMessage({ type: 'ready', pid: 123, routes: 5, extensions: 2 });
+  assert(serialized === '{"type":"ready","pid":123,"routes":5,"extensions":2}\n', 'serializeIpcMessage produces newline-delimited JSON');
+
+  // parseIpcMessage — valid
+  const ipcParsed = parseIpcMessage('{"type":"ready","pid":123,"routes":5,"extensions":2}');
+  assert(ipcParsed.type === 'ready' && ipcParsed.pid === 123, 'parseIpcMessage parses valid JSON');
+  assert(Object.isFrozen(ipcParsed), 'parseIpcMessage freezes result');
+
+  // parseIpcMessage — invalid JSON
+  const badParse = parseIpcMessage('not json');
+  assert(badParse === null, 'parseIpcMessage returns null for invalid JSON');
+
+  // validateWorkerMessage — valid ready
+  const readyMsg = validateWorkerMessage({ type: 'ready', pid: 123, routes: 5, extensions: 2 });
+  assert(readyMsg.type === 'ready', 'validateWorkerMessage accepts valid ready');
+
+  // validateWorkerMessage — valid error
+  const errMsg = validateWorkerMessage({ type: 'error', message: 'boom' });
+  assert(errMsg.type === 'error' && errMsg.message === 'boom', 'validateWorkerMessage accepts valid error');
+
+  // validateWorkerMessage — unknown type
+  assert(validateWorkerMessage({ type: 'bogus' }) === null, 'validateWorkerMessage rejects unknown type');
+
+  // validateWorkerMessage — missing fields
+  assert(validateWorkerMessage({ type: 'ready' }) === null, 'validateWorkerMessage rejects ready missing fields');
+
+  // validateCommandMessage — valid restart
+  const restartCmd = validateCommandMessage({ cmd: 'restart' });
+  assert(restartCmd.cmd === 'restart', 'validateCommandMessage accepts restart');
+
+  // validateCommandMessage — valid status
+  const statusCmd = validateCommandMessage({ cmd: 'status' });
+  assert(statusCmd.cmd === 'status', 'validateCommandMessage accepts status');
+
+  // validateCommandMessage — valid shutdown
+  const shutdownCmd = validateCommandMessage({ cmd: 'shutdown' });
+  assert(shutdownCmd.cmd === 'shutdown', 'validateCommandMessage accepts shutdown');
+
+  // validateCommandMessage — valid keepalive
+  const kaCmd = validateCommandMessage({ cmd: 'keepalive' });
+  assert(kaCmd.cmd === 'keepalive', 'validateCommandMessage accepts keepalive');
+
+  // validateCommandMessage — unknown
+  assert(validateCommandMessage({ cmd: 'bogus' }) === null, 'validateCommandMessage rejects unknown cmd');
+
+  // validateCommandMessage — not an object
+  assert(validateCommandMessage('restart') === null, 'validateCommandMessage rejects string');
+  assert(validateCommandMessage(null) === null, 'validateCommandMessage rejects null');
+
   const { ResultAccessError, ArgumentError, ConfigError } = await import('../src/core/exceptions.js');
   const { parseSseMetadata } = await import('../src/core/sse-parser.js');
   const { ProxyConfig } = await import('../src/core/config.js');
