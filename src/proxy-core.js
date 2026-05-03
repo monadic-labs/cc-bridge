@@ -1,9 +1,11 @@
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { loadConfigFromFile } from './core/config.js';
 import { ensureCompleteProviders } from './core/migrator.js';
 import { ProvidersMap, ProviderConfig } from './core/providers.js';
 import { Result, ProxyRequestContext } from './core/types.js';
+import { ConfigError } from './core/exceptions.js';
 import { buildRoutingPolicy } from './core/routing-rules.js';
 import { loadEnv } from './core/env-file.js';
 import { decompress, compress } from './core/compression.js';
@@ -16,11 +18,7 @@ import { DebugLogger } from './core/debug-logger.js';
 import { runKill } from './infra/process-manager.js';
 import { detectFormat, convertV2ToInternal } from './core/config-adapter.js';
 import { ExtensionRegistry } from './core/extension-registry.js';
-import { createWebSearchZaiExtension } from './extensions/web-search-zai.js';
-import { createThinkingSseExtension } from './extensions/thinking-sse.js';
-import { createSanitizationExtension } from './extensions/sanitization.js';
-import { createNonCompliantTransformExtension } from './extensions/non-compliant-transform.js';
-import { createFallbackExtension } from './extensions/fallback.js';
+import { discoverExtensions, buildRegistry, watchExtensions } from './core/extension-loader.js';
 
 export { runKill };
 export { loadEnv };
@@ -29,20 +27,28 @@ class ProxyState {
   #reqCount;
   #activeProviders;
   #extensions;
+  #extensionConfigs;
+  #activeConnections;
 
-  constructor(reqCount, activeProviders, extensions) {
+  constructor(reqCount, activeProviders, extensions, extensionConfigs, activeConnections) {
     this.#reqCount = reqCount;
     this.#activeProviders = activeProviders;
     this.#extensions = extensions;
+    this.#extensionConfigs = extensionConfigs ?? {};
+    this.#activeConnections = activeConnections ?? 0;
     Object.freeze(this);
   }
 
   get reqCount() { return this.#reqCount; }
   get providers() { return this.#activeProviders; }
   get extensions() { return this.#extensions; }
+  get extensionConfigs() { return this.#extensionConfigs; }
+  get openaiProviders() { return this.#extensionConfigs['openai-format']?.providers; }
+  get activeConnections() { return this.#activeConnections; }
 
-  withIncrement() { return new ProxyState(this.#reqCount + 1, this.#activeProviders, this.#extensions); }
-  withProviders(providers, extensions) { return new ProxyState(this.#reqCount, providers, extensions ?? this.#extensions); }
+  withIncrement() { return new ProxyState(this.#reqCount + 1, this.#activeProviders, this.#extensions, this.#extensionConfigs, this.#activeConnections); }
+  withConnectionBump(delta) { return new ProxyState(this.#reqCount, this.#activeProviders, this.#extensions, this.#extensionConfigs, this.#activeConnections + delta); }
+  withProviders(providers, extensions, extensionConfigs) { return new ProxyState(this.#reqCount, providers, extensions ?? this.#extensions, extensionConfigs ?? this.#extensionConfigs, this.#activeConnections); }
 }
 
 /**
@@ -89,18 +95,9 @@ function tryParseProviders(data, filepath) {
       defaultFallback: internal.defaultFallback ?? null
     });
 
-    const extensions = new ExtensionRegistry();
-    extensions.register(createSanitizationExtension());
-    extensions.register(createNonCompliantTransformExtension());
-    extensions.register(createThinkingSseExtension());
-    extensions.register(createFallbackExtension());
-    for (const cfg of providerConfigs) {
-      if (cfg.toolTransforms?.web_search) {
-        extensions.register(createWebSearchZaiExtension(cfg.toolTransforms.web_search));
-      }
-    }
+    const extensionConfigs = merged.extensions ?? raw.extensions ?? {};
 
-    return Result.ok({ policy, extensions });
+    return Result.ok({ policy, providerConfigs, extensionConfigs });
   } catch (e) {
     return Result.fail(e);
   }
@@ -184,28 +181,67 @@ export function createProxyCore({ configDir, port }) {
       getConfig,
       policy: shellState.providers,
       extensions: shellState.extensions,
-      emit
+      emit,
+      openaiProviders: shellState.openaiProviders
     });
   }
 
   // ── Provider lifecycle ──
 
-  function handleProvidersReload(parsedResult) {
-    if (parsedResult.isSuccess) {
-      const { policy, extensions } = parsedResult.value;
-      shellState = shellState.withProviders(policy, extensions);
-      process.stdout.write(`[providers] Hot-reloaded: ${shellState.providers.size} rule(s), ${shellState.providers.allTargetModels.length} model(s), ${shellState.extensions.size} extension(s)\n`);
-      return;
+  const BUILTIN_EXTENSIONS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'extensions');
+
+  let reloadInProgress = false;
+
+  async function rebuildExtensions(providerConfigs, extensionConfigs) {
+    const dirs = [BUILTIN_EXTENSIONS_DIR];
+    const userExtDir = path.join(configDir, 'extensions');
+    if (fs.existsSync(userExtDir)) dirs.push(userExtDir);
+
+    const allModules = [];
+    for (const dir of dirs) {
+      const modules = await discoverExtensions(dir);
+      allModules.push(...modules);
     }
-    process.stderr.write(`[providers] Reload failed: ${parsedResult.error.message}\n`);
-    errorReporter.write(parsedResult.error, { operation: 'hot-reloading providers.json' });
+
+    const { registry, errors } = buildRegistry(allModules, providerConfigs, extensionConfigs);
+
+    if (errors.length > 0) {
+      process.stderr.write(`[extensions] Warnings: ${errors.join('; ')}\n`);
+      for (const err of errors) {
+        errorReporter.write(new ConfigError(err), { operation: 'extension loading' });
+      }
+    }
+
+    return registry;
+  }
+
+  async function loadAndApplyProviders(data) {
+    if (reloadInProgress) return;
+    reloadInProgress = true;
+    try {
+      const parsed = tryParseProviders(data);
+      if (!parsed.isSuccess) {
+        process.stderr.write(`[providers] Parse failed: ${parsed.error.message}\n`);
+        errorReporter.write(parsed.error, { operation: 'parsing providers.json' });
+        return;
+      }
+
+      const { policy, providerConfigs, extensionConfigs } = parsed.value;
+      const extensions = await rebuildExtensions(providerConfigs, extensionConfigs);
+      shellState = shellState.withProviders(policy, extensions, extensionConfigs);
+      process.stdout.write(`[providers] Loaded: ${shellState.providers.size} rule(s), ${shellState.providers.allTargetModels.length} model(s), ${shellState.extensions.size} extension(s)\n`);
+    } catch (e) {
+      errorReporter.write(e, { operation: 'loading providers and extensions' });
+    } finally {
+      reloadInProgress = false;
+    }
   }
 
   async function reloadProviders() {
     try {
       Object.assign(process.env, loadEnv(path.join(configDir, '.env')));
       const data = await fs.promises.readFile(providersPath, 'utf8');
-      handleProvidersReload(tryParseProviders(data));
+      await loadAndApplyProviders(data);
     } catch (e) {
       errorReporter.write(e, { operation: 'reading providers.json' });
     }
@@ -214,23 +250,94 @@ export function createProxyCore({ configDir, port }) {
   function initProviders() {
     if (!fs.existsSync(providersPath)) return;
     const data = fs.readFileSync(providersPath, 'utf8');
-    const parsed = tryParseProviders(data, providersPath);
-    if (parsed.isSuccess) {
-      const { policy, extensions } = parsed.value;
-      shellState = shellState.withProviders(policy, extensions);
-    }
+    loadAndApplyProviders(data).catch((e) => errorReporter.write(e, { operation: 'initial provider load' }));
 
     try {
       fs.watch(providersPath, () => { reloadProviders().catch((e) => errorReporter.write(e, { operation: 'providers reload callback' })); });
     } catch (e) {
       errorReporter.write(e, { operation: 'setting up providers.json watcher' });
     }
+
+    const userExtDir = path.join(configDir, 'extensions');
+    const watchDirs = [BUILTIN_EXTENSIONS_DIR];
+    if (fs.existsSync(userExtDir)) watchDirs.push(userExtDir);
+
+    watchExtensions(watchDirs, () => {
+      process.stdout.write('[extensions] File change detected, reloading...\n');
+      reloadProviders().catch((e) => errorReporter.write(e, { operation: 'extension hot-reload' }));
+    });
   }
 
   // ── Request handler ──
 
+  // Tracks the last active context per socket. When a new request arrives on a
+  // keep-alive socket, the previous request's error responses are blackholed to
+  // prevent stale timeout errors from contaminating the new request.
+  const lastCtxPerSocket = new WeakMap();
+
   function createRequestHandler() {
     return (req, res) => {
+      // ── GUI Static Files ──
+      if (req.method === 'GET' && req.url.startsWith('/gui')) {
+        let filePath = req.url === '/gui' || req.url === '/gui/' 
+          ? path.join(BUILTIN_EXTENSIONS_DIR, '..', 'infra', 'gui', 'index.html')
+          : path.join(BUILTIN_EXTENSIONS_DIR, '..', 'infra', 'gui', req.url.replace('/gui/', ''));
+        
+        fs.readFile(filePath, (err, data) => {
+          if (err) {
+            res.writeHead(404);
+            res.end('Not Found');
+            return;
+          }
+          const ext = path.extname(filePath);
+          const contentType = ext === '.html' ? 'text/html' : ext === '.js' ? 'text/javascript' : 'text/plain';
+          res.writeHead(200, { 'Content-Type': contentType });
+          res.end(data);
+        });
+        return;
+      }
+
+      // ── API Endpoints ──
+      if (req.method === 'GET' && req.url === '/api/config') {
+        fs.readFile(providersPath, 'utf8', (err, data) => {
+          if (err) {
+            res.writeHead(500);
+            res.end('Error reading config');
+            return;
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(data);
+        });
+        return;
+      }
+
+      if (req.method === 'GET' && req.url === '/api/schema') {
+        const schema = {
+          extensions: shellState.extensions.getSchemas()
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(schema));
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/api/config') {
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', () => {
+          try {
+            JSON.parse(body); // Validate JSON
+            fs.writeFileSync(providersPath, body, 'utf8');
+            res.writeHead(200);
+            res.end('OK');
+            // fs.watch will trigger reload
+          } catch (e) {
+            res.writeHead(400);
+            res.end('Invalid JSON');
+          }
+        });
+        return;
+      }
+
       if (req.method === 'GET' && req.url === '/__ccb_internal__/keepalive') {
         if (keepaliveSecret && req.headers['x-ccb-keepalive-secret'] !== keepaliveSecret) {
           res.writeHead(401, { 'content-type': 'text/plain' });
@@ -265,11 +372,25 @@ export function createProxyCore({ configDir, port }) {
         return;
       }
       shellState = shellState.withIncrement();
+      shellState = shellState.withConnectionBump(1);
 
       const { sessionId: urlSessionId, strippedUrl } = extractUrlSession(req.url);
       if (urlSessionId) req.url = strippedUrl;
 
       const ctx = new ProxyRequestContext({ req, res, id: shellState.reqCount, startTime: Date.now(), urlSessionId });
+      res.on('close', () => {
+        shellState = shellState.withConnectionBump(-1);
+      });
+
+      // Supersede any previous request on this keep-alive socket so its pending
+      // error responses (e.g. a 600s upstream timeout) are silently discarded
+      // instead of being written to the shared socket.
+      const socket = req.socket;
+      if (socket) {
+        const prevCtx = lastCtxPerSocket.get(socket);
+        if (prevCtx) prevCtx.markSuperseded();
+        lastCtxPerSocket.set(socket, ctx);
+      }
       const chunks = [];
       req.on('error', () => { if (!res.headersSent) res.writeHead(400); res.end(); });
       req.on('data', (chunk) => chunks.push(chunk));
@@ -280,6 +401,7 @@ export function createProxyCore({ configDir, port }) {
           deps: {
             policy: shellState.providers,
             extensions: shellState.extensions,
+            openaiProviders: shellState.openaiProviders,
             decompress,
             compress,
             logger,
@@ -298,6 +420,7 @@ export function createProxyCore({ configDir, port }) {
     initProviders,
     createRequestHandler,
     get providerCount() { return shellState.providers.size; },
+    get activeConnections() { return shellState.activeConnections; },
     getConfig,
     emit,
     logsDir,

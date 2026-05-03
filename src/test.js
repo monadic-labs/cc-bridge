@@ -121,6 +121,18 @@ async function runUnitTests() {
   assert(validateCommandMessage('restart') === null, 'validateCommandMessage rejects string');
   assert(validateCommandMessage(null) === null, 'validateCommandMessage rejects null');
 
+  // ── extractUrlSession (proxy-core) ──
+  console.log('\nextractUrlSession:');
+  const { extractUrlSession } = await import('../src/proxy-core.js');
+  assert(extractUrlSession('/s/abc123/v1/messages').sessionId === 'abc123', 'extracts session');
+  assert(extractUrlSession('/s/abc123/v1/messages').strippedUrl === '/v1/messages', 'strips prefix');
+  assert(extractUrlSession('/v1/messages').sessionId === '', 'no-session returns empty');
+  assert(extractUrlSession('/v1/messages').strippedUrl === '/v1/messages', 'no-session returns url');
+  assert(extractUrlSession(null).sessionId === '', 'null safe');
+  assert(extractUrlSession(null).strippedUrl === '/', 'null returns /');
+  assert(extractUrlSession('/s/abc').sessionId === 'abc', 'no trailing path');
+  assert(extractUrlSession('/s/abc').strippedUrl === '/', 'no trailing path returns /');
+
   const { ResultAccessError, ArgumentError, ConfigError } = await import('../src/core/exceptions.js');
   const { parseSseMetadata } = await import('../src/core/sse-parser.js');
   const { ProxyConfig } = await import('../src/core/config.js');
