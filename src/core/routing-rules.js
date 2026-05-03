@@ -3,7 +3,7 @@ import { ProviderConfig, ProviderMatch } from './providers.js';
 import { Option } from './types.js';
 
 const VALID_OPERATORS = Object.freeze(['gt', 'lt', 'gte', 'lte']);
-const VALID_RULE_TYPES = Object.freeze(['exact', 'regex', 'property', 'payloadSize']);
+const VALID_RULE_TYPES = Object.freeze(['exact', 'regex', 'property', 'payloadSize', 'pool']);
 
 function requireString(value, fieldName) {
   if (typeof value !== 'string' || !value) {
@@ -39,6 +39,46 @@ function validateFallback(fallback) {
 }
 
 export const MAX_FALLBACK_DEPTH = 3;
+
+export class PoolRule {
+  #match;
+  #pool;
+  #fallbackProviderId;
+  #fallbackModel;
+
+  constructor({ match, pool, fallback }) {
+    requireString(match, 'PoolRule.match');
+    if (!pool || !Array.isArray(pool.entries)) {
+      throw new ArgumentError('PoolRule.pool must have an entries array', { context: { pool } });
+    }
+    const fb = validateFallback(fallback);
+    this.#match = match;
+    this.#pool = pool;
+    this.#fallbackProviderId = fb.providerId;
+    this.#fallbackModel = fb.model;
+    Object.freeze(this);
+  }
+
+  get type() { return 'pool'; }
+  get match() { return this.#match; }
+  get pool() { return this.#pool; }
+  get fallbackProviderId() { return this.#fallbackProviderId; }
+  get fallbackModel() { return this.#fallbackModel; }
+  get hasFallback() { return this.#fallbackProviderId !== null; }
+  get hasTarget() { return true; }
+
+  matches(body) {
+    return typeof body.model === 'string' && body.model === this.#match;
+  }
+
+  toLabel() { return `pool:${this.#match}`; }
+
+  toJSON() {
+    const json = { type: 'pool', match: this.#match, pool: this.#pool };
+    if (this.#fallbackProviderId) json.fallback = { providerId: this.#fallbackProviderId, model: this.#fallbackModel };
+    return json;
+  }
+}
 
 export class ExactRule {
   #match;
@@ -260,6 +300,7 @@ export function createRule(raw) {
   if (type === 'exact') return new ExactRule({ match: raw.match, targetProvider, targetModel, fallback: raw.fallback });
   if (type === 'regex') return new RegexRule({ pattern: raw.pattern, targetProvider, targetModel, fallback: raw.fallback });
   if (type === 'property') return new PropertyRule({ property: raw.property, targetProvider, targetModel, fallback: raw.fallback });
+  if (type === 'pool') return new PoolRule({ match: raw.match, pool: raw.pool, fallback: raw.fallback });
   return new PayloadSizeRule({ thresholdBytes: raw.thresholdBytes, operator: raw.operator, targetProvider, targetModel, fallback: raw.fallback });
 }
 
@@ -350,13 +391,12 @@ export class RoutingPolicy {
    * Legacy matches (from the models map) return a null rule (no fallback possible).
    *
    * @param {object} body - Request body to evaluate
-   * @returns {Option<{ match: ProviderMatch, rule: object|null }>}
+   * @returns {Option<{ match: ProviderMatch|null, rule: object|null }>}
    */
   evaluateWithRule(body) {
     for (const rule of this.#rules) {
       if (rule.matches(body)) {
         if (!rule.hasTarget) {
-          // Passthrough rule — no primary target, but keep rule for fallback
           return Option.some({ match: null, rule });
         }
         const provider = this.#providerMap.get(rule.targetProviderId);
@@ -383,6 +423,7 @@ export class RoutingPolicy {
     return provider ? Option.some(provider) : Option.none();
   }
 
+
   /**
    * The default fallback rule for unmatched (Anthropic-passthrough) requests.
    * Returns Option.some(rule) if configured, Option.none() otherwise.
@@ -395,6 +436,7 @@ export class RoutingPolicy {
 
   get rules() { return [...this.#rules]; }
   get size() { return this.#rules.length; }
+  get providerMap() { return this.#providerMap; }
 
   get allTargetModels() {
     const models = new Set();

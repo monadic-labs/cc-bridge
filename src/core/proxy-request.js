@@ -24,7 +24,7 @@ import { ProxyError } from './exceptions.js';
  * @param {function} params.deps.buildErrorResponse - Error response builder
  */
 export async function handleRequestEnd({ ctx, chunks, deps }) {
-  const { decompress, compress, errorReporter, debugLogger, getConfig, forwardToUpstream, buildErrorResponse, policy, extensions, logger } = deps;
+  const { decompress, compress, errorReporter, debugLogger, getConfig, forwardToUpstream, buildErrorResponse, policy, extensions, logger, openaiProviders } = deps;
 
   const rawBuffer = Buffer.concat(chunks);
   const encoding = ctx.req.headers['content-encoding'];
@@ -78,7 +78,8 @@ export async function handleRequestEnd({ ctx, chunks, deps }) {
       extensions,
       anthropicBaseUrl: getConfig().anthropicBaseUrl,
       logger,
-      getConfig
+      getConfig,
+      openaiProviders
     });
 
     const config = getConfig();

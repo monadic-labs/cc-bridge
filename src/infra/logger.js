@@ -19,7 +19,8 @@ export class Logger {
   }
 
   async emit(line, sessionId) {
-    const out = line + '\n';
+    const sessionPrefix = sessionId ? `[${sessionId}] ` : '';
+    const out = sessionPrefix + line + '\n';
     process.stdout.write(out);
     try {
       if (!fs.existsSync(this.#logsDir)) fs.mkdirSync(this.#logsDir, { recursive: true });
@@ -48,8 +49,17 @@ export class Logger {
     if (!config.loggingEnabled || !config.logResponses) return;
     const isSse = (headers['content-type'] ?? '').includes('text/event-stream');
 
-    if (isSse) return this.#logSseResponse(id, statusCode, rawBody, sessionId);
-    return this.#logJsonResponse(id, statusCode, rawBody, sessionId, config);
+    let activeSessionId = sessionId;
+    if (!activeSessionId) {
+      try {
+        const parsed = JSON.parse(rawBody);
+        const { extractSessionId } = await import('../core/routing.js');
+        activeSessionId = extractSessionId(parsed);
+      } catch { /* not JSON or parse failed */ }
+    }
+
+    if (isSse) return this.#logSseResponse(id, statusCode, rawBody, activeSessionId);
+    return this.#logJsonResponse(id, statusCode, rawBody, activeSessionId, config);
   }
 
   async #logSseResponse(id, statusCode, raw, sessionId) {

@@ -10,13 +10,13 @@
  * strips cache_control from generic blocks (non-compliant only).
  */
 
-import { BLOCK_TYPES } from '../core/types.js';
+import { BLOCK_TYPES } from '../../core/types.js';
 import {
   getSystemBlockText,
   getBlockType, getBlockText, getBlockThinking, getBlockRedactedData, getBlockToolContent,
   hasValidSignature, omitCacheControl,
   getSystem, getMessages,
-} from '../core/api-adapter.js';
+} from '../../core/api-adapter.js';
 
 export function createSanitizationExtension() {
   return {

@@ -67,18 +67,18 @@ function isRetryableBody(bodyStr, retryConfig) {
  * @param {RoutingPolicy} params.policy - Active routing policy (for fallback resolution)
  * @param {function} params.emit - Emit function for logging fallback events
  */
-export function forwardToUpstream({ ctx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit }) {
+export function forwardToUpstream({ ctx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, openaiProviders }) {
   const retryConfig = getConfig().retry;
   if (retryConfig.maxAttempts > 0) {
-    return forwardWithRetry({ ctx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, retryConfig, attempt: 0 });
+    return forwardWithRetry({ ctx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, retryConfig, attempt: 0, openaiProviders });
   }
-  singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, retryConfig: null, onRetryNeeded: null });
+  singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, retryConfig: null, onRetryNeeded: null, openaiProviders });
 }
 
 /**
  * Retry wrapper around singleForwardAttempt with exponential backoff.
  */
-function forwardWithRetry({ ctx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, retryConfig, attempt }) {
+function forwardWithRetry({ ctx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, retryConfig, attempt, openaiProviders }) {
   let settled = false;
 
   const retryState = {
@@ -102,6 +102,7 @@ function forwardWithRetry({ ctx, handleResponseEnd, errorReporter, getConfig, po
     extensions,
     emit,
     retryConfig,
+    openaiProviders,
     onTcpError: (err) => {
       if (isRetryableTcpError(err, retryConfig) && attempt < retryConfig.maxAttempts) {
         retryState.shouldRetry = true;
@@ -114,7 +115,7 @@ function forwardWithRetry({ ctx, handleResponseEnd, errorReporter, getConfig, po
       if (extensions && extensions.hasFallback && extensions.shouldAttemptFallbackForTcpError({ matchedRule: ctx.matchedRule, fallbackDepth: ctx.fallbackDepth })) {
         settled = true;
         emit(`[#${ctx.id}] Retry exhausted (${retryConfig.maxAttempts} attempts), falling back: ${err.code}`, ctx.sessionId).catch(() => {});
-        attemptFallbackFromTcpError(ctx, extensions, handleResponseEnd, errorReporter, getConfig, policy, emit);
+        attemptFallbackFromTcpError(ctx, extensions, handleResponseEnd, errorReporter, getConfig, policy, emit, openaiProviders);
         return true; // suppress normal error handling
       }
       return false;
@@ -155,7 +156,7 @@ function forwardWithRetry({ ctx, handleResponseEnd, errorReporter, getConfig, po
         emit(`[#${ctx.id}] Retry aborted (client gone) during backoff`, ctx.sessionId).catch(() => {});
         return;
       }
-      forwardWithRetry({ ctx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, retryConfig, attempt: nextAttempt });
+      forwardWithRetry({ ctx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, retryConfig, attempt: nextAttempt, openaiProviders });
     });
   }
 }
@@ -163,8 +164,8 @@ function forwardWithRetry({ ctx, handleResponseEnd, errorReporter, getConfig, po
 /**
  * Attempt fallback after retry-exhausted TCP error.
  */
-function attemptFallbackFromTcpError(ctx, extensions, handleResponseEnd, errorReporter, getConfig, policy, emit) {
-  const fallbackResult = extensions.buildFallbackRequest({ originalBody: ctx.originalBody, matchedRule: ctx.matchedRule, policy, routedHeaders: ctx.routedHeaders });
+function attemptFallbackFromTcpError(ctx, extensions, handleResponseEnd, errorReporter, getConfig, policy, emit, openaiProviders) {
+  const fallbackResult = extensions.buildFallbackRequest({ originalBody: ctx.originalBody, matchedRule: ctx.matchedRule, policy, routedHeaders: ctx.routedHeaders, openaiProviders });
   if (!fallbackResult) return;
 
   const fallbackCtx = ctx.withRouting({
@@ -182,7 +183,7 @@ function attemptFallbackFromTcpError(ctx, extensions, handleResponseEnd, errorRe
     matchedRule: null
   });
 
-  forwardToUpstream({ ctx: fallbackCtx, handleResponseEnd, errorReporter, getConfig, policy, emit });
+  forwardToUpstream({ ctx: fallbackCtx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, openaiProviders });
 }
 
 /**
@@ -192,8 +193,27 @@ function attemptFallbackFromTcpError(ctx, extensions, handleResponseEnd, errorRe
  * @param {function|null} params.onTcpError - Called on TCP error; return true to suppress error response
  * @param {function|null} params.onUpstreamResponse - Called with (statusCode, bodyStr) for 4xx/5xx; return true to buffer instead of stream
  */
-function singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, retryConfig, onTcpError, onUpstreamResponse, onRetryNeeded }) {
-  const target = new URL(ctx.targetBase + (ctx.req.url ?? '/'));
+function resolveUpstreamUrl(targetBase, reqUrl, isCustom) {
+  const reqPath = reqUrl ?? '/';
+  if (!isCustom) return new URL(targetBase + reqPath);
+  const parsed = new URL(targetBase);
+  if (parsed.pathname === '/' || parsed.pathname === '') {
+    return new URL(targetBase + reqPath);
+  }
+  // Provider URL already has a path (e.g. https://api.example.com/openai/v1).
+  // Strip the Anthropic /v1 prefix from the incoming request path and append
+  // only the remainder, or use /chat/completions for the messages endpoint.
+  let subPath = reqPath.replace(/^\/v1\/messages/, '/chat/completions');
+  // If nothing matched (path is /v1/something-else or just /v1), append as-is
+  if (subPath === reqPath) {
+    subPath = reqPath.replace(/^\/v1/, '');
+  }
+  if (!subPath || subPath === '/') subPath = '/chat/completions';
+  return new URL(targetBase + subPath);
+}
+
+function singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, retryConfig, onTcpError, onUpstreamResponse, onRetryNeeded, openaiProviders }) {
+  const target = resolveUpstreamUrl(ctx.targetBase, ctx.req.url, ctx.isCustom);
   const finalHeaders = { ...ctx.routedHeaders, host: target.host, 'content-length': String(ctx.forwardBody.length) };
   if (ctx.isCustom) delete finalHeaders['accept-encoding'];
 
@@ -204,9 +224,10 @@ function singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, getConfig
     { hostname: target.hostname, port: target.port || defaultPort, path: target.pathname + target.search, method: ctx.req.method, headers: finalHeaders },
     (proxyRes) => handleProxyResponse({
       reqCtx: ctx, proxyRes, headers: finalHeaders, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit,
-      forwardToUpstream: ({ ctx: fallbackCtx }) => forwardToUpstream({ ctx: fallbackCtx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit }),
+      forwardToUpstream: ({ ctx: fallbackCtx }) => forwardToUpstream({ ctx: fallbackCtx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, openaiProviders }),
       onUpstreamResponse,
-      onRetryNeeded
+      onRetryNeeded,
+      openaiProviders
     })
   );
 
@@ -222,7 +243,9 @@ function singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, getConfig
   const upstreamTimeout = getConfig().upstreamTimeoutMs;
   if (upstreamTimeout > 0) {
     proxyReq.setTimeout(upstreamTimeout, () => {
-      proxyReq.destroy(new Error(`Upstream timed out after ${upstreamTimeout}ms`)); // eslint-disable-line local/no-generic-error -- Node.js destroy() requires Error
+      const timeoutErr = new Error(`Upstream timed out after ${upstreamTimeout}ms`); // eslint-disable-line local/no-generic-error -- Node.js destroy() requires Error
+      timeoutErr.code = 'ETIMEDOUT';
+      proxyReq.destroy(timeoutErr);
     });
   }
 
@@ -241,6 +264,15 @@ function singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, getConfig
     // live, catching the case where the client disconnected mid-retry.
     if (clientGone || ctx.clientAborted) {
       emit(`[#${ctx.id}] ${errorId} proxy_error (client gone): ${err.message}`, ctx.sessionId).catch(() => {});
+      return;
+    }
+
+    // A newer request arrived on the same keep-alive socket. The client has
+    // already moved on — writing this error would contaminate the new request.
+    // Blackhole the response entirely, just log and report.
+    if (ctx.superseded) {
+      emit(`[#${ctx.id}] ${errorId} proxy_error (superseded, blackholed): ${err.message}`, ctx.sessionId).catch(() => {});
+      proxyReq.destroy();
       return;
     }
 
@@ -270,8 +302,8 @@ function singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, getConfig
  * When retry is configured and the error matches retry criteria, buffers the
  * response and signals retry instead of streaming to the client.
  */
-export function handleProxyResponse({ reqCtx, proxyRes, headers, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, forwardToUpstream, onUpstreamResponse, onRetryNeeded }) {
-  if (reqCtx.clientAborted) {
+export function handleProxyResponse({ reqCtx, proxyRes, headers, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, forwardToUpstream, onUpstreamResponse, onRetryNeeded, openaiProviders }) {
+  if (reqCtx.clientAborted || reqCtx.superseded) {
     proxyRes.resume(); // drain the response
     return;
   }
@@ -290,13 +322,13 @@ export function handleProxyResponse({ reqCtx, proxyRes, headers, handleResponseE
         return;
       }
       // Not retryable — fall through to fallback or normal streaming
-      processProxyResponse(reqCtx, proxyRes, statusCode, headers, errorChunks, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, forwardToUpstream, matchedRule);
+      processProxyResponse(reqCtx, proxyRes, statusCode, headers, errorChunks, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, forwardToUpstream, matchedRule, openaiProviders);
     });
     proxyRes.on('error', () => { if (!reqCtx.res.writableEnded && !reqCtx.clientAborted) reqCtx.res.end(); });
     return;
   }
 
-  processProxyResponse(reqCtx, proxyRes, statusCode, headers, null, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, forwardToUpstream, matchedRule);
+  processProxyResponse(reqCtx, proxyRes, statusCode, headers, null, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, forwardToUpstream, matchedRule, openaiProviders);
 }
 
 function identityChunk(chunk) { return chunk; }
@@ -314,7 +346,7 @@ function createChunkTransformer(extensions) {
 /**
  * Process an upstream response: fallback interception, streaming, SSE transformation.
  */
-function processProxyResponse(reqCtx, proxyRes, statusCode, headers, bufferedChunks, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, forwardToUpstream, matchedRule) {
+function processProxyResponse(reqCtx, proxyRes, statusCode, headers, bufferedChunks, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, forwardToUpstream, matchedRule, openaiProviders) {
   // ── Fallback interception ──
   if (extensions && extensions.hasFallback && extensions.shouldAttemptFallback({ statusCode, matchedRule, fallbackDepth: reqCtx.fallbackDepth })) {
     const errorChunks = bufferedChunks ?? [];
@@ -323,7 +355,7 @@ function processProxyResponse(reqCtx, proxyRes, statusCode, headers, bufferedChu
     }
 
     const afterBuffer = () => {
-      const fallbackResult = extensions.buildFallbackRequest({ originalBody: reqCtx.originalBody, matchedRule, policy, routedHeaders: reqCtx.routedHeaders });
+      const fallbackResult = extensions.buildFallbackRequest({ originalBody: reqCtx.originalBody, matchedRule, policy, routedHeaders: reqCtx.routedHeaders, openaiProviders });
       if (!fallbackResult) {
         streamBufferedError(reqCtx, proxyRes, errorChunks, handleResponseEnd, headers);
         return;
@@ -348,7 +380,7 @@ function processProxyResponse(reqCtx, proxyRes, statusCode, headers, bufferedChu
         matchedRule: null
       });
 
-      forwardToUpstream({ ctx: fallbackCtx });
+      forwardToUpstream({ ctx: fallbackCtx, openaiProviders });
     };
 
     if (!bufferedChunks) {

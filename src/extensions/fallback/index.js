@@ -9,11 +9,11 @@
  *   { fallbackProviderId, fallbackModel, hasFallback }
  */
 
-import { Option } from '../core/types.js';
-import { ProviderMatch } from '../core/providers.js';
-import { providerIdToEnvKey } from '../core/providers.js';
-import { MAX_FALLBACK_DEPTH } from '../core/routing-rules.js';
-import { tryParseBody, routeToProvider, applyAuthHeaders } from '../core/routing.js';
+import { Option } from '../../core/types.js';
+import { ProviderMatch } from '../../core/providers.js';
+import { providerIdToEnvKey } from '../../core/providers.js';
+import { MAX_FALLBACK_DEPTH } from '../../core/routing-rules.js';
+import { tryParseBody, routeToProvider, applyAuthHeaders } from '../../core/routing.js';
 
 export function createFallbackExtension() {
   return {
@@ -32,8 +32,8 @@ export function createFallbackExtension() {
       },
       buildFallbackRequest: {
         order: 50,
-        build: ({ originalBody, matchedRule, policy, routedHeaders, extensions }) =>
-          buildFallbackRequest(originalBody, matchedRule, policy, routedHeaders, extensions),
+        build: ({ originalBody, matchedRule, policy, routedHeaders, extensions, openaiProviders }) =>
+          buildFallbackRequest(originalBody, matchedRule, policy, routedHeaders, extensions, openaiProviders),
       },
     },
   };
@@ -54,7 +54,7 @@ function checkFallbackForTcpError(matchedRule, fallbackDepth) {
   return true;
 }
 
-function buildFallbackRequest(originalBody, matchedRule, policy, routedHeaders, extensions) {
+function buildFallbackRequest(originalBody, matchedRule, policy, routedHeaders, extensions, openaiProviders) {
   const providerOpt = policy.getProvider(matchedRule.fallbackProviderId);
   if (providerOpt.isNone) return null;
 
@@ -68,7 +68,7 @@ function buildFallbackRequest(originalBody, matchedRule, policy, routedHeaders, 
 
   const envVar = providerIdToEnvKey(fallbackMatch.provider.id);
   const apiKey = process.env[envVar] ?? '';
-  const finalHeaders = applyAuthHeaders({ headers: routedHeaders, match: fallbackMatch, apiKey });
+  const finalHeaders = applyAuthHeaders({ headers: routedHeaders, match: fallbackMatch, apiKey, openaiProviders });
 
   return {
     forwardBody: routing.forwardBody,

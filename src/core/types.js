@@ -69,6 +69,7 @@ export class ProxyRequestContext {
   #originalBody;
   #fallbackDepth;
   #matchedRule;
+  #superseded;
 
   constructor({ req, res, id, startTime, urlSessionId }) {
     this.#req = req;
@@ -88,6 +89,7 @@ export class ProxyRequestContext {
     this.#originalBody = Buffer.alloc(0);
     this.#fallbackDepth = 0;
     this.#matchedRule = null;
+    this.#superseded = false;
   }
 
   get req() { return this.#req; }
@@ -110,6 +112,10 @@ export class ProxyRequestContext {
   get matchedRule() { return this.#matchedRule; }
   /** True when the client has disconnected (aborted or closed the request). Checked live, no propagation needed. */
   get clientAborted() { return this.#req.aborted || this.#res.destroyed || (this.#req.socket?.destroyed ?? false); }
+  /** True when a newer request has arrived on the same keep-alive socket. Error responses must be discarded. */
+  get superseded() { return this.#superseded; }
+  /** Mark this request as superseded by a newer request on the same socket. */
+  markSuperseded() { this.#superseded = true; }
 
   withRouting({ routeLabel, reqModel, sessionId, routedHeaders, forwardBody, targetBase, isCustom, rawBody, sanitizationReport, originalBody, fallbackDepth, matchedRule }) {
     const next = new ProxyRequestContext({ req: this.#req, res: this.#res, id: this.#id, startTime: this.#startTime, urlSessionId: this.#urlSessionId });
@@ -125,6 +131,7 @@ export class ProxyRequestContext {
     next.#originalBody = originalBody ?? this.#originalBody;
     next.#fallbackDepth = fallbackDepth ?? this.#fallbackDepth;
     next.#matchedRule = matchedRule ?? this.#matchedRule;
+    next.#superseded = this.#superseded;
     return next;
   }
 }

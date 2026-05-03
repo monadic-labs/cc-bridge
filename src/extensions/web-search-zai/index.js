@@ -6,6 +6,11 @@
  * before forwarding to Claude Code CLI.
  */
 
+export const EXTENSION_META = {
+  activation: 'provider-driven',
+  providerTrigger: 'toolTransforms.web_search',
+};
+
 const WEB_SEARCH_TOOL_RE = /^web_search(_\d{8})?$/;
 
 /**
@@ -155,9 +160,9 @@ function transformFullResponse({ response, provider }) {
               tool_use_id: block.id,
               content: { type: 'web_search_result', url: '', title: '' },
             });
-          } else {
-            newContent.push(block);
+            continue;
           }
+          newContent.push(block);
         }
         parsed.content = newContent;
         changed = true;

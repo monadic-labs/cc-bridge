@@ -1,7 +1,7 @@
 import { RequestInfo, Option } from './types.js';
 import { redactHeaders } from './headers.js';
 import { applyRoutingWithMatch, applyAuthHeaders, extractSessionId } from './routing.js';
-import { providerIdToEnvKey } from './providers.js';
+import { providerIdToEnvKey, ProviderMatch } from './providers.js';
 
 /**
  * Resolve routing for an incoming request body against the active policy.
@@ -17,14 +17,26 @@ import { providerIdToEnvKey } from './providers.js';
  * @param {string} params.anthropicBaseUrl - Fallback Anthropic API base URL
  * @returns {{ reqModel: string, sessionId: string, routing: RoutingResult, routedHeaders: object, match: ProviderMatch|null }}
  */
-export function resolveRouting({ policy, body, urlSessionId, routedHeaders, anthropicBaseUrl, extensions }) {
+export async function resolveRouting({ policy, body, urlSessionId, routedHeaders, anthropicBaseUrl, extensions, openaiProviders }) {
   const reqModel = body.model ?? 'unknown';
   const sessionId = urlSessionId || extractSessionId(body);
 
   const evalOpt = policy.evaluateWithRule(body);
 
-  // No rule matched — use default fallback if configured, otherwise pure Anthropic passthrough
+  // No rule matched — try extension-based resolution (e.g. dot-notation models)
   if (evalOpt.isNone) {
+    if (extensions && extensions.hasUnmatchedResolver && typeof body.model === 'string' && body.model.includes('.')) {
+      const extResult = await extensions.resolveUnmatched({ modelName: body.model, policy });
+      if (extResult) {
+        const match = new ProviderMatch(extResult.provider, `direct:${extResult.providerId}→${extResult.model}`, extResult.model);
+        const routing = applyRoutingWithMatch(body, Option.some(match), anthropicBaseUrl, extensions);
+        const envVar = providerIdToEnvKey(match.provider.id);
+        const apiKey = process.env[envVar] ?? '';
+        const finalHeaders = applyAuthHeaders({ headers: routedHeaders, match, apiKey, openaiProviders });
+        return { reqModel, sessionId, routing, routedHeaders: finalHeaders, match, matchedRule: null };
+      }
+    }
+
     const defaultRule = policy.defaultFallbackRule;
     const routing = applyRoutingWithMatch(body, Option.none(), anthropicBaseUrl, extensions);
     return {
@@ -35,8 +47,19 @@ export function resolveRouting({ policy, body, urlSessionId, routedHeaders, anth
     };
   }
 
-  const rawMatch = evalOpt.value.match;
+  let rawMatch = evalOpt.value.match;
   const matchedRule = evalOpt.value.rule;
+
+  // Let extensions potentially override the routing (e.g., load balancer picks a pool entry)
+  if (extensions) {
+    const resolved = extensions.resolveProvider({ body, matchedRule, policy, match: rawMatch });
+    if (resolved) {
+      const provider = policy.getProvider(resolved.providerId);
+      if (provider.isSome) {
+        rawMatch = new ProviderMatch(provider.value, `pool:${resolved.providerId}→${resolved.model}`, resolved.model);
+      }
+    }
+  }
 
   // Passthrough rules (no target) have null match — route to Anthropic,
   // but keep matchedRule for fallback detection
@@ -50,7 +73,7 @@ export function resolveRouting({ policy, body, urlSessionId, routedHeaders, anth
     apiKey = process.env[envVar] ?? '';
   }
 
-  const finalHeaders = applyAuthHeaders({ headers: routedHeaders, match, apiKey });
+  const finalHeaders = applyAuthHeaders({ headers: routedHeaders, match, apiKey, openaiProviders });
 
   return { reqModel, sessionId, routing, routedHeaders: finalHeaders, match, matchedRule };
 }
@@ -67,14 +90,15 @@ export function resolveRouting({ policy, body, urlSessionId, routedHeaders, anth
  * @param {function} params.getConfig - Config accessor
  * @returns {Promise<ProxyRequestContext>} Context with routing applied
  */
-export async function processRequestBody({ ctx, body, policy, extensions, anthropicBaseUrl, logger, getConfig }) {
-  const { reqModel, sessionId, routing, routedHeaders, matchedRule } = resolveRouting({
+export async function processRequestBody({ ctx, body, policy, extensions, anthropicBaseUrl, logger, getConfig, openaiProviders }) {
+  const { reqModel, sessionId, routing, routedHeaders, matchedRule, match } = resolveRouting({
     policy,
     body,
     urlSessionId: ctx.urlSessionId,
     routedHeaders: ctx.routedHeaders,
     anthropicBaseUrl,
-    extensions
+    extensions,
+    openaiProviders
   });
 
   const requestInfo = new RequestInfo({

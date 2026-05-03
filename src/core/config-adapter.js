@@ -143,11 +143,19 @@ export function convertV2ToInternal(v2Json) {
       rule.targetModel = target.model;
     }
 
-    if (keyParsed.type === 'exact') {
+    if (value.pool) {
+      rule.type = 'pool';
+      rule.pool = typeof value.pool === 'string' ? { entries: [value.pool] } : value.pool;
+    }
+
+    if (rule.type === 'exact') {
       rule.match = keyParsed.match;
     }
-    if (keyParsed.type === 'regex') {
+    if (rule.type === 'regex') {
       rule.pattern = keyParsed.pattern;
+    }
+    if (rule.type === 'pool') {
+      rule.match = keyParsed.match;
     }
 
     if (value.fallback && value.fallback.length > 0) {
