@@ -262,7 +262,7 @@ function handleKeySet(args) {
   }
 
   const data = readProvidersJson();
-  const key = findProviderKey(data, providerId);
+  const key = findProviderKey(data.providers, providerId);
   if (!key) {
     process.stderr.write(`Error: No provider matching "${providerId}"\n`);
     process.exit(1);
@@ -281,7 +281,7 @@ function handleKeyRemove(args) {
   }
 
   const data = readProvidersJson();
-  const key = findProviderKey(data, providerId);
+  const key = findProviderKey(data.providers, providerId);
   if (!key) {
     process.stderr.write(`Error: No provider matching "${providerId}"\n`);
     process.exit(1);
@@ -316,15 +316,13 @@ function handleKeyPrune() {
     return;
   }
 
-  const result = pruneEnvLines(envPath, validEnvKeys);
-  if (!result.isSuccess) {
-    process.stderr.write(`Error: ${result.error.message}\n`);
-    process.exit(1);
-  }
+  const removed = pruneEnvLines(envPath, ({ key }) => {
+    if (!key.endsWith('_KEY')) return false;
+    return !validEnvKeys.has(key.toUpperCase());
+  });
 
-  const removed = result.value;
   if (removed.length === 0) {
-    console.log('No orphaned keys to prune.');
+    console.log('No orphaned keys found.');
     return;
   }
 

@@ -2135,7 +2135,7 @@ async function runIntegrationTests() {
 
   // Test --x-route
   console.log('  Testing --x-route add/remove/list/tree/exceptions...');
-  assertCli(runCcb(['--x-route', 'add']), 1, null, 'Error:', '--x-route add missing args');
+  assertCli(runCcb(['--x-route', 'add']), 1, null, 'Usage:', '--x-route add missing args');
 
   runCcb(['--x-route', 'add', 'model', 'test-alias', 'zai.test-real']);
   providers = JSON.parse(fs.readFileSync(path.join(TEST_CONFIG_DIR, PROVIDERS_FILENAME), 'utf8'));
