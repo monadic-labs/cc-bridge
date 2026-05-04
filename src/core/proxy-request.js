@@ -145,7 +145,7 @@ export async function handleRequestEnd({ ctx, chunks, deps }) {
       requestBody: bodyOpt.value,
       debugMode: debugLogger.isDebug
     });
-    buildErrorResponse(activeCtx.res, e);
+    buildErrorResponse(activeCtx.res, e, activeCtx.startTime);
     return;
   }
 

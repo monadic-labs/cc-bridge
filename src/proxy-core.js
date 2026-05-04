@@ -106,14 +106,34 @@ function tryParseProviders(data, filepath) {
   }
 }
 
-function buildErrorResponse(res, error) {
+function buildErrorResponse(res, error, startTime) {
   if (res.headersSent) return;
-  const payload = typeof error.toResponsePayload === 'function'
-    ? error.toResponsePayload()
-    : JSON.stringify({
+  const elapsedMs = startTime ? Date.now() - startTime : null;
+  let payload;
+  if (typeof error.toResponsePayload === 'function') {
+    payload = error.toResponsePayload();
+    // Inject timing if payload is a JSON string
+    if (elapsedMs !== null && typeof payload === 'string') {
+      try {
+        const parsed = JSON.parse(payload);
+        if (parsed.error && typeof parsed.error === 'object') {
+          parsed.error.ccb_response_time_ms = elapsedMs;
+          payload = JSON.stringify(parsed);
+        }
+      } catch {
+        // Not valid JSON, leave as-is
+      }
+    }
+  } else {
+    payload = JSON.stringify({
       type: 'error',
-      error: { type: 'invalid_request_error', message: error.message || String(error) }
+      error: {
+        type: 'invalid_request_error',
+        message: error.message || String(error),
+        ...(elapsedMs !== null && { ccb_response_time_ms: elapsedMs })
+      }
     });
+  }
   res.writeHead(400, {
     'content-type': 'application/json',
     'content-length': Buffer.byteLength(payload),
