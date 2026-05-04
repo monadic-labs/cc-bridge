@@ -121,6 +121,10 @@ async function runUnitTests() {
   const kaCmd = validateCommandMessage({ cmd: 'keepalive' });
   assert(kaCmd.cmd === 'keepalive', 'validateCommandMessage accepts keepalive');
 
+  // validateCommandMessage — valid sessions
+  const sessionsCmd = validateCommandMessage({ cmd: 'sessions' });
+  assert(sessionsCmd.cmd === 'sessions', 'validateCommandMessage accepts sessions');
+
   // validateCommandMessage — unknown
   assert(validateCommandMessage({ cmd: 'bogus' }) === null, 'validateCommandMessage rejects unknown cmd');
 
@@ -2119,6 +2123,7 @@ async function runIntegrationTests() {
   console.log('  Testing --x-help...');
   assertCli(runCcb(['--x-help']), 0, 'CCB (Claude Code Bridge) Management Commands', null, '--x-help');
   assertCli(runCcb(['--x-help']), 0, '--x-clearlogs', null, '--x-help includes --x-clearlogs');
+  assertCli(runCcb(['--x-help']), 0, '--x-sessions', null, '--x-help includes --x-sessions');
 
   // Test --x-init
   console.log('  Testing --x-init...');

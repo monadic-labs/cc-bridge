@@ -6,7 +6,7 @@ import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import os from 'os';
-import { CCB_DIR_NAME } from '../src/core/constants.js';
+import { CCB_DIR_NAME, CCB_VERSION } from '../src/core/constants.js';
 import { getControlIpcPath } from '../src/core/daemon-constants.js';
 import { parseIpcMessage, serializeIpcMessage, validateWorkerMessage, validateCommandMessage } from '../src/core/ipc-protocol.js';
 import { loadConfigFromFile } from '../src/core/config.js';
@@ -22,6 +22,9 @@ let sharedServer = null;
 let shuttingDown = false;
 let shutdownTimer = null;
 let restartInProgress = false;
+
+// Track all workers (for multi-version support in Phase 2)
+const allWorkers = new Map(); // pid -> { pid, version, startTime, keepalives: Set }
 
 const _configDir = process.env.CCB_CONFIG_DIR || path.join(os.homedir(), '.claude', CCB_DIR_NAME);
 
@@ -130,6 +133,32 @@ function handleControlConnection(socket) {
           workerPid: activeWorker ? activeWorker.pid : null,
           uptimeMs: Date.now() - startTime,
           keepalives: keepaliveConnections.size
+        }));
+        return;
+      }
+
+      if (cmd.cmd === 'sessions') {
+        const workers = [];
+        if (activeWorker) {
+          workers.push({
+            pid: activeWorker.pid,
+            version: CCB_VERSION,
+            uptimeMs: Date.now() - startTime,
+            keepalives: keepaliveConnections.size
+          });
+        }
+        if (drainingWorker) {
+          workers.push({
+            pid: drainingWorker.pid,
+            version: CCB_VERSION,
+            uptimeMs: Date.now() - startTime,
+            keepalives: 0
+          });
+        }
+        socket.write(serializeIpcMessage({
+          cmd: 'sessions',
+          workers,
+          totalKeepalives: keepaliveConnections.size
         }));
         return;
       }

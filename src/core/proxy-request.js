@@ -1,7 +1,9 @@
 import { copyRequestHeaders } from './headers.js';
 import { tryParseBody } from './routing.js';
 import { processRequestBody } from './proxy-routing.js';
+import { extractSessionId } from './routing.js';
 import { ProxyError } from './exceptions.js';
+import { CCB_VERSION } from './constants.js';
 
 /**
  * Handle the end of an incoming request: decompress, parse, route, compress, forward.
@@ -52,6 +54,30 @@ export async function handleRequestEnd({ ctx, chunks, deps }) {
   });
 
   const bodyOpt = tryParseBody(decompressedBody);
+
+  // Intercept ccb.session.info command
+  if (bodyOpt.isSome && bodyOpt.value.model === 'ccb.session.info') {
+    const sessionId = activeCtx.urlSessionId || extractSessionId(bodyOpt.value) || 'unknown';
+    const response = {
+      type: 'error',
+      error: {
+        type: 'invalid_request_error',
+        message: `Invalid model: ccb.session.info\n\n${JSON.stringify({
+          session_id: sessionId,
+          version: CCB_VERSION,
+          worker_pid: process.pid,
+          uptime_sec: Math.round(process.uptime()),
+          log_path: deps.logsDir || '~/.claude/.ccb/logs',
+          config_path: process.env.CCB_CONFIG_DIR || '~/.claude/.ccb',
+          active_connections: deps.activeConnections || 0
+        }, null, 2)}`
+      }
+    };
+    activeCtx.res.writeHead(400, { 'content-type': 'application/json' });
+    activeCtx.res.end(JSON.stringify(response));
+    return;
+  }
+
   if (bodyOpt.isNone) {
     if (encoding) {
       delete activeCtx.routedHeaders['content-encoding'];

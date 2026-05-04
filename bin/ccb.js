@@ -417,6 +417,51 @@ async function handleStatusCommand() {
   }, 5000);
 }
 
+async function handleSessionsCommand() {
+  const socket = await connectToControlIpc();
+  if (!socket) {
+    process.stderr.write('ccb: No running proxy daemon found.\n');
+    process.exit(1);
+  }
+
+  socket.write(serializeIpcMessage({ cmd: 'sessions' }));
+
+  let buffer = '';
+  socket.on('data', (data) => {
+    buffer += data.toString();
+    const lines = buffer.split('\n');
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const response = parseIpcMessage(line);
+      if (response && response.cmd === 'sessions') {
+        if (response.workers && response.workers.length > 0) {
+          process.stdout.write('Active Sessions:\n');
+          process.stdout.write('  PID    Version  Uptime   Keepalives\n');
+          for (const w of response.workers) {
+            process.stdout.write(`  ${String(w.pid).padEnd(6)} ${String(w.version).padEnd(8)} ${String(Math.round(w.uptimeMs / 1000) + 's').padEnd(8)} ${w.keepalives}\n`);
+          }
+          process.stdout.write(`\nTotal: ${response.totalKeepalives} session(s) across ${response.workers.length} worker(s)\n`);
+        } else {
+          process.stdout.write('No active sessions.\n');
+        }
+        socket.end();
+        process.exit(0);
+      }
+    }
+  });
+
+  socket.on('error', (err) => {
+    process.stderr.write(`ccb: IPC error: ${err.message}\n`);
+    process.exit(1);
+  });
+
+  setTimeout(() => {
+    process.stderr.write('ccb: Sessions request timed out\n');
+    socket.destroy();
+    process.exit(1);
+  }, 5000);
+}
+
 const CCB_CMDS = {
   '--x-init': () => {
     init();
@@ -424,6 +469,9 @@ const CCB_CMDS = {
   },
   '--x-status': () => {
     handleStatusCommand();
+  },
+  '--x-sessions': () => {
+    handleSessionsCommand();
   },
   '--x-gui': () => {
     const config = loadDaemonConfig(USER_CONFIG_DIR);
@@ -485,6 +533,7 @@ CCB (Claude Code Bridge) Management Commands:
   --x-version       Print the ccb version
   --x-init          Initialize the config directory (~/.claude/.ccb)
   --x-status        Show current daemon and worker status
+  --x-sessions      List all active sessions across workers
   --x-killall       Kill all background proxy processes
   --x-restart       Gracefully restart the proxy daemon (zero-downtime)
   --x-gui           Open the GUI dashboard in your browser

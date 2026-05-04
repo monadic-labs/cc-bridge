@@ -3,6 +3,7 @@ import path from 'path';
 import http from 'http';
 import { fileURLToPath } from 'url';
 import {
+  CCB_VERSION,
   LOGS_DIR_NAME,
   PROVIDERS_FILENAME,
   ENV_FILENAME
@@ -405,7 +406,9 @@ export function createProxyCore({ configDir, port }) {
             debugLogger,
             getConfig,
             forwardToUpstream: boundForwardToUpstream,
-            buildErrorResponse
+            buildErrorResponse,
+            activeConnections: shellState.activeConnections,
+            logsDir
           }
         });
       });
