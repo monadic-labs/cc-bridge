@@ -52,7 +52,16 @@ class ProxyState {
   get activeConnections() { return this.#activeConnections; }
 
   withIncrement() { return new ProxyState(this.#reqCount + 1, this.#activeProviders, this.#extensions, this.#extensionConfigs, this.#activeConnections); }
-  withConnectionBump(delta) { return new ProxyState(this.#reqCount, this.#activeProviders, this.#extensions, this.#extensionConfigs, this.#activeConnections + delta); }
+  withConnectionBump(delta) {
+    if (typeof delta !== 'number' || !Number.isFinite(delta)) {
+      throw new ArgumentError('delta must be a finite number');
+    }
+    const newCount = this.#activeConnections + delta;
+    if (newCount < 0) {
+      throw new ArgumentError(`activeConnections cannot be negative (current: ${this.#activeConnections}, delta: ${delta})`);
+    }
+    return new ProxyState(this.#reqCount, this.#activeProviders, this.#extensions, this.#extensionConfigs, newCount);
+  }
   withProviders(providers, extensions, extensionConfigs) { return new ProxyState(this.#reqCount, providers, extensions ?? this.#extensions, extensionConfigs ?? this.#extensionConfigs, this.#activeConnections); }
 }
 
@@ -420,54 +429,70 @@ export function runWorkerMode({ configDir, port }) {
   const core = createProxyCore({ configDir, port });
   let drained = false;
   let server = null;
+  let drainInterval = null;
 
   process.on('message', (msg, handle) => {
+    // Receive socket handle from watchdog
     if (msg?.type === 'socket' && handle) {
       server = http.createServer(core.createRequestHandler());
-      server.listen(handle, () => {
-        process.stdout.write('[worker] Listening on passed socket handle\n');
+
+      server.listen(handle, async () => {
+        process.stdout.write(`[worker] Listening on passed socket handle (port ${msg.port})\n`);
+
+        try {
+          await core.initProviders();
+          const readyMsg = {
+            type: 'ready',
+            pid: process.pid,
+            routes: core.providerCount,
+            extensions: core.extensions?.size ?? 0
+          };
+          if (process.send) process.send(readyMsg);
+        } catch (e) {
+          const errorMsg = {
+            type: 'error',
+            message: e.message
+          };
+          if (process.send) process.send(errorMsg);
+          process.exit(1);
+        }
       });
 
-      core.initProviders().then(() => {
-        const readyMsg = {
-          type: 'ready',
-          pid: process.pid,
-          routes: core.providerCount,
-          extensions: core.extensions?.size ?? 0
-        };
-        if (process.send) process.send(readyMsg);
-      }).catch((_e) => {
-        const errorMsg = {
-          type: 'error',
-          message: _e.message
-        };
-        if (process.send) process.send(errorMsg);
+      server.on('error', (err) => {
+        process.stdout.write(`[worker] Server error: ${err.message}\n`);
         process.exit(1);
       });
     }
 
+    // Handle drain signal
     if (msg?.type === 'drain' && !drained) {
       drained = true;
       process.stdout.write('[worker] Drain signal received, stopping new connections\n');
 
+      const config = core.getConfig();
       const timeout = setTimeout(() => {
+        clearInterval(drainInterval);
         process.stdout.write('[worker] Drain timeout exceeded, force exiting\n');
         process.exit(0);
-      }, msg.timeout || 600_000);
+      }, msg.timeout || config.drainTimeoutMs);
 
       const checkDrain = () => {
         if (core.activeConnections <= 0) {
           clearTimeout(timeout);
+          clearInterval(drainInterval);
           process.stdout.write('[worker] All in-flight requests completed\n');
           process.exit(0);
         }
       };
 
+      drainInterval = setInterval(checkDrain, config.pollIntervalMs);
+
       if (server) {
-        server.close(checkDrain);
+        server.close(() => {
+          // Don't exit — let existing connections finish via drainInterval
+          process.stdout.write('[worker] Server closed to new connections\n');
+        });
       }
-      const pollMs = core.getConfig().daemon.pollIntervalMs;
-      setInterval(checkDrain, pollMs);
     }
   });
 }

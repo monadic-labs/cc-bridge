@@ -92,13 +92,6 @@ function runProxyDaemon() {
   ensureLogsDir();
   const config = loadDaemonConfig();
 
-  if (process.env.CCB_WORKER_MODE === '1') {
-    import('../src/proxy-core.js').then(({ runWorkerMode }) => {
-      runWorkerMode({ configDir: USER_CONFIG_DIR, port: config.port });
-    });
-    return;
-  }
-
   const core = createProxyCore({ configDir: USER_CONFIG_DIR, port: config.port });
   const server = http.createServer(core.createRequestHandler());
 

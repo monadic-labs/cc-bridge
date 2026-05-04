@@ -1,8 +1,5 @@
 import path from 'path';
 
-export const INIT_TIMEOUT_MS = 10_000;
-export const DRAIN_TIMEOUT_MS = 600_000;
-
 export const CCB_DIR_NAME = '.ccb';
 export const CONFIG_FILENAME = 'config.json';
 export const PROVIDERS_FILENAME = 'providers.json';
