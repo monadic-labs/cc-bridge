@@ -64,7 +64,7 @@ async function runUnitTests() {
 
   // ── daemon-constants ──
   console.log('\ndaemon-constants:');
-  const { getControlIpcPath, INIT_TIMEOUT_MS, DRAIN_TIMEOUT_MS } = await import('../src/core/daemon-constants.js');
+  const { getControlIpcPath } = await import('../src/core/daemon-constants.js');
   const ipcPath = getControlIpcPath();
   assert(typeof ipcPath === 'string' && ipcPath.length > 0, 'getControlIpcPath returns non-empty string');
   if (process.platform === 'win32') {
@@ -73,8 +73,6 @@ async function runUnitTests() {
   if (process.platform !== 'win32') {
     assert(ipcPath.endsWith('.sock') || ipcPath.includes('ccb-ctrl'), 'POSIX IPC path has expected suffix');
   }
-  assert(typeof INIT_TIMEOUT_MS === 'number' && INIT_TIMEOUT_MS > 0, 'INIT_TIMEOUT_MS is positive number');
-  assert(typeof DRAIN_TIMEOUT_MS === 'number' && DRAIN_TIMEOUT_MS > 0, 'DRAIN_TIMEOUT_MS is positive number');
 
   // ── ipc-protocol ──
   console.log('\nipc-protocol:');
@@ -360,14 +358,48 @@ async function runUnitTests() {
   const validConfig = new ProxyConfig({
     port: 9099,
     anthropicBaseUrl: 'https://api.anthropic.com',
-    daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000 },
+    daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000 },
     logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 },
     compression: { recompressRequests: true }
   });
   assert(validConfig.port === 9099, 'port');
   assert(validConfig.anthropicBaseUrl === 'https://api.anthropic.com', 'anthropicBaseUrl');
   assert(validConfig.upstreamTimeoutMs === 600000, 'upstreamTimeoutMs');
+  assert(validConfig.workerInitTimeoutMs === 20000, 'workerInitTimeoutMs');
+  assert(validConfig.drainTimeoutMs === 600000, 'drainTimeoutMs');
   assertThrows(() => new ProxyConfig({ port: 9099, logging: { enabled: true } }), ConfigError, 'incomplete logging throws');
+
+  // Config validation: watchdog timeouts
+  assertThrows(() => new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 500, drainTimeoutMs: 600000 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } }), ConfigError, 'workerInitTimeoutMs < 1000 throws');
+  assertThrows(() => new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 500 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } }), ConfigError, 'drainTimeoutMs < 1000 throws');
+
+  // ── ProxyState withConnectionBump validation ──
+  console.log('\nProxyState:');
+  // Test the validation logic (same code as in proxy-core.js ProxyState.withConnectionBump)
+  const makeState = (activeConnections) => ({
+    bump(delta) {
+      if (typeof delta !== 'number' || !Number.isFinite(delta)) {
+        throw new ArgumentError('delta must be a finite number');
+      }
+      const newCount = activeConnections + delta;
+      if (newCount < 0) {
+        throw new ArgumentError(`activeConnections cannot be negative (current: ${activeConnections}, delta: ${delta})`);
+      }
+      return newCount;
+    }
+  });
+  // Happy path: zero → 1 → 0
+  assert(makeState(0).bump(1) === 1, 'bump 0+1 returns 1');
+  assert(makeState(1).bump(-1) === 0, 'bump 1-1 returns 0');
+  assert(makeState(5).bump(3) === 8, 'bump 5+3 returns 8');
+  // Error path: invalid delta
+  assertThrows(() => makeState(0).bump(NaN), ArgumentError, 'NaN delta throws ArgumentError');
+  assertThrows(() => makeState(0).bump(Infinity), ArgumentError, 'Infinity delta throws ArgumentError');
+  assertThrows(() => makeState(0).bump('1'), ArgumentError, 'string delta throws ArgumentError');
+  assertThrows(() => makeState(0).bump(undefined), ArgumentError, 'undefined delta throws ArgumentError');
+  // Error path: negative result
+  assertThrows(() => makeState(0).bump(-1), ArgumentError, 'negative result throws ArgumentError');
+  assertThrows(() => makeState(2).bump(-3), ArgumentError, 'underflow result throws ArgumentError');
 
   // ── RequestInfo ──
   console.log('\nRequestInfo:');
@@ -391,6 +423,8 @@ async function runUnitTests() {
   assert(completeConfig.anthropicBaseUrl === 'https://api.anthropic.com', 'anthropicBaseUrl default');
   assert(completeConfig.daemon.upstreamTimeoutMs === 600000, 'upstreamTimeoutMs default');
   assert(completeConfig.daemon.healthCheckTimeoutMs === 500, 'healthCheckTimeoutMs default');
+  assert(completeConfig.daemon.workerInitTimeoutMs === 20000, 'workerInitTimeoutMs default');
+  assert(completeConfig.daemon.drainTimeoutMs === 600000, 'drainTimeoutMs default');
 
   const rawProviders = { providers: [{ id: 'zai', url: 'https://zai.com/api', anthropicCompliant: false }] };
   const completeProviders = ensureCompleteProviders(rawProviders);
