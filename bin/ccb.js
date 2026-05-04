@@ -432,6 +432,22 @@ const CCB_CMDS = {
   '--x-status': () => {
     handleStatusCommand();
   },
+  '--x-gui': () => {
+    const config = loadDaemonConfig(USER_CONFIG_DIR);
+    const url = `http://localhost:${config.port}/gui`;
+    const platform = process.platform;
+    let cmd;
+    if (platform === 'darwin') {
+      cmd = 'open';
+    } else if (platform === 'win32') {
+      cmd = 'start';
+    } else {
+      cmd = 'xdg-open';
+    }
+    spawnCommand(cmd, [url], { detached: true }).unref();
+    console.log(`Opening GUI: ${url}`);
+    process.exit(0);
+  },
   '--x-killall': async () => {
     await runKill();
     process.exit(0);
@@ -478,6 +494,7 @@ CCB (Claude Code Bridge) Management Commands:
   --x-status        Show current daemon and worker status
   --x-killall       Kill all background proxy processes
   --x-restart       Gracefully restart the proxy daemon (zero-downtime)
+  --x-gui           Open the GUI dashboard in your browser
   --x-clearlogs     Delete all log files in the logs directory
   --x-provider ...  Manage providers (add/remove)
   --x-route ...     Manage routing rules (model/property/payloadSize)
