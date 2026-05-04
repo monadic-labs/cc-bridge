@@ -1,33 +1,37 @@
 /**
  * ESLint rule: no-else
  *
- * Enforces guard-clause-only control flow. All if blocks must return
- * early, throw, break, or continue. else and else if are forbidden.
+ * Forbids the use of 'else' and 'else if' blocks.
+ * Encourages early returns, guard clauses, and functional alternatives
+ * like maps or polymorphism.
  */
 
 "use strict";
 
 export default {
   meta: {
-    type: "suggestion",
+    type: "problem",
     docs: {
-      description: "Forbid else/else if — use guard clauses only",
-      category: "Style",
+      description:
+        "Forbid 'else' and 'else if' blocks to reduce cyclomatic complexity and encourage early returns.",
+      category: "Best Practices",
       recommended: true
     },
     schema: [],
     messages: {
-      noElse: "Use guard clauses instead of else/else if. Return early, throw, or continue."
+      noElse:
+        "The use of 'else' and 'else if' is forbidden. Use guard clauses, early returns, or functional patterns instead."
     }
   },
 
   create(context) {
     return {
       IfStatement(node) {
-        if (node.alternate && node.alternate.type === "IfStatement") {
-          context.report({ node: node.alternate, messageId: "noElse" });
-        } else if (node.alternate) {
-          context.report({ node: node.alternate, messageId: "noElse" });
+        if (node.alternate) {
+          context.report({
+            node: node.alternate,
+            messageId: "noElse"
+          });
         }
       }
     };

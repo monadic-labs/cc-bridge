@@ -10,7 +10,6 @@
 
 import path from "path";
 
-const ALLOWED_FILES = new Set(["process-manager.js", "proxy-upstream.js", "proxy-core.js"]);
 
 export default {
   meta: {
@@ -29,9 +28,7 @@ export default {
   create(context) {
     const filename = context.filename;
     if (!filename.includes(`${path.sep}src${path.sep}`)) return {};
-    for (const allowed of ALLOWED_FILES) {
-      if (filename.endsWith(allowed)) return {};
-    }
+
 
     return {
       CallExpression(node) {

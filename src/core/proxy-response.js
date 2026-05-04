@@ -93,5 +93,16 @@ export async function handleResponseEnd({ resCtx, resChunks, deps }) {
     }
   }
 
+  if (!resCtx.res.headersSent) {
+    const resHeaders = filterResponseHeaders(resCtx.proxyRes.headers);
+    // Remove content-encoding since we've decompressed the body
+    delete resHeaders['content-encoding'];
+    // Update content-length for the decompressed body
+    const bodyBuffer = Buffer.from(raw);
+    resHeaders['content-length'] = String(bodyBuffer.length);
+    resCtx.res.writeHead(status, resHeaders);
+    resCtx.res.write(bodyBuffer);
+  }
+
   if (!resCtx.res.writableEnded) resCtx.res.end();
 }

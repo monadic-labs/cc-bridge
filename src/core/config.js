@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { CONFIG_FILENAME, CCB_DIR_NAME } from './constants.js';
 import { ConfigError } from './exceptions.js';
 import { ensureCompleteConfig } from './migrator.js';
 
@@ -134,9 +135,9 @@ export function parseConfig(jsonString) {
 }
 
 export function loadConfigFromFile(configDir) {
-  const configPath = path.join(configDir, 'config.json');
+  const configPath = path.join(configDir, CONFIG_FILENAME);
   if (!fs.existsSync(configPath)) {
-    throw new ConfigError(`config.json missing: ${configPath}. Please run 'ccb --x-init' first.`);
+    throw new ConfigError(`${CONFIG_FILENAME} missing: ${configPath}. Please run 'ccb --x-init' first.`);
   }
   let raw = fs.readFileSync(configPath, 'utf8');
   let parsed;
@@ -154,5 +155,5 @@ export function loadConfigFromFile(configDir) {
 
 export function resolveUserConfigDir() {
   if (process.env.CCB_CONFIG_DIR) return process.env.CCB_CONFIG_DIR;
-  return path.join(os.homedir(), '.claude', '.ccb');
+  return path.join(os.homedir(), '.claude', CCB_DIR_NAME);
 }

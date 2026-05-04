@@ -1,29 +1,36 @@
 #!/usr/bin/env node
 
-import { spawn, execSync } from 'child_process';
-import { randomBytes } from 'crypto';
+import { spawnSync as _spawnSync } from 'child_process';
 import http from 'http';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import path from 'path';
-import { createProxyCore, runKill } from '../src/proxy-core.js';
-import { ReadinessTimeoutException, ConfigurationMissingException, ConfigError } from '../src/core/exceptions.js';
+import { ReadinessTimeoutException, ConfigurationMissingException, ConfigError, ArgumentError } from '../src/core/exceptions.js';
 import { loadConfigFromFile, resolveUserConfigDir } from '../src/core/config.js';
-import { addRouteModel, removeRouteModel, listModels, listProviders, formatTree, findProviderKey, addProvider, removeProvider } from '../src/core/model-manager.js';
-import { listApiKeys, obfuscateKey } from '../src/core/key-manager.js';
+import {
+  LOGS_DIR_NAME,
+  PROVIDERS_FILENAME,
+  CONFIG_FILENAME,
+  ENV_FILENAME,
+  WATCHDOG_SCRIPT_NAME
+} from '../src/core/constants.js';
+import { addRouteModel, removeRouteModel, formatTree, findProviderKey, addProvider, removeProvider } from '../src/core/model-manager.js';
+import { listApiKeys as _listApiKeys, obfuscateKey } from '../src/core/key-manager.js';
 import { ensureCompleteConfig, ensureCompleteProviders } from '../src/core/migrator.js';
 import { providerIdToEnvKey } from '../src/core/providers.js';
 import { loadEnv, updateEnvKey, pruneEnvLines } from '../src/core/env-file.js';
-import { parseTarget, detectFormat } from '../src/core/config-adapter.js';
+import { parseTarget as _parseTarget, detectFormat as _detectFormat } from '../src/core/config-adapter.js';
 import net from 'net';
 import { getControlIpcPath } from '../src/core/daemon-constants.js';
 import { serializeIpcMessage, parseIpcMessage } from '../src/core/ipc-protocol.js';
+import { runKill, spawnDaemon, spawnCommand } from '../src/infra/process-manager.js';
+import { createProxyCore } from '../src/proxy-core.js';
 
 const PROXY_FLAG = '--__cc-proxy-daemon__';
 
 const USER_CONFIG_DIR = resolveUserConfigDir();
-const LOGS_DIR = path.join(USER_CONFIG_DIR, 'logs');
-const providersPath = path.join(USER_CONFIG_DIR, 'providers.json');
+const LOGS_DIR = path.join(USER_CONFIG_DIR, LOGS_DIR_NAME);
+const providersPath = path.join(USER_CONFIG_DIR, PROVIDERS_FILENAME);
 
 function readJsonFile(filePath) {
   if (!fs.existsSync(filePath)) return null;
@@ -50,7 +57,7 @@ function init() {
 
   const pkgRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
   const examplePath = path.join(pkgRoot, 'providers.example.json');
-  const configPath = path.join(USER_CONFIG_DIR, 'config.json');
+  const configPath = path.join(USER_CONFIG_DIR, CONFIG_FILENAME);
 
   const providersData = readJsonFile(providersPath) ?? readJsonFile(examplePath) ?? {};
   const mergedProviders = ensureCompleteProviders(providersData);
@@ -85,7 +92,6 @@ function runProxyDaemon() {
   ensureLogsDir();
   const config = loadDaemonConfig();
 
-  // Worker mode: watchdog spawned us with CCB_WORKER_MODE flag
   if (process.env.CCB_WORKER_MODE === '1') {
     import('../src/proxy-core.js').then(({ runWorkerMode }) => {
       runWorkerMode({ configDir: USER_CONFIG_DIR, port: config.port });
@@ -93,398 +99,41 @@ function runProxyDaemon() {
     return;
   }
 
-  // Standalone mode: existing behavior (no watchdog)
   const core = createProxyCore({ configDir: USER_CONFIG_DIR, port: config.port });
-  core.initProviders();
-
-  core.emit(`CC-Bridge proxy daemon started on http://localhost:${config.port}`);
-  core.emit(`Logs directory: ${LOGS_DIR}`);
-  core.emit(`Providers: ${core.providerCount} route(s) loaded`);
-
   const server = http.createServer(core.createRequestHandler());
-  server.listen(config.port);
-}
 
-function checkProxy(config) {
-  return new Promise((resolve) => {
-    const req = http.get(`http://localhost:${config.port}/v1/models`, () => resolve(true));
-    req.on('error', () => resolve(false));
-    req.setTimeout(config.healthCheckTimeoutMs, () => { req.destroy(); resolve(false); });
+  server.listen(config.port, async () => {
+    core.initProviders();
   });
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function connectToControlIpc() {
-  return new Promise((resolve) => {
-    const ipcPath = getControlIpcPath();
-    const socket = net.createConnection(ipcPath, () => {
-      resolve(socket);
-    });
-    socket.on('error', () => resolve(null));
-    socket.setTimeout(2000, () => { socket.destroy(); resolve(null); });
-  });
-}
-
-async function pollUntilReady(config) {
-  const { pollMaxAttempts, pollIntervalMs } = config;
-  for (let attempt = 0; attempt < pollMaxAttempts; attempt++) {
-    if (await checkProxy(config)) return true;
-    if (attempt < pollMaxAttempts - 1) await sleep(pollIntervalMs);
-  }
-  return false;
-}
-
-function startProxyDaemon(config) {
-  return new Promise((resolve, reject) => {
-    const logsDir = path.join(USER_CONFIG_DIR, 'logs');
-    if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
-
-    const out = fs.openSync(path.join(logsDir, 'daemon.log'), 'a');
-    const err = fs.openSync(path.join(logsDir, 'daemon.err'), 'a');
-
-    const watchdogPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'ccb-watchdog.js');
-
-    const child = spawn(
-      process.execPath,
-      [watchdogPath],
-      {
-        detached: true,
-        stdio: ['ignore', out, err],
-        windowsHide: true,
-        env: { ...process.env, CCB_CONFIG_DIR: USER_CONFIG_DIR }
-      }
-    );
-    child.unref();
-
-    pollUntilReady(config)
-      .then(isUp => {
-        if (isUp) return resolve('');
-        reject(new ReadinessTimeoutException('Proxy daemon failed to start within timeout limit'));
-      })
-      .catch(reject);
-  });
-}
-
-function resolveWindowsCmdPath() {
-  try {
-    const stdout = execSync('where.exe claude', { encoding: 'utf8' });
-    const paths = stdout.split('\n').map(p => p.trim()).filter(Boolean);
-    const cmdPaths = paths.filter(p => p.toLowerCase().endsWith('.cmd'));
-    
-    if (cmdPaths.length === 0) return { cmd: paths[0] || 'claude', isNode: false };
-    
-    for (const cmdPath of cmdPaths) {
-      const parsed = parseCmdWrapper(cmdPath);
-      if (fs.existsSync(parsed.cmd)) {
-        return parsed;
-      }
-    }
-    
-    return parseCmdWrapper(cmdPaths[0]);
-  } catch {
-    return { cmd: 'claude', isNode: false };
-  }
-}
-
-function parseCmdWrapper(cmdPath) {
-  try {
-    const content = fs.readFileSync(cmdPath, 'utf8');
-    // Improved regex to handle various %dp0 variations and both .js and .exe targets.
-    // Uses negative lookahead (?!node\.exe) to avoid matching the node executable itself in wrappers.
-    const m = content.match(/"?(?:%~dp0%?\\?|[%]dp0[%]\\?|%dp0%\\)((?:(?!node\.exe)[^\n"])+\.(?:js|exe))"?/i);
-    if (m) {
-      let targetPath = m[1];
-      if (targetPath.startsWith('\\') || targetPath.startsWith('/')) {
-        targetPath = targetPath.slice(1);
-      }
-      const resolved = path.resolve(path.dirname(cmdPath), targetPath);
-      return { cmd: resolved, isNode: targetPath.toLowerCase().endsWith('.js') };
-    }
-  } catch {}
-  return { cmd: cmdPath, isNode: false };
-}
-
-function getClaudeCommand() {
-  if (process.platform !== 'win32') return { cmd: 'claude', isNode: false };
-  return resolveWindowsCmdPath();
-}
-
-async function ensureProxyReady(config) {
-  if (!fs.existsSync(USER_CONFIG_DIR)) init();
-  if (await checkProxy(config)) return '';
-  return await startProxyDaemon(config);
-}
-
-async function main() {
-  ensureLogsDir();
-  const config = loadDaemonConfig();
-  const keepaliveSecret = await ensureProxyReady(config);
-
-  // Generate a stable session ID for this ccb invocation. It is embedded in
-  // ANTHROPIC_BASE_URL so every API request from this CLI process arrives at
-  // the proxy with the same /s/{ownSessionId}/ prefix. The proxy extracts it
-  // and uses it to name log files — no dependency on CLI internals.
-  const ownSessionId = randomBytes(8).toString('hex');
-
-  const args = process.argv.slice(2);
-  const env = { ...process.env, ANTHROPIC_BASE_URL: `http://localhost:${config.port}/s/${ownSessionId}` };
-
-  try {
-    fs.appendFileSync(path.join(LOGS_DIR, 'proxy.log'), `\n[ccb] Spawning with args: ${JSON.stringify(args)}\n`);
-  } catch {}
-
-  const cli = getClaudeCommand();
-  const spawnCmd = cli.isNode ? process.execPath : cli.cmd;
-  const spawnArgs = cli.isNode ? [cli.cmd, ...args] : args;
-
-  const ipcSocket = await connectToControlIpc();
-  if (ipcSocket) {
-    ipcSocket.write(serializeIpcMessage({ cmd: 'keepalive' }));
-    ipcSocket.on('error', () => { /* ignore */ });
-  }
-  if (!ipcSocket) {
-    const keepaliveOptions = keepaliveSecret ? { headers: { 'x-ccb-keepalive-secret': keepaliveSecret } } : {};
-    const keepaliveReq = http.get(`http://localhost:${config.port}/__ccb_internal__/keepalive`, keepaliveOptions);
-    keepaliveReq.on('error', () => { /* ignore */ });
-  }
-
-  // On Windows, if we're still pointing to a .cmd file (e.g. resolve failed), we MUST use shell: true
-  const useShell = process.platform === 'win32' && spawnCmd.toLowerCase().endsWith('.cmd');
-  const child = spawn(spawnCmd, spawnArgs, { stdio: 'inherit', env, shell: useShell });
-
-  let sigintCount = 0;
-  const handleSigInt = () => {
-    sigintCount++;
-    if (sigintCount >= 3) {
-      process.exit(130);
-    }
-    // Forward to child. Claude CLI might need two SIGINTs to exit gracefully.
-    try { child.kill('SIGINT'); } catch {}
-  };
-  process.on('SIGINT', handleSigInt);
-
-  child.on('exit', (code) => {
-    if (ipcSocket) ipcSocket.destroy();
-    process.exit(code ?? 0);
-  });
-  child.on('error', (err) => {
-    if (ipcSocket) ipcSocket.destroy();
-    process.stderr.write(`ccb: failed to launch claude: ${err.message}\n`);
-    process.exit(1);
-  });
-}
-
-
-function clearLogs() {
-  if (!fs.existsSync(LOGS_DIR)) {
-    console.log('No logs directory found.');
-    return;
-  }
-  const files = fs.readdirSync(LOGS_DIR).filter(f => f.endsWith('.log') || f.endsWith('.json'));
-  if (files.length === 0) {
-    console.log('No log files to clear.');
-    return;
-  }
-  let removed = 0;
-  for (const f of files) {
-    try {
-      fs.unlinkSync(path.join(LOGS_DIR, f));
-      removed++;
-    } catch (e) {
-      process.stderr.write(`Warning: Could not delete ${f}: ${e.message}\n`);
-    }
-  }
-  console.log(`Cleared ${removed} log file(s) from ${LOGS_DIR}`);
-}
-
-const CCB_CMDS = {
-  '--x-init': () => {
-    init();
-    process.exit(0);
-  },
-  '--x-killall': async () => {
-    await runKill();
-    process.exit(0);
-  },
-  '--x-restart': async () => {
-    const socket = await connectToControlIpc();
-    if (!socket) {
-      process.stderr.write('ccb: No running watchdog found. Start a session first with: ccb\n');
-      process.exit(1);
-    }
-
-    socket.write(serializeIpcMessage({ cmd: 'restart' }));
-
-    let buffer = '';
-    socket.on('data', (data) => {
-      buffer += data.toString();
-      const lines = buffer.split('\n');
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        const response = parseIpcMessage(line);
-        if (response) {
-          if (response.status === 'ok') {
-            process.stdout.write(`Restarted worker (PID ${response.oldPid} → PID ${response.newPid})\n`);
-            socket.end();
-            process.exit(0);
-          }
-          process.stderr.write(`Restart failed: ${response.message}\n`);
-          socket.end();
-          process.exit(1);
-        }
-      }
-    });
-
-    socket.on('error', (err) => {
-      process.stderr.write(`ccb: IPC error: ${err.message}\n`);
-      process.exit(1);
-    });
-
-    socket.on('close', () => {
-      process.exit(0);
-    });
-
-    setTimeout(() => {
-      process.stderr.write('ccb: Restart timed out\n');
-      socket.destroy();
-      process.exit(1);
-    }, 15_000);
-  },
-  '--x-clearlogs': () => {
-    clearLogs();
-    process.exit(0);
-  },
-  '--x-version': () => {
-    const pkg = JSON.parse(fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8'));
-    process.stdout.write(`${pkg.version}\n`);
-    process.exit(0);
-  },
-  '--x-help': () => {
-    process.stdout.write(`
-CCB (Claude Code Bridge) Management Commands:
-  --x-version       Print the ccb version
-  --x-init          Initialize the config directory (~/.claude/.ccb)
-  --x-killall       Kill all background proxy processes
-  --x-restart      Gracefully restart the proxy daemon (zero-downtime)
-  --x-clearlogs     Delete all log files in the logs directory
-  --x-provider ...  Manage providers (add/remove)
-  --x-route ...     Manage routing rules (model/property/payloadSize)
-  --x-key ...       Manage provider API keys
-  --x-help          Show this help message
-`);
-    process.exit(0);
-  }
-};
-
-function handleProviderCommand() {
-  const subcommand = process.argv[3];
-  const args = process.argv.slice(4);
-
-  if (subcommand === 'add') return handleProviderAdd(args);
-  if (subcommand === 'remove') return handleProviderRemove(args);
-
-  process.stderr.write(`Usage:
-  ccb --x-provider add <id> <url> [--non-compliant]   Add a new provider
-  ccb --x-provider remove <id>                        Remove a provider
-`);
-  process.exit(1);
-}
-
-function handleProviderAdd(args) {
-  const id = args[0];
-  const url = args[1];
-  const compliant = !args.includes('--non-compliant');
-
-  if (!id || !url) {
-    process.stderr.write('Usage: ccb --x-provider add <id> <url> [--non-compliant]\n');
-    process.exit(1);
-  }
-
-  const data = readProvidersJson();
-  const result = addProvider(data.providers, id, url, compliant);
-  if (!result.isSuccess) {
-    process.stderr.write(`Error: ${result.error.message}\n`);
-    process.exit(1);
-  }
-
-  data.providers = result.value;
-  writeProvidersJson(data);
-  console.log(`Added provider "${id}" (${url}) [${compliant ? 'compliant' : 'non-compliant'}]`);
-}
-
-function handleProviderRemove(args) {
-  const id = args[0];
-  if (!id) {
-    process.stderr.write('Usage: ccb --x-provider remove <id>\n');
-    process.exit(1);
-  }
-
-  const data = readProvidersJson();
-  const result = removeProvider(data.providers, id);
-  if (!result.isSuccess) {
-    process.stderr.write(`Error: ${result.error.message}\n`);
-    process.exit(1);
-  }
-
-  data.providers = result.value;
-  writeProvidersJson(data);
-  console.log(`Removed provider "${id}"`);
 }
 
 export function validateIds(providers) {
-  const ids = new Set();
   const envKeys = new Set();
-  const idPattern = /^[a-z0-9-_]+$/;
-
-  // Support both v2 (object) and v1 (array) for robustness
-  const entries = Array.isArray(providers)
-    ? providers.map(p => [p.id, p])
-    : Object.entries(providers);
-
-  for (const [id, cfg] of entries) {
-    if (!id) {
-      throw new ConfigError(`Provider missing ID`);
+  for (const id of Object.keys(providers)) {
+    if (!/^[a-z0-9-_]+$/.test(id)) {
+      throw new ArgumentError(`Invalid provider ID "${id}". IDs must be lowercase alphanumeric, dashes, or underscores.`);
     }
-    if (!idPattern.test(id)) {
-      throw new ConfigError(`Invalid provider ID format: "${id}". Use only lowercase alphanumeric, hyphens, or underscores.`);
-    }
-    if (ids.has(id)) {
-      throw new ConfigError(`Duplicate provider ID: "${id}" in providers.json`);
-    }
-
     const envKey = providerIdToEnvKey(id);
     if (envKeys.has(envKey)) {
-      throw new ConfigError(`Provider ID collision: "${id}" maps to same environment variable "${envKey}" as another provider.`);
+      throw new ArgumentError(`Provider ID "${id}" results in duplicate environment key "${envKey}".`);
     }
-
-    ids.add(id);
     envKeys.add(envKey);
   }
 }
 
 function readProvidersJson() {
-  const providersPath = path.join(USER_CONFIG_DIR, 'providers.json');
+  const providersPath = path.join(USER_CONFIG_DIR, PROVIDERS_FILENAME);
   if (!fs.existsSync(providersPath)) {
     throw new ConfigurationMissingException(`providers.json not found at ${providersPath}. Run 'ccb --x-init' first.`);
   }
   const data = JSON.parse(fs.readFileSync(providersPath, 'utf8'));
   const merged = ensureCompleteProviders(data);
-
-  // Auto-migrate v1 → v2 on first read
-  const format = detectFormat(data);
-  if (format === 'v1') {
-    writeProvidersJson(merged);
-  }
-
   validateIds(merged.providers);
   return merged;
 }
 
 function writeProvidersJson(data) {
-  const providersPath = path.join(USER_CONFIG_DIR, 'providers.json');
+  const providersPath = path.join(USER_CONFIG_DIR, PROVIDERS_FILENAME);
   fs.writeFileSync(providersPath, JSON.stringify(data, null, 2) + '\n', 'utf8');
 }
 
@@ -492,266 +141,136 @@ function handleRouteCommand() {
   const subcommand = process.argv[3];
   const args = process.argv.slice(4);
 
-  if (subcommand === 'add') return handleRouteAdd(args);
-  if (subcommand === 'remove') return handleRouteRemove(args);
-  if (subcommand === 'list') return handleRouteList();
-  if (subcommand === 'tree') return handleRouteTree();
-
-  process.stderr.write(`Usage:
-  ccb --x-route add model <name> <provider.model> [--fallback <provider.model>]
-  ccb --x-route add property <name> <provider.model> [--fallback <provider.model>]
-  ccb --x-route add payloadSize <threshold> <provider.model> [--operator gt|lt]
-  ccb --x-route remove <name>
-  ccb --x-route list
-  ccb --x-route tree
-`);
-  process.exit(1);
-}
-
-function handleRouteAdd(args) {
-  const routeType = args[0];
-  if (!routeType) {
-    process.stderr.write('Error: Route type required (model, property, or payloadSize)\n');
-    process.exit(1);
-  }
-
-  const data = readProvidersJson();
-
-  if (routeType === 'model') {
-    const name = args[1];
-    const targetDot = args[2];
-    if (!name || !targetDot) {
-      process.stderr.write('Usage: ccb --x-route add model <name> <provider.model> [--fallback <provider.model>]\n');
+  if (subcommand === 'add') {
+    const _type = args[0];
+    const key = args[1];
+    const target = args[2];
+    if (!_type || !key || !target) {
+      process.stderr.write('Usage: ccb --x-route add <model|property|payloadSize> <key> <target>\n');
       process.exit(1);
     }
-
-    // Validate target provider exists
-    try {
-      const parsed = parseTarget(targetDot);
-      if (!data.providers[parsed.providerId]) {
-        process.stderr.write(`Error: No provider "${parsed.providerId}"\n`);
-        process.exit(1);
-      }
-    } catch (e) {
-      process.stderr.write(`Error: ${e.message}\n`);
-      process.exit(1);
-    }
-
-    const fallbackIdx = args.indexOf('--fallback');
-    const fallback = fallbackIdx !== -1 && args[fallbackIdx + 1] ? [args[fallbackIdx + 1]] : undefined;
-
-    const result = addRouteModel(data, name, targetDot, fallback);
+    const data = readProvidersJson();
+    const result = addRouteModel(data, key, target);
     if (!result.isSuccess) {
       process.stderr.write(`Error: ${result.error.message}\n`);
       process.exit(1);
     }
-
-    writeProvidersJson(result.value);
-    console.log(`Added model route "${name}" → ${targetDot}${fallback ? ` (fallback: ${fallback[0]})` : ''}`);
+    const updatedData = result.value;
+    writeProvidersJson(updatedData);
+    console.log(`Added route: ${key} -> ${target}`);
     return;
   }
 
-  if (routeType === 'property') {
-    const propName = args[1];
-    const targetDot = args[2];
-    if (!propName || !targetDot) {
-      process.stderr.write('Usage: ccb --x-route add property <name> <provider.model>\n');
+  if (subcommand === 'remove') {
+    const key = args[0];
+    if (!key) {
+      process.stderr.write('Usage: ccb --x-route remove <key>\n');
       process.exit(1);
     }
-
-    try {
-      const parsed = parseTarget(targetDot);
-      if (!data.providers[parsed.providerId]) {
-        process.stderr.write(`Error: No provider "${parsed.providerId}"\n`);
-        process.exit(1);
-      }
-    } catch (e) {
-      process.stderr.write(`Error: ${e.message}\n`);
+    const data = readProvidersJson();
+    const result = removeRouteModel(data, key);
+    if (!result.isSuccess) {
+      process.stderr.write(`Error: ${result.error.message}\n`);
       process.exit(1);
     }
-
-    if (!data.routes) data.routes = { models: {}, properties: {}, payloadSize: {} };
-    if (!data.routes.properties) data.routes.properties = {};
-    data.routes.properties[propName] = targetDot;
-
-    writeProvidersJson(data);
-    console.log(`Added property route "${propName}" → ${targetDot}`);
+    const updatedData = result.value;
+    writeProvidersJson(updatedData);
+    console.log(`Removed route: ${key}`);
     return;
   }
 
-  if (routeType === 'payloadSize') {
-    const threshold = args[1];
-    const targetDot = args[2];
-    if (!threshold || !targetDot) {
-      process.stderr.write('Usage: ccb --x-route add payloadSize <threshold> <provider.model> [--operator gt|lt]\n');
-      process.exit(1);
+  if (subcommand === 'list') {
+    const data = readProvidersJson();
+    console.log('Routes:');
+    for (const [key, target] of Object.entries(data.routes.models)) {
+      console.log(`  ${key} -> ${target}`);
     }
-
-    try {
-      const parsed = parseTarget(targetDot);
-      if (!data.providers[parsed.providerId]) {
-        process.stderr.write(`Error: No provider "${parsed.providerId}"\n`);
-        process.exit(1);
-      }
-    } catch (e) {
-      process.stderr.write(`Error: ${e.message}\n`);
-      process.exit(1);
-    }
-
-    const operatorIdx = args.indexOf('--operator');
-    const operator = operatorIdx !== -1 && args[operatorIdx + 1] ? args[operatorIdx + 1] : '>';
-    const key = `${operator}${threshold}`;
-
-    if (!data.routes) data.routes = { models: {}, properties: {}, payloadSize: {} };
-    if (!data.routes.payloadSize) data.routes.payloadSize = {};
-    data.routes.payloadSize[key] = targetDot;
-
-    writeProvidersJson(data);
-    console.log(`Added payloadSize route "${key}" → ${targetDot}`);
     return;
   }
 
-  process.stderr.write(`Error: Unknown route type "${routeType}". Use model, property, or payloadSize.\n`);
+  if (subcommand === 'tree') {
+    const data = readProvidersJson();
+    console.log(formatTree(data));
+    return;
+  }
+
+  process.stderr.write('Usage: ccb --x-route <add|remove|list|tree>\n');
   process.exit(1);
 }
 
-function handleRouteRemove(args) {
-  const name = args[0];
-  if (!name) {
-    process.stderr.write('Usage: ccb --x-route remove <name>\n');
-    process.exit(1);
-  }
+function handleProviderCommand() {
+  const subcommand = process.argv[3];
+  const args = process.argv.slice(4);
 
-  const data = readProvidersJson();
-
-  // Try to remove from each route section
-  if (data.routes?.models?.[name] !== undefined) {
-    const result = removeRouteModel(data, name);
-    if (result.isSuccess) {
-      writeProvidersJson(result.value);
-      console.log(`Removed model route "${name}"`);
-      return;
+  if (subcommand === 'add') {
+    const id = args[0];
+    const url = args[1];
+    if (!id || !url) {
+      process.stderr.write('Usage: ccb --x-provider add <id> <url> [--non-compliant]\n');
+      process.exit(1);
     }
-  }
-  if (data.routes?.properties?.[name] !== undefined) {
-    const updated = JSON.parse(JSON.stringify(data));
-    delete updated.routes.properties[name];
-    writeProvidersJson(updated);
-    console.log(`Removed property route "${name}"`);
-    return;
-  }
-  if (data.routes?.payloadSize?.[name] !== undefined) {
-    const updated = JSON.parse(JSON.stringify(data));
-    delete updated.routes.payloadSize[name];
-    writeProvidersJson(updated);
-    console.log(`Removed payloadSize route "${name}"`);
+    const compliant = !args.includes('--non-compliant');
+    const data = readProvidersJson();
+    const result = addProvider(data.providers, id, url, compliant);
+    if (!result.isSuccess) {
+      process.stderr.write(`Error: ${result.error.message}\n`);
+      process.exit(1);
+    }
+    data.providers = result.value;
+    writeProvidersJson(data);
+    console.log(`Added provider: ${id} (${url}, ${compliant ? 'compliant' : 'non-compliant'})\n`);
     return;
   }
 
-  process.stderr.write(`Error: Route "${name}" not found\n`);
+  if (subcommand === 'remove') {
+    const id = args[0];
+    if (!id) {
+      process.stderr.write('Usage: ccb --x-provider remove <id>\n');
+      process.exit(1);
+    }
+    const data = readProvidersJson();
+    const result = removeProvider(data.providers, id);
+    if (!result.isSuccess) {
+      process.stderr.write(`Error: ${result.error.message}\n`);
+      process.exit(1);
+    }
+    data.providers = result.value;
+    writeProvidersJson(data);
+    console.log(`Removed provider: ${id}`);
+    return;
+  }
+
+  if (subcommand === 'list') {
+    const data = readProvidersJson();
+    console.log('Providers:');
+    for (const [id, cfg] of Object.entries(data.providers)) {
+      console.log(`  ${id} (${cfg.url})`);
+    }
+    return;
+  }
+
+  process.stderr.write('Usage: ccb --x-provider <add|remove|list>\n');
   process.exit(1);
-}
-
-function handleRouteList() {
-  const data = readProvidersJson();
-  const routes = data.routes ?? {};
-  let count = 0;
-
-  const models = routes.models ?? {};
-  for (const [name, value] of Object.entries(models)) {
-    const v = typeof value === 'string' ? value : `${value.target}${value.fallback ? ` [fallback: ${value.fallback.join(', ')}]` : ''}`;
-    console.log(`[model] ${name} → ${v}`);
-    count++;
-  }
-
-  const properties = routes.properties ?? {};
-  for (const [name, value] of Object.entries(properties)) {
-    const v = typeof value === 'string' ? value : value.target;
-    console.log(`[property] ${name} → ${v}`);
-    count++;
-  }
-
-  const payloadSizes = routes.payloadSize ?? {};
-  for (const [name, value] of Object.entries(payloadSizes)) {
-    const v = typeof value === 'string' ? value : value.target;
-    console.log(`[payloadSize] ${name} → ${v}`);
-    count++;
-  }
-
-  if (count === 0) console.log('(no routes)');
-}
-
-function handleRouteTree() {
-  const data = readProvidersJson();
-  console.log(formatTree(data));
-}
-
-function handleKeyPrune() {
-  const data = readProvidersJson();
-  const validEnvKeys = new Set(Object.keys(data.providers).map(id => providerIdToEnvKey(id)));
-
-  const envPath = path.join(USER_CONFIG_DIR, '.env');
-  if (!fs.existsSync(envPath)) {
-    console.log('No .env file found.');
-    return;
-  }
-
-  const removed = pruneEnvLines(envPath, ({ key }) => {
-    if (!key.endsWith('_KEY')) return false;
-    return !validEnvKeys.has(key.toUpperCase());
-  });
-
-  if (removed.length === 0) {
-    console.log('No orphaned keys found.');
-    return;
-  }
-
-  console.log(`Pruned ${removed.length} orphaned key(s) from .env: ${removed.join(', ')}`);
-}
-
-function updateEnvFile(key, value) {
-  const envPath = path.join(USER_CONFIG_DIR, '.env');
-  const content = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
-
-  const lines = content.split('\n');
-  let found = false;
-  const newLines = lines.map((line) => {
-    const trimmed = line.trim();
-    if (trimmed.startsWith(`${key}=`) || trimmed.startsWith(`# ${key}=`)) {
-      found = true;
-      return `${key}=${value}`;
-    }
-    return line;
-  });
-
-  if (!found) {
-    newLines.push(`${key}=${value}`);
-  }
-
-  fs.writeFileSync(envPath, newLines.join('\n').trim() + '\n', 'utf8');
-  if (process.platform !== 'win32') {
-    try { fs.chmodSync(envPath, 0o600); } catch { /* best effort */ }
-  }
 }
 
 function handleKeySet(args) {
   const providerId = args[0];
   const apiKey = args[1];
-  if (!providerId || apiKey === undefined) {
+  if (!providerId || !apiKey) {
     process.stderr.write('Usage: ccb --x-key set <provider-id> <api-key>\n');
     process.exit(1);
   }
 
   const data = readProvidersJson();
-  const key = findProviderKey(data.providers, providerId);
-  if (key === null) {
+  const key = findProviderKey(data, providerId);
+  if (!key) {
     process.stderr.write(`Error: No provider matching "${providerId}"\n`);
     process.exit(1);
   }
 
   const envVar = providerIdToEnvKey(key);
-  updateEnvKey(path.join(USER_CONFIG_DIR, '.env'), envVar, apiKey);
-  console.log(`Updated environment variable ${envVar} in .env for provider "${key}"`);
+  updateEnvKey(path.join(USER_CONFIG_DIR, ENV_FILENAME), envVar, apiKey);
+  console.log(`Updated environment variable ${envVar} in ${ENV_FILENAME} for provider "${key}"`);
 }
 
 function handleKeyRemove(args) {
@@ -762,76 +281,365 @@ function handleKeyRemove(args) {
   }
 
   const data = readProvidersJson();
-  const key = findProviderKey(data.providers, providerId);
-  if (key === null) {
+  const key = findProviderKey(data, providerId);
+  if (!key) {
     process.stderr.write(`Error: No provider matching "${providerId}"\n`);
     process.exit(1);
   }
 
   const envVar = providerIdToEnvKey(key);
-  updateEnvKey(path.join(USER_CONFIG_DIR, '.env'), envVar, '');
-  console.log(`Cleared environment variable ${envVar} in .env for provider "${key}"`);
+  updateEnvKey(path.join(USER_CONFIG_DIR, ENV_FILENAME), envVar, '');
+  console.log(`Cleared environment variable ${envVar} in ${ENV_FILENAME} for provider "${key}"`);
 }
 
 function handleKeyList(args) {
   const reveal = args.includes('--reveal');
+  const env = loadEnv(path.join(USER_CONFIG_DIR, ENV_FILENAME));
+  const providers = readProvidersJson().providers;
+
+  console.log('Provider API Keys:');
+  for (const id of Object.keys(providers)) {
+    const envKey = providerIdToEnvKey(id);
+    const val = env[envKey] || '';
+    const display = val ? (reveal ? val : obfuscateKey(val)) : '(not set)';
+    console.log(`  [${id}] ${envKey}=${display}`);
+  }
+}
+
+function handleKeyPrune() {
   const data = readProvidersJson();
-  const keys = Object.keys(data.providers);
-  if (keys.length === 0) {
-    console.log('No providers configured.');
+  const validEnvKeys = new Set(Object.keys(data.providers).map(id => providerIdToEnvKey(id)));
+
+  const envPath = path.join(USER_CONFIG_DIR, ENV_FILENAME);
+  if (!fs.existsSync(envPath)) {
+    console.log('No .env file found.');
     return;
   }
-  for (const id of keys) {
-    const cfg = data.providers[id];
-    const envVar = providerIdToEnvKey(id);
-    const val = process.env[envVar] || '';
-    const keyDisplay = reveal ? (val || '(none)') : obfuscateKey(val);
-    console.log(`[${id}] ${cfg.url}  ${keyDisplay} (env: ${envVar})`);
+
+  const result = pruneEnvLines(envPath, validEnvKeys);
+  if (!result.isSuccess) {
+    process.stderr.write(`Error: ${result.error.message}\n`);
+    process.exit(1);
   }
+
+  const removed = result.value;
+  if (removed.length === 0) {
+    console.log('No orphaned keys to prune.');
+    return;
+  }
+
+  console.log(`Pruned ${removed.length} orphaned key(s) from ${ENV_FILENAME}: ${removed.join(', ')}`);
 }
 
 function handleKeyCommand() {
   const subcommand = process.argv[3];
   const args = process.argv.slice(4);
 
-  if (subcommand === 'set') return handleKeySet(args);
-  if (subcommand === 'remove') return handleKeyRemove(args);
-  if (subcommand === 'list') return handleKeyList(args);
-  if (subcommand === 'prune') return handleKeyPrune();
+  if (subcommand === 'set') {
+    handleKeySet(args);
+    return;
+  }
 
-  process.stderr.write(`Usage:
-  ccb --x-key set <provider-id> <api-key>       Set API key for a provider
-  ccb --x-key remove <provider-id>              Remove API key from a provider
-  ccb --x-key list [--reveal]                    List API keys for all providers
-  ccb --x-key prune                             Remove orphaned keys from .env
-`);
+  if (subcommand === 'remove') {
+    handleKeyRemove(args);
+    return;
+  }
+
+  if (subcommand === 'list') {
+    handleKeyList(args);
+    return;
+  }
+
+  if (subcommand === 'prune') {
+    handleKeyPrune();
+    return;
+  }
+
+  process.stderr.write('Usage: ccb --x-key <set|remove|list|prune>\n');
   process.exit(1);
 }
 
+function clearLogs() {
+  const logsDir = path.join(USER_CONFIG_DIR, LOGS_DIR_NAME);
+  if (!fs.existsSync(logsDir)) return;
+  const files = fs.readdirSync(logsDir);
+  let removed = 0;
+  for (const f of files) {
+    try {
+      fs.unlinkSync(path.join(logsDir, f));
+      removed++;
+    } catch (e) {
+      process.stderr.write(`Warning: Could not delete ${f}: ${e.message}\n`);
+    }
+  }
+  console.log(`Cleared ${removed} log file(s) from ${LOGS_DIR_NAME}`);
+}
+
+async function connectToControlIpc() {
+  const ipcPath = getControlIpcPath();
+  return new Promise((resolve) => {
+    const socket = net.connect(ipcPath, () => {
+      resolve(socket);
+    });
+    socket.on('error', () => {
+      resolve(null);
+    });
+  });
+}
+
+async function handleStatusCommand() {
+  const socket = await connectToControlIpc();
+  if (!socket) {
+    process.stderr.write('ccb: No running proxy daemon found.\n');
+    process.exit(1);
+  }
+
+  socket.write(serializeIpcMessage({ cmd: 'status' }));
+
+  let buffer = '';
+  socket.on('data', (data) => {
+    buffer += data.toString();
+    const lines = buffer.split('\n');
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const response = parseIpcMessage(line);
+      if (response) {
+        process.stdout.write(`Status: ${response.status}\n`);
+        process.stdout.write(`Worker PID: ${response.workerPid}\n`);
+        process.stdout.write(`Uptime: ${Math.round(response.uptimeMs / 1000)}s\n`);
+        process.stdout.write(`Active Keepalives: ${response.keepalives}\n`);
+        socket.end();
+        process.exit(0);
+      }
+    }
+  });
+
+  socket.on('error', (err) => {
+    process.stderr.write(`ccb: IPC error: ${err.message}\n`);
+    process.exit(1);
+  });
+
+  setTimeout(() => {
+    process.stderr.write('ccb: Status request timed out\n');
+    socket.destroy();
+    process.exit(1);
+  }, 5000);
+}
+
+const CCB_CMDS = {
+  '--x-init': () => {
+    init();
+    process.exit(0);
+  },
+  '--x-status': () => {
+    handleStatusCommand();
+  },
+  '--x-killall': async () => {
+    await runKill();
+    process.exit(0);
+  },
+  '--x-restart': async () => {
+    const socket = await connectToControlIpc();
+    if (!socket) {
+      process.stderr.write('ccb: No proxy daemon running.\n');
+      process.exit(1);
+    }
+    socket.write(serializeIpcMessage({ cmd: 'restart' }));
+    socket.on('data', (data) => {
+      const msg = parseIpcMessage(data.toString());
+      if (msg?.status === 'ok') {
+        console.log('Restart signal sent to daemon.');
+        process.exit(0);
+      }
+    });
+  },
+  '--x-clearlogs': () => {
+    clearLogs();
+    process.exit(0);
+  },
+  '--x-provider': () => {
+    handleProviderCommand();
+  },
+  '--x-route': () => {
+    handleRouteCommand();
+  },
+  '--x-key': () => {
+    handleKeyCommand();
+  },
+  '--x-version': () => {
+    const pkgRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+    const pkg = JSON.parse(fs.readFileSync(path.join(pkgRoot, 'package.json'), 'utf8'));
+    process.stdout.write(`ccb version ${pkg.version}\n`);
+    process.exit(0);
+  },
+  '--x-help': () => {
+    process.stdout.write(`
+CCB (Claude Code Bridge) Management Commands:
+  --x-version       Print the ccb version
+  --x-init          Initialize the config directory (~/.claude/.ccb)
+  --x-status        Show current daemon and worker status
+  --x-killall       Kill all background proxy processes
+  --x-restart       Gracefully restart the proxy daemon (zero-downtime)
+  --x-clearlogs     Delete all log files in the logs directory
+  --x-provider ...  Manage providers (add/remove)
+  --x-route ...     Manage routing rules (model/property/payloadSize)
+  --x-key ...       Manage API keys (.env)
+`);
+    process.exit(0);
+  }
+};
+
+function checkProxy(port) {
+  return new Promise((resolve) => {
+    const req = http.get(`http://localhost:${port}/v1/models`, { timeout: 500 }, (res) => {
+      resolve(res.statusCode === 200);
+    });
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+  });
+}
+
+function startProxyDaemonProcess() {
+  const logsDir = path.join(USER_CONFIG_DIR, LOGS_DIR_NAME);
+  if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
+
+  const out = fs.openSync(path.join(logsDir, 'daemon.log'), 'a');
+  const err = fs.openSync(path.join(logsDir, 'daemon.err'), 'a');
+
+  const watchdogPath = path.join(path.dirname(fileURLToPath(import.meta.url)), WATCHDOG_SCRIPT_NAME);
+
+  const child = spawnDaemon(watchdogPath, [], {
+    detached: true,
+    stdio: ['ignore', out, err],
+    env: { ...process.env, [PROXY_FLAG]: '1' }
+  });
+
+  child.unref();
+}
+
+async function ensureDaemon(config) {
+  const isUp = await checkProxy(config.port);
+  if (!isUp) {
+    startProxyDaemonProcess();
+    let attempts = 0;
+    const MAX_ATTEMPTS = 10;
+    const POLL_INTERVAL_MS = 300;
+    while (attempts < MAX_ATTEMPTS) {
+      await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+      if (await checkProxy(config.port)) return;
+      attempts++;
+    }
+    throw new ReadinessTimeoutException('Proxy daemon failed to start within timeout limit');
+  }
+}
+
+/**
+ * Parse a Windows .cmd npm wrapper to extract the real executable path.
+ * npm wrappers look like: "<dp0>\node_modules\...\claude.exe"  %*
+ * Returns the resolved absolute path, or null if parsing fails.
+ */
+function parseCmdWrapper(cmdPath) {
+  try {
+    const content = fs.readFileSync(cmdPath, 'utf8');
+    // Match the quoted exe path on the exec line, e.g.: "%dp0%\...\claude.exe"
+    const match = content.match(/"%dp0%\\([^"]+)"|"([^"]+\.exe)"/);
+    if (!match) return null;
+    const relativePart = match[1] || match[2];
+    if (!relativePart) return null;
+    // dp0 is the directory of the .cmd file itself
+    const dp0 = path.dirname(cmdPath);
+    const resolved = path.resolve(dp0, relativePart);
+    return fs.existsSync(resolved) ? resolved : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the real claude binary path on Windows, bypassing .cmd shell wrappers.
+ * Falls back to the bare 'claude' string (for non-Windows or if resolution fails).
+ */
+function resolveClaudeBin() {
+  if (process.platform !== 'win32') return 'claude';
+  try {
+    const result = _spawnSync('where.exe', ['claude'], { encoding: 'utf8', windowsHide: true });
+    const candidates = (result.stdout || '').split('\n').map(l => l.trim()).filter(Boolean);
+    for (const candidate of candidates) {
+      if (candidate.endsWith('.cmd')) {
+        const resolved = parseCmdWrapper(candidate);
+        if (resolved) return resolved;
+        continue;
+      }
+      if (candidate.endsWith('.exe') && fs.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+  } catch { }
+  return 'claude';
+}
+
 async function entry() {
-  Object.assign(process.env, loadEnv(path.join(USER_CONFIG_DIR, '.env')));
+  const envPath = path.join(USER_CONFIG_DIR, ENV_FILENAME);
+  if (fs.existsSync(envPath)) {
+    Object.assign(process.env, loadEnv(envPath));
+  }
 
   if (process.argv.includes(PROXY_FLAG)) {
     runProxyDaemon();
     return;
   }
 
-  if (process.argv[2] === '--x-route') return handleRouteCommand();
-  if (process.argv[2] === '--x-provider') return handleProviderCommand();
-  if (process.argv[2] === '--x-key') return handleKeyCommand();
+  for (const cmd of Object.keys(CCB_CMDS)) {
+    if (process.argv.includes(cmd)) {
+      CCB_CMDS[cmd]();
+      return;
+    }
+  }
 
-  const cmd = CCB_CMDS[process.argv[2]];
-  if (cmd) return cmd();
+  const config = loadConfigFromFile(USER_CONFIG_DIR);
+  await ensureDaemon(config);
 
-  await main();
+  const ipcPath = getControlIpcPath();
+  const socket = net.connect(ipcPath, () => {
+    socket.write(serializeIpcMessage({ cmd: 'keepalive' }));
+  });
+  socket.on('error', () => {});
+
+  const args = process.argv.slice(2);
+  const baseUrl = `http://localhost:${config.port}`;
+  
+  const claudeBin = resolveClaudeBin();
+  const child = spawnCommand(claudeBin, args, {
+    stdio: 'inherit',
+    env: { ...process.env, ANTHROPIC_BASE_URL: baseUrl }
+  });
+
+  child.on('exit', (code) => {
+    socket.destroy();
+    process.exit(code ?? 0);
+  });
 }
 
 function handleError(err) {
-  process.stderr.write(`ccb error: ${err.name} - ${err.message}\n`);
+  if (err instanceof ReadinessTimeoutException) {
+    process.stderr.write(`ccb error: ${err.message}\n`);
+    process.exit(1);
+  }
+
+  if (err instanceof ConfigurationMissingException) {
+    process.stderr.write(`ccb error: ${err.message}\n`);
+    process.exit(1);
+  }
+
+  if (err instanceof ConfigError) {
+    process.stderr.write(`ccb config error: ${err.message}\n`);
+    process.exit(1);
+  }
+
+  process.stderr.write(`ccb unexpected error: ${err.stack || err}\n`);
   process.exit(1);
 }
 
-// Only run when executed directly, not when imported (e.g. by test.js)
 if (process.argv[1]) {
   const metaPath = fs.realpathSync(fileURLToPath(import.meta.url));
   const argPath = fs.realpathSync(path.resolve(process.argv[1]));

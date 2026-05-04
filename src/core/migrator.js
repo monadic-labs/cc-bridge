@@ -102,7 +102,7 @@ export function ensureCompleteProviders(existingRaw) {
   }
 
   if (merged.providers && typeof merged.providers === 'object' && !Array.isArray(merged.providers)) {
-    for (const [id, cfg] of Object.entries(merged.providers)) {
+    for (const [_id, cfg] of Object.entries(merged.providers)) {
       deepMerge(cfg, DEFAULT_PROVIDER_ENTRY);
     }
   }

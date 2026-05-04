@@ -66,7 +66,7 @@ export async function handleRequestEnd({ ctx, chunks, deps }) {
       });
     }
 
-    forwardToUpstream(activeCtx);
+    forwardToUpstream(activeCtx, logger, getConfig, extensions);
     return;
   }
 
@@ -123,5 +123,5 @@ export async function handleRequestEnd({ ctx, chunks, deps }) {
     return;
   }
 
-  forwardToUpstream(activeCtx);
+  forwardToUpstream(activeCtx, logger, getConfig, extensions);
 }

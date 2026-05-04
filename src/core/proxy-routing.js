@@ -23,17 +23,19 @@ export async function resolveRouting({ policy, body, urlSessionId, routedHeaders
 
   const evalOpt = policy.evaluateWithRule(body);
 
-  // No rule matched — try extension-based resolution (e.g. dot-notation models)
+  // No rule matched — try extension-based resolution (e.g. dot-notation models or aliases)
   if (evalOpt.isNone) {
-    if (extensions && extensions.hasUnmatchedResolver && typeof body.model === 'string' && body.model.includes('.')) {
-      const extResult = await extensions.resolveUnmatched({ modelName: body.model, policy });
-      if (extResult) {
-        const match = new ProviderMatch(extResult.provider, `direct:${extResult.providerId}→${extResult.model}`, extResult.model);
-        const routing = applyRoutingWithMatch(body, Option.some(match), anthropicBaseUrl, extensions);
-        const envVar = providerIdToEnvKey(match.provider.id);
+    if (extensions && extensions.hasUnmatchedResolver && typeof body.model === 'string') {
+      const _extResult = await extensions.resolveUnmatched({ modelName: body.model, policy });
+      if (_extResult) {
+        const _match = new ProviderMatch(_extResult.provider, `direct:${_extResult.providerId}→${_extResult.model}`, _extResult.model);
+
+        const _routing = applyRoutingWithMatch(body, Option.some(_match), anthropicBaseUrl, extensions);
+
+        const envVar = providerIdToEnvKey(_match.provider.id);
         const apiKey = process.env[envVar] ?? '';
-        const finalHeaders = applyAuthHeaders({ headers: routedHeaders, match, apiKey, openaiProviders });
-        return { reqModel, sessionId, routing, routedHeaders: finalHeaders, match, matchedRule: null };
+        const _finalHeaders = applyAuthHeaders({ headers: routedHeaders, match: _match, apiKey, openaiProviders });
+        return { reqModel, sessionId, routing: _routing, routedHeaders: _finalHeaders, match: _match, matchedRule: null };
       }
     }
 
@@ -91,7 +93,7 @@ export async function resolveRouting({ policy, body, urlSessionId, routedHeaders
  * @returns {Promise<ProxyRequestContext>} Context with routing applied
  */
 export async function processRequestBody({ ctx, body, policy, extensions, anthropicBaseUrl, logger, getConfig, openaiProviders }) {
-  const { reqModel, sessionId, routing, routedHeaders, matchedRule, match } = resolveRouting({
+  const { reqModel, sessionId, routing, routedHeaders, matchedRule, match } = await resolveRouting({
     policy,
     body,
     urlSessionId: ctx.urlSessionId,
@@ -100,6 +102,10 @@ export async function processRequestBody({ ctx, body, policy, extensions, anthro
     extensions,
     openaiProviders
   });
+
+  if (!routing) {
+    throw new Error('Routing resolution failed: no routing result returned');
+  }
 
   const requestInfo = new RequestInfo({
     id: ctx.id,

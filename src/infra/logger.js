@@ -2,7 +2,6 @@ import fs from 'fs';
 import path from 'path';
 import { redactHeaders } from '../core/headers.js';
 import { parseSseMetadata } from '../core/sse-parser.js';
-import { RequestSummary } from '../core/types.js';
 import { decompress } from '../core/compression.js';
 
 export class Logger {
