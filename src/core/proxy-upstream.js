@@ -145,7 +145,7 @@ function singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, getConfig
     }
 
     if (!ctx.res.headersSent) {
-      buildErrorResponse(ctx.res, new UpstreamError(`Upstream connection failed: ${err.message}`, { code: err.code }));
+      buildErrorResponse(ctx.res, new UpstreamError(`Upstream connection failed: ${err.message}`, { code: err.code }), ctx.startTime);
     }
   });
 
@@ -295,11 +295,17 @@ function streamBufferedError(reqCtx, proxyRes, chunks, _handleResponseEnd, _head
   reqCtx.res.end();
 }
 
-function buildErrorResponse(res, error) {
+function buildErrorResponse(res, error, startTime) {
   if (res.headersSent) return;
+  const elapsedMs = startTime ? Date.now() - startTime : null;
   const payload = JSON.stringify({
     type: 'error',
-    error: { type: 'upstream_error', message: error.message, code: error.code }
+    error: {
+      type: 'upstream_error',
+      message: error.message,
+      code: error.code,
+      ...(elapsedMs !== null && { ccb_response_time_ms: elapsedMs })
+    }
   });
   res.writeHead(400, {
     'content-type': 'application/json',
