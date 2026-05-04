@@ -15,16 +15,19 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_SCRIPT = path.join(__dirname, '..', 'src', 'proxy.js');
 
 let activeWorker = null;
-let drainingWorker = null;
-let startTime = Date.now();
-let keepaliveConnections = new Set();
 let sharedServer = null;
 let shuttingDown = false;
 let shutdownTimer = null;
 let restartInProgress = false;
 
-// Track all workers (for multi-version support in Phase 2)
-const allWorkers = new Map(); // pid -> { pid, version, startTime, keepalives: Set }
+const startTime = Date.now();
+
+// Keepalive sockets — each is associated with the active worker at connect time
+const keepaliveConnections = new Set();
+const socketWorkerMap = new Map(); // socket -> worker child process
+
+// Draining workers — old versions kept alive per workerKeepaliveS policy
+const drainingWorkers = new Map(); // child -> { keepaliveCount, lastKeepaliveAt, timer }
 
 const _configDir = process.env.CCB_CONFIG_DIR || path.join(os.homedir(), '.claude', CCB_DIR_NAME);
 
@@ -32,11 +35,14 @@ function log(msg) {
   process.stdout.write(`[watchdog] ${msg}\n`);
 }
 
+function getConfig() {
+  return loadConfigFromFile(_configDir);
+}
+
 function spawnWorker() {
   log('Spawning new worker...');
-  const config = loadConfigFromFile(_configDir);
+  const config = getConfig();
 
-  // Create shared server if not exists (watchdog owns the listening socket)
   if (!sharedServer) {
     sharedServer = http.createServer();
     sharedServer.listen(config.port, () => {
@@ -54,7 +60,6 @@ function spawnWorker() {
     env: { ...process.env, CCB_DAEMON_WORKER: '1' }
   });
 
-  // Init timeout
   const initTimeout = setTimeout(() => {
     log(`Worker initialization timeout (${config.workerInitTimeoutMs}ms) exceeded, killing hung worker`);
     child.kill('SIGKILL');
@@ -69,9 +74,26 @@ function spawnWorker() {
       restartInProgress = false;
       log(`Worker ready (PID ${workerMsg.pid}, ${workerMsg.routes} routes, ${workerMsg.extensions} extensions)`);
 
-      if (drainingWorker) {
-        log(`Sending drain signal to old worker (PID ${drainingWorker.pid})`);
-        drainingWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
+      // Drain old workers only after new worker is confirmed ready
+      if (drainingWorkers.size > 0) {
+        const keepaliveS = config.workerKeepaliveS;
+        for (const [oldWorker, state] of drainingWorkers) {
+          if (keepaliveS === -1) {
+            log(`Old worker (PID ${oldWorker.pid}) kept alive indefinitely (workerKeepaliveS=-1)`);
+            continue;
+          }
+          if (keepaliveS === 0 && state.keepaliveCount === 0) {
+            log(`Draining old worker (PID ${oldWorker.pid}) — no keepalives, policy=0`);
+            oldWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
+            continue;
+          }
+          if (keepaliveS > 0 && state.keepaliveCount === 0) {
+            log(`Old worker (PID ${oldWorker.pid}) — no keepalives, starting ${keepaliveS}s grace period`);
+            startDrainGraceTimer(oldWorker, keepaliveS);
+            continue;
+          }
+          log(`Old worker (PID ${oldWorker.pid}) has ${state.keepaliveCount} keepalive(s), waiting for natural close`);
+        }
       }
     }
 
@@ -85,9 +107,11 @@ function spawnWorker() {
     clearTimeout(initTimeout);
     log(`Worker (PID ${child.pid}) exited with code ${code} and signal ${signal}`);
 
-    if (child === drainingWorker) {
-      log('Draining worker exited');
-      drainingWorker = null;
+    if (drainingWorkers.has(child)) {
+      const state = drainingWorkers.get(child);
+      if (state.timer) clearTimeout(state.timer);
+      drainingWorkers.delete(child);
+      log(`Draining worker (PID ${child.pid}) removed`);
       return;
     }
 
@@ -97,11 +121,31 @@ function spawnWorker() {
     }
   });
 
-  // Pass the listening socket handle to the worker
   const handle = sharedServer._handle;
   child.send({ type: 'socket', port: config.port }, handle);
 
   return child;
+}
+
+function startDrainGraceTimer(worker, keepaliveS) {
+  const state = drainingWorkers.get(worker);
+  if (!state) return;
+
+  if (state.timer) clearTimeout(state.timer);
+  state.timer = setTimeout(() => {
+    const config = getConfig();
+    log(`Grace period (${keepaliveS}s) expired for worker (PID ${worker.pid}), sending drain`);
+    worker.send({ type: 'drain', timeout: config.drainTimeoutMs });
+    state.timer = null;
+  }, keepaliveS * 1000);
+}
+
+function countKeepalivesFor(worker) {
+  let count = 0;
+  for (const w of socketWorkerMap.values()) {
+    if (w === worker) count++;
+  }
+  return count;
 }
 
 function handleControlConnection(socket) {
@@ -117,6 +161,9 @@ function handleControlConnection(socket) {
 
       if (cmd.cmd === 'keepalive') {
         keepaliveConnections.add(socket);
+        if (activeWorker) {
+          socketWorkerMap.set(socket, activeWorker);
+        }
         if (shutdownTimer) {
           clearTimeout(shutdownTimer);
           shutdownTimer = null;
@@ -132,27 +179,32 @@ function handleControlConnection(socket) {
           status: 'ok',
           workerPid: activeWorker ? activeWorker.pid : null,
           uptimeMs: Date.now() - startTime,
-          keepalives: keepaliveConnections.size
+          keepalives: keepaliveConnections.size,
+          drainingWorkers: drainingWorkers.size
         }));
         return;
       }
 
       if (cmd.cmd === 'sessions') {
         const workers = [];
+        const config = getConfig();
         if (activeWorker) {
           workers.push({
             pid: activeWorker.pid,
             version: CCB_VERSION,
             uptimeMs: Date.now() - startTime,
-            keepalives: keepaliveConnections.size
+            keepalives: countKeepalivesFor(activeWorker),
+            status: 'active'
           });
         }
-        if (drainingWorker) {
+        for (const [worker, state] of drainingWorkers) {
           workers.push({
-            pid: drainingWorker.pid,
+            pid: worker.pid,
             version: CCB_VERSION,
             uptimeMs: Date.now() - startTime,
-            keepalives: 0
+            keepalives: countKeepalivesFor(worker),
+            status: 'draining',
+            policy: config.workerKeepaliveS === -1 ? 'indefinite' : config.workerKeepaliveS === 0 ? 'last-keepalive' : `${config.workerKeepaliveS}s-grace`
           });
         }
         socket.write(serializeIpcMessage({
@@ -172,7 +224,14 @@ function handleControlConnection(socket) {
         log('Restart requested via IPC');
 
         if (activeWorker) {
-          drainingWorker = activeWorker;
+          const oldWorker = activeWorker;
+          const oldKeepalives = countKeepalivesFor(oldWorker);
+          drainingWorkers.set(oldWorker, {
+            keepaliveCount: oldKeepalives,
+            lastKeepaliveAt: Date.now(),
+            timer: null
+          });
+          log(`Moved active worker (PID ${oldWorker.pid}) to draining (${oldKeepalives} keepalives)`);
         }
         activeWorker = spawnWorker();
         socket.write(serializeIpcMessage({ status: 'ok', cmd: 'restart' }));
@@ -182,9 +241,12 @@ function handleControlConnection(socket) {
       if (cmd.cmd === 'shutdown') {
         log('Shutdown requested via IPC');
         shuttingDown = true;
-        const config = loadConfigFromFile(_configDir);
+        const config = getConfig();
         if (activeWorker) {
           activeWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
+        }
+        for (const [worker] of drainingWorkers) {
+          worker.send({ type: 'drain', timeout: config.drainTimeoutMs });
         }
         socket.write(serializeIpcMessage({ status: 'ok', cmd: 'shutdown' }));
         setTimeout(() => process.exit(0), config.drainTimeoutMs + 1000);
@@ -194,22 +256,49 @@ function handleControlConnection(socket) {
   });
 
   socket.on('close', () => {
+    const assignedWorker = socketWorkerMap.get(socket);
+    socketWorkerMap.delete(socket);
     keepaliveConnections.delete(socket);
-    if (keepaliveConnections.size === 0 && !shuttingDown) {
-      shuttingDown = true;
-      log('All keepalive connections closed, shutting down');
-      const config = loadConfigFromFile(_configDir);
-      if (activeWorker) {
-        activeWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
+
+    // Update draining worker keepalive counts
+    if (assignedWorker && drainingWorkers.has(assignedWorker)) {
+      const state = drainingWorkers.get(assignedWorker);
+      state.keepaliveCount = countKeepalivesFor(assignedWorker);
+      state.lastKeepaliveAt = Date.now();
+
+      const config = getConfig();
+      const keepaliveS = config.workerKeepaliveS;
+
+      if (state.keepaliveCount === 0 && keepaliveS === 0) {
+        log(`Last keepalive closed for draining worker (PID ${assignedWorker.pid}), sending drain`);
+        assignedWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
       }
-      shutdownTimer = setTimeout(() => {
-        shutdownTimer = null;
-        process.exit(0);
-      }, config.drainTimeoutMs + 1000);
+      if (state.keepaliveCount === 0 && keepaliveS > 0 && !state.timer) {
+        log(`Last keepalive closed for draining worker (PID ${assignedWorker.pid}), starting ${keepaliveS}s grace`);
+        startDrainGraceTimer(assignedWorker, keepaliveS);
+      }
+    }
+
+    // Newest worker: always shut down when last keepalive closes
+    if (assignedWorker === activeWorker && keepaliveConnections.size === 0 && !shuttingDown) {
+      const activeKeepalives = countKeepalivesFor(activeWorker);
+      if (activeKeepalives === 0) {
+        shuttingDown = true;
+        log('All keepalive connections closed for active worker, shutting down');
+        const config = getConfig();
+        if (activeWorker) {
+          activeWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
+        }
+        shutdownTimer = setTimeout(() => {
+          shutdownTimer = null;
+          process.exit(0);
+        }, config.drainTimeoutMs + 1000);
+      }
     }
   });
 
   socket.on('error', () => {
+    socketWorkerMap.delete(socket);
     keepaliveConnections.delete(socket);
   });
 }
@@ -231,9 +320,12 @@ controlServer.on('error', (err) => {
 process.on('SIGINT', () => {
   shuttingDown = true;
   log('SIGINT received, shutting down');
-  const config = loadConfigFromFile(_configDir);
+  const config = getConfig();
   if (activeWorker) {
     activeWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
+  }
+  for (const [worker] of drainingWorkers) {
+    worker.send({ type: 'drain', timeout: config.drainTimeoutMs });
   }
   setTimeout(() => process.exit(0), config.drainTimeoutMs + 1000);
 });

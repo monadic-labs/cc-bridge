@@ -16,6 +16,7 @@ export const DEFAULT_RAW_CONFIG = {
     upstreamTimeoutMs: 600000,
     workerInitTimeoutMs: 20000,
     drainTimeoutMs: 600000,
+    workerKeepaliveS: -1,
     retry: {
       maxAttempts: 2,
       baseDelayMs: 500,
