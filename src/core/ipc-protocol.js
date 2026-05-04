@@ -1,5 +1,5 @@
 const VALID_WORKER_TYPES = Object.freeze(['ready', 'error']);
-const VALID_COMMANDS = Object.freeze(['restart', 'status', 'shutdown', 'keepalive']);
+const VALID_COMMANDS = Object.freeze(['restart', 'status', 'shutdown', 'keepalive', 'sessions']);
 
 export function serializeIpcMessage(obj) {
   return JSON.stringify(obj) + '\n';
