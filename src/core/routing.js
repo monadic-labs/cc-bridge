@@ -1,6 +1,6 @@
 import { ANTHROPIC_HOST } from './headers.js';
 import { RoutingResult, Option } from './types.js';
-import { getModel, getMessages } from './api-adapter.js';
+import { getModel, getMessages as _getMessages } from './api-adapter.js';
 
 /**
  * Route to Anthropic's API directly (no custom provider match).
@@ -69,7 +69,8 @@ export function applyAuthHeaders({ headers, match, apiKey = '', openaiProviders 
   if (provider.id && apiKey) {
     if (isOpenai) {
       updated['authorization'] = `Bearer ${apiKey}`;
-    } else {
+    }
+    if (!isOpenai) {
       updated['x-api-key'] = apiKey;
     }
   }

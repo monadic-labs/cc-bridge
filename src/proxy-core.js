@@ -2,6 +2,11 @@ import fs from 'fs';
 import path from 'path';
 import http from 'http';
 import { fileURLToPath } from 'url';
+import {
+  LOGS_DIR_NAME,
+  PROVIDERS_FILENAME,
+  ENV_FILENAME
+} from './core/constants.js';
 import { loadConfigFromFile } from './core/config.js';
 import { ensureCompleteProviders } from './core/migrator.js';
 import { ProvidersMap, ProviderConfig } from './core/providers.js';
@@ -20,8 +25,6 @@ import { runKill } from './infra/process-manager.js';
 import { detectFormat, convertV2ToInternal } from './core/config-adapter.js';
 import { ExtensionRegistry } from './core/extension-registry.js';
 import { discoverExtensions, buildRegistry, watchExtensions } from './core/extension-loader.js';
-import { serializeIpcMessage } from './core/ipc-protocol.js';
-
 export { runKill };
 export { loadEnv };
 
@@ -55,18 +58,6 @@ class ProxyState {
 
 /**
  * Extract cc-bridge's own session ID from a URL path prefix.
- *
- * `bin/ccb.js` embeds the session ID in ANTHROPIC_BASE_URL as
- * `http://localhost:{port}/s/{ownSessionId}`, so the CLI sends requests
- * to `/s/{ownSessionId}/v1/messages`. This function strips the prefix and
- * returns both the ID and the real downstream path.
- *
- * If the URL does not match the prefix pattern the session ID is '' and the
- * URL is returned unchanged — this preserves behaviour for callers that
- * bypass ccb (e.g. curl tests, old daemons).
- *
- * @param {string} url - The raw request URL from Node.js `req.url`.
- * @returns {{ sessionId: string, strippedUrl: string }}
  */
 export function extractUrlSession(url) {
   if (!url) return { sessionId: '', strippedUrl: '/' };
@@ -105,15 +96,14 @@ function tryParseProviders(data, filepath) {
   }
 }
 
-
 function buildErrorResponse(res, error) {
   if (res.headersSent) return;
   const payload = typeof error.toResponsePayload === 'function'
     ? error.toResponsePayload()
     : JSON.stringify({
-        type: 'error',
-        error: { type: 'invalid_request_error', message: error.message || String(error) }
-      });
+      type: 'error',
+      error: { type: 'invalid_request_error', message: error.message || String(error) }
+    });
   res.writeHead(400, {
     'content-type': 'application/json',
     'content-length': Buffer.byteLength(payload),
@@ -123,10 +113,10 @@ function buildErrorResponse(res, error) {
 }
 
 export function createProxyCore({ configDir, port }) {
-  const logsDir = path.join(configDir, 'logs');
-  const providersPath = path.join(configDir, 'providers.json');
+  const logsDir = path.join(configDir, LOGS_DIR_NAME);
+  const providersPath = path.join(configDir, PROVIDERS_FILENAME);
 
-  Object.assign(process.env, loadEnv(path.join(configDir, '.env')));
+  Object.assign(process.env, loadEnv(path.join(configDir, ENV_FILENAME)));
 
   const cachedConfig = loadConfigFromFile(configDir);
   const logger = new Logger({ logsDir, defaultLog: path.join(logsDir, 'proxy.log'), maxHistory: cachedConfig.historySize });
@@ -241,7 +231,7 @@ export function createProxyCore({ configDir, port }) {
 
   async function reloadProviders() {
     try {
-      Object.assign(process.env, loadEnv(path.join(configDir, '.env')));
+      Object.assign(process.env, loadEnv(path.join(configDir, ENV_FILENAME)));
       const data = await fs.promises.readFile(providersPath, 'utf8');
       await loadAndApplyProviders(data);
     } catch (e) {
@@ -274,19 +264,16 @@ export function createProxyCore({ configDir, port }) {
 
   // ── Request handler ──
 
-  // Tracks the last active context per socket. When a new request arrives on a
-  // keep-alive socket, the previous request's error responses are blackholed to
-  // prevent stale timeout errors from contaminating the new request.
   const lastCtxPerSocket = new WeakMap();
 
   function createRequestHandler() {
     return (req, res) => {
       // ── GUI Static Files ──
       if (req.method === 'GET' && req.url.startsWith('/gui')) {
-        let filePath = req.url === '/gui' || req.url === '/gui/' 
+        let filePath = req.url === '/gui' || req.url === '/gui/'
           ? path.join(BUILTIN_EXTENSIONS_DIR, '..', 'infra', 'gui', 'index.html')
           : path.join(BUILTIN_EXTENSIONS_DIR, '..', 'infra', 'gui', req.url.replace('/gui/', ''));
-        
+
         fs.readFile(filePath, (err, data) => {
           if (err) {
             res.writeHead(404);
@@ -333,8 +320,7 @@ export function createProxyCore({ configDir, port }) {
             fs.writeFileSync(providersPath, body, 'utf8');
             res.writeHead(200);
             res.end('OK');
-            // fs.watch will trigger reload
-          } catch (e) {
+          } catch {
             res.writeHead(400);
             res.end('Invalid JSON');
           }
@@ -386,9 +372,6 @@ export function createProxyCore({ configDir, port }) {
         shellState = shellState.withConnectionBump(-1);
       });
 
-      // Supersede any previous request on this keep-alive socket so its pending
-      // error responses (e.g. a 600s upstream timeout) are silently discarded
-      // instead of being written to the shared socket.
       const socket = req.socket;
       if (socket) {
         const prevCtx = lastCtxPerSocket.get(socket);
@@ -424,6 +407,7 @@ export function createProxyCore({ configDir, port }) {
     initProviders,
     createRequestHandler,
     get providerCount() { return shellState.providers.size; },
+    get extensions() { return shellState.extensions; },
     get activeConnections() { return shellState.activeConnections; },
     getConfig,
     emit,
@@ -445,18 +429,18 @@ export function runWorkerMode({ configDir, port }) {
       });
 
       core.initProviders().then(() => {
-        const readyMsg = serializeIpcMessage({
+        const readyMsg = {
           type: 'ready',
           pid: process.pid,
           routes: core.providerCount,
-          extensions: 0
-        });
+          extensions: core.extensions?.size ?? 0
+        };
         if (process.send) process.send(readyMsg);
-      }).catch((e) => {
-        const errorMsg = serializeIpcMessage({
+      }).catch((_e) => {
+        const errorMsg = {
           type: 'error',
-          message: e.message
-        });
+          message: _e.message
+        };
         if (process.send) process.send(errorMsg);
         process.exit(1);
       });
@@ -482,7 +466,8 @@ export function runWorkerMode({ configDir, port }) {
       if (server) {
         server.close(checkDrain);
       }
-      setInterval(checkDrain, 1000);
+      const pollMs = core.getConfig().daemon.pollIntervalMs;
+      setInterval(checkDrain, pollMs);
     }
   });
 }

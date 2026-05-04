@@ -1,9 +1,17 @@
-import { spawn, spawnSync } from 'child_process';
 import http from 'http';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import pty from 'node-pty';
+import {
+  LOGS_DIR_NAME,
+  PROVIDERS_FILENAME,
+  CONFIG_FILENAME,
+  ENV_FILENAME,
+  CCB_DIR_NAME
+} from '../src/core/constants.js';
+import { ArgumentError } from '../src/core/exceptions.js';
 
 const PKG_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
@@ -61,7 +69,8 @@ async function runUnitTests() {
   assert(typeof ipcPath === 'string' && ipcPath.length > 0, 'getControlIpcPath returns non-empty string');
   if (process.platform === 'win32') {
     assert(ipcPath.includes('pipe'), 'Windows IPC path contains "pipe"');
-  } else {
+  }
+  if (process.platform !== 'win32') {
     assert(ipcPath.endsWith('.sock') || ipcPath.includes('ccb-ctrl'), 'POSIX IPC path has expected suffix');
   }
   assert(typeof INIT_TIMEOUT_MS === 'number' && INIT_TIMEOUT_MS > 0, 'INIT_TIMEOUT_MS is positive number');
@@ -142,7 +151,7 @@ async function runUnitTests() {
   const ok = Result.ok(42);
   assert(ok.isSuccess === true, 'ok.isSuccess');
   assert(ok.value === 42, 'ok.value === 42');
-  const err = Result.fail(new Error('boom'));
+  const err = Result.fail(new ArgumentError('boom'));
   assert(err.isSuccess === false, 'fail.isSuccess === false');
   assertThrows(() => err.value, ResultAccessError, 'fail.value throws ResultAccessError');
   assertThrows(() => ok.error, ResultAccessError, 'ok.error throws ResultAccessError');
@@ -189,13 +198,12 @@ async function runUnitTests() {
   // ── ID Validation ──
   console.log('\nID Validation:');
   const { validateIds } = await import('../bin/ccb.js');
-  const validP = [{ id: 'zai', url: 'https://zai.com' }, { id: 'mirror', url: 'https://mirror.com' }];
+  const validP = { 'zai': { url: 'https://zai.com' }, 'mirror': { url: 'https://mirror.com' } };
   assert(validateIds(validP) === undefined, 'valid IDs pass');
 
-  assertThrows(() => validateIds([{ id: '', url: 'x' }]), ConfigError, 'empty ID throws');
-  assertThrows(() => validateIds([{ id: 'Bad ID', url: 'x' }]), ConfigError, 'invalid ID format throws');
-  assertThrows(() => validateIds([{ id: 'a', url: 'x' }, { id: 'a', url: 'y' }]), ConfigError, 'duplicate ID throws');
-  assertThrows(() => validateIds([{ id: 'z-ai', url: 'x' }, { id: 'z_ai', url: 'y' }]), ConfigError, 'env key collision throws (Z_AI_KEY)');
+  assertThrows(() => validateIds({ '': { url: 'x' } }), ArgumentError, 'empty ID throws');
+  assertThrows(() => validateIds({ 'Bad ID': { url: 'x' } }), ArgumentError, 'invalid ID format throws');
+  assertThrows(() => validateIds({ 'z-ai': { url: 'x' }, 'z_ai': { url: 'y' } }), ArgumentError, 'env key collision throws (Z_AI_KEY)');
 
   // ── applyRouting ──
   console.log('\napplyRouting:');
@@ -903,7 +911,7 @@ async function runUnitTests() {
   // loadEnv from a temp file
   const tmpEnvDir = path.join(os.tmpdir(), `ccb-test-env-${Date.now()}`);
   fs.mkdirSync(tmpEnvDir, { recursive: true });
-  const tmpEnvPath = path.join(tmpEnvDir, '.env');
+  const tmpEnvPath = path.join(tmpEnvDir, ENV_FILENAME);
   fs.writeFileSync(tmpEnvPath, 'KEY_A=value_a\nKEY_B=value=b\n# COMMENT\n\nKEY_C=hello\n', 'utf8');
 
   const env = loadEnvFn(tmpEnvPath);
@@ -1357,7 +1365,7 @@ async function runUnitTests() {
     pools: { coder: { entries: ['z.glm-5'] } }
   });
   const trackMap = new Map();
-  const origSet = trackMap.set.bind(trackMap);
+  const _origSet = trackMap.set.bind(trackMap);
   // Verify hooks exist and don't crash
   lbTracking.hooks.onRequestStart.handler({ providerId: 'z', model: 'glm-5' });
   lbTracking.hooks.onRequestEnd.handler({ providerId: 'z', model: 'glm-5' });
@@ -1503,7 +1511,7 @@ const TEST_PORT = 9100;
 const TEST_CONFIG_DIR = path.join(PKG_ROOT, '.test-config');
 
 async function setupTestConfig() {
-  const testEnvPath = path.join(TEST_CONFIG_DIR, '.env');
+  const testEnvPath = path.join(TEST_CONFIG_DIR, ENV_FILENAME);
   let savedEnv = null;
   if (fs.existsSync(testEnvPath)) {
     const content = fs.readFileSync(testEnvPath, 'utf8');
@@ -1517,7 +1525,7 @@ async function setupTestConfig() {
 
   // Fall back to the user's real ccb config .env (~/.claude/.ccb/.env)
   if (!savedEnv) {
-    const userCcbEnv = path.join(os.homedir(), '.claude', '.ccb', '.env');
+    const userCcbEnv = path.join(os.homedir(), '.claude', CCB_DIR_NAME, ENV_FILENAME);
     if (fs.existsSync(userCcbEnv)) {
       const content = fs.readFileSync(userCcbEnv, 'utf8');
       const keyMatch = content.match(/^ZAI_KEY=(.+)$/m);
@@ -1528,11 +1536,11 @@ async function setupTestConfig() {
   // WSL cross-mount fallback: Linux homedir may differ from Windows USERPROFILE
   if (!savedEnv) {
     try {
-      const winHome = spawnSync('cmd.exe', ['/c', 'echo', '%USERPROFILE%'], { encoding: 'utf8', timeout: 3000 });
+      const winHome = runSync('cmd.exe', ['/c', 'echo', '%USERPROFILE%'], { encoding: 'utf8', timeout: 3000 });
       const winPath = (winHome.stdout || '').trim();
       if (winPath && !winPath.includes('%')) {
         const wslPath = winPath.replace(/\\/g, '/').replace(/^([A-Z]):/i, (_, d) => `/mnt/${d.toLowerCase()}`);
-        const wslEnv = path.join(wslPath, '.claude', '.ccb', '.env');
+        const wslEnv = path.join(wslPath, '.claude', CCB_DIR_NAME, ENV_FILENAME);
         if (fs.existsSync(wslEnv)) {
           const content = fs.readFileSync(wslEnv, 'utf8');
           const keyMatch = content.match(/^ZAI_KEY=(.+)$/m);
@@ -1544,20 +1552,19 @@ async function setupTestConfig() {
 
   // Last resort: process environment
   if (!savedEnv) {
-    if (process.env.ZAI_KEY) {
-      savedEnv = `ZAI_KEY=${process.env.ZAI_KEY}\n`;
-    } else {
-      throw new Error('No ZAI_KEY found. Set it via ccb --x-key, or in process env.');
+    if (!process.env.ZAI_KEY) {
+      throw new ArgumentError('No ZAI_KEY found. Set it via ccb --x-key, or in process env.');
     }
+    savedEnv = `ZAI_KEY=${process.env.ZAI_KEY}\n`;
   }
 
-  const logsDir = path.join(TEST_CONFIG_DIR, 'logs');
+  const logsDir = path.join(TEST_CONFIG_DIR, LOGS_DIR_NAME);
   if (fs.existsSync(TEST_CONFIG_DIR)) {
     try {
       fs.rmSync(TEST_CONFIG_DIR, { recursive: true, force: true });
     } catch {
       // WSL on /mnt/c/ (NTFS cross-mount) can fail with ENOTEMPTY
-      spawnSync('rm', ['-rf', TEST_CONFIG_DIR], { encoding: 'utf8' });
+      runSync('rm', ['-rf', TEST_CONFIG_DIR], { encoding: 'utf8' });
     }
   }
   fs.mkdirSync(TEST_CONFIG_DIR, { recursive: true });
@@ -1576,6 +1583,16 @@ async function setupTestConfig() {
             content_size: "high"
           }
         }
+      },
+      "synthetic": {
+        "url": "https://api.openai.com/v1"
+      }
+    },
+    extensions: {
+      "openai-format": {
+        providers: {
+          "synthetic": { "format": "openai" }
+        }
       }
     },
     routes: {
@@ -1584,14 +1601,14 @@ async function setupTestConfig() {
       payloadSize: {}
     }
   };
-  fs.writeFileSync(path.join(TEST_CONFIG_DIR, 'providers.json'), JSON.stringify(providers, null, 2), 'utf8');
+  fs.writeFileSync(path.join(TEST_CONFIG_DIR, PROVIDERS_FILENAME), JSON.stringify(providers, null, 2), 'utf8');
 
   const config = {
     port: TEST_PORT,
     daemon: { healthCheckTimeoutMs: 1000, pollIntervalMs: 200, pollMaxAttempts: 15 },
     logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000, level: 'trace' }
   };
-  fs.writeFileSync(path.join(TEST_CONFIG_DIR, 'config.json'), JSON.stringify(config, null, 2), 'utf8');
+  fs.writeFileSync(path.join(TEST_CONFIG_DIR, CONFIG_FILENAME), JSON.stringify(config, null, 2), 'utf8');
 
   fs.writeFileSync(testEnvPath, savedEnv, 'utf8');
 }
@@ -1608,14 +1625,16 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+import { spawnDaemon, runSync } from '../src/infra/process-manager.js';
+
 let testDaemonPid = null;
 
 async function startTestDaemon() {
   const CCB_BIN = path.join(PKG_ROOT, 'bin', 'ccb.js');
-  const out = fs.openSync(path.join(TEST_CONFIG_DIR, 'logs', 'daemon.log'), 'a');
-  const err = fs.openSync(path.join(TEST_CONFIG_DIR, 'logs', 'daemon.err'), 'a');
+  const out = fs.openSync(path.join(TEST_CONFIG_DIR, LOGS_DIR_NAME, 'daemon.log'), 'a');
+  const err = fs.openSync(path.join(TEST_CONFIG_DIR, LOGS_DIR_NAME, 'daemon.err'), 'a');
 
-  const child = spawn(process.execPath, [CCB_BIN, '--__cc-proxy-daemon__'], {
+  const child = spawnDaemon(CCB_BIN, ['--__cc-proxy-daemon__'], {
     detached: true,
     stdio: ['ignore', out, err],
     windowsHide: true,
@@ -1624,9 +1643,10 @@ async function startTestDaemon() {
   testDaemonPid = child.pid;
   child.unref();
 
+  const POLL_MS = 200;
   for (let i = 0; i < 15; i++) {
     if (await checkTestProxy()) return true;
-    await sleep(200);
+    await sleep(POLL_MS);
   }
   return false;
 }
@@ -1639,90 +1659,201 @@ function killTestDaemon() {
 
   // Kill anything listening on the test port
   try {
-    if (process.platform === 'win32') {
-      const r = spawnSync('netstat', ['-aon', '-p', 'TCP'], { encoding: 'utf8' });
-      const lines = (r.stdout || '').split('\n').filter(l => l.includes(`:${TEST_PORT} `));
-      for (const line of lines) {
-        const pid = line.trim().split(/\s+/).pop();
-        if (pid && /^\d+$/.test(pid)) {
-          try { process.kill(Number(pid), 'SIGKILL'); } catch { }
-        }
-      }
-    } else {
-      const ss = spawnSync('sh', ['-c', `ss -ltnp | grep :${TEST_PORT}`], { encoding: 'utf8' });
-      const match = ss.stdout.match(/pid=(\d+)/);
-      if (match && match[1]) {
-        process.kill(Number(match[1]), 'SIGKILL');
+  if (process.platform === 'win32') {
+    const r = runSync('netstat', ['-aon', '-p', 'TCP'], { encoding: 'utf8' });
+    const lines = (r.stdout || '').split('\n').filter(l => l.includes(`:${TEST_PORT} `));
+    for (const line of lines) {
+      const pid = line.trim().split(/\s+/).pop();
+      if (pid && /^\d+$/.test(pid)) {
+        try { process.kill(Number(pid), 'SIGKILL'); } catch { }
       }
     }
+  }
+  if (process.platform !== 'win32') {
+    const ss = runSync('sh', ['-c', `ss -ltnp | grep :${TEST_PORT}`], { encoding: 'utf8' });
+    const match = ss.stdout.match(/pid=(\d+)/);
+    if (match && match[1]) {
+      process.kill(Number(match[1]), 'SIGKILL');
+    }
+  }
   } catch { }
 }
 
-function assertModel(model, expectedPattern) {
+class InteractiveSession {
+  constructor(cmd, args, env) {
+    this.output = '';
+    this.closed = false;
+    this.ptyProcess = pty.spawn(cmd, args, {
+      name: 'xterm-color',
+      cols: 100,
+      rows: 40,
+      cwd: process.cwd(),
+      env: env
+    });
+    this.ptyProcess.onData((data) => {
+      this.output += data;
+    });
+  }
+
+  async waitFor(pattern, timeoutMs = 60000) {
+    const start = Date.now();
+    const POLL_MS = 100;
+    while (Date.now() - start <= timeoutMs) {
+      if (pattern.test(this.output)) return true;
+      await new Promise(r => setTimeout(r, POLL_MS));
+    }
+    return false;
+  }
+
+  send(text) {
+    this.ptyProcess.write(text);
+  }
+
+  clearOutput() {
+    this.output = '';
+  }
+
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    this.send('\x03\x03'); // Ctrl+C twice to gracefully exit Claude CLI
+  }
+}
+
+async function assertModel(model, expectedPattern) {
   console.log(`\nTesting model: ${model}...`);
 
   const CCB_BIN = path.join(PKG_ROOT, 'bin', 'ccb.js');
-  const prompt = `State your exact model name, then explain the difference between recursion and iteration in one paragraph. Be concise.`;
-  const args = ['--model', model, '--print', prompt];
-
-  const result = spawnSync(process.execPath, [CCB_BIN, ...args], {
-    encoding: 'utf8',
-    timeout: 20000,
-    env: {
-      ...process.env,
-      CCB_CONFIG_DIR: TEST_CONFIG_DIR
-    }
+  const session = new InteractiveSession(process.execPath, [CCB_BIN, '--model', model], {
+    ...process.env,
+    CCB_CONFIG_DIR: TEST_CONFIG_DIR
   });
 
-  const output = result.stdout || '';
-  const errOutput = result.stderr || '';
-  const combined = output + errOutput;
+  try {
+    // Wait for the Claude CLI prompt and let the UI settle
+    const ready = await session.waitFor(/❯/);
+    if (!ready) {
+      console.error(`  FAIL: Timed out waiting for CLI prompt for ${model} after 60s.`);
+      console.error(`  [DEBUG OUTPUT]: ${session.output.slice(0, 500)}`);
+      return false;
+    }
+    
+    const WAIT_MS = 1500;
+  await new Promise(r => setTimeout(r, WAIT_MS));
 
-  const responseLine = output.trim().split('\n').find(l => l.toLowerCase().includes('claude') || l.toLowerCase().includes('glm') || l.toLowerCase().includes('sonnet') || l.toLowerCase().includes('opus')) || output.trim().split('\n')[0];
-  if (responseLine) console.log(`Response: ${responseLine}`);
+    session.clearOutput();
+    session.send(`State your exact model name.\r`);
 
-  if (result.error?.code === 'ETIMEDOUT' || result.status === null) {
-    console.error(`  FAIL: Timed out for ${model} after 20s.`);
+    // Wait until the expected model name (or a known error pattern) appears in the output
+    const waitPattern = new RegExp(`(${expectedPattern.source}|429|402|insufficient|limit reached|401|403|Authentication|thinking\\.signature|adjacent text blocks)`, 'i');
+    const responded = await session.waitFor(waitPattern, 60000);
+    if (!responded) {
+      console.error(`  FAIL: Timed out waiting for response for ${model} after 60s.`);
+      console.error(`  [DEBUG OUTPUT]: ${session.output}`);
+      return false;
+    }
+
+    const combined = session.output;
+    
+    // Hard proxy logic failures
+    if (combined.includes('thinking.signature: Field required') || combined.includes('adjacent text blocks not allowed')) {
+      console.error(`  FAIL: Proxy Logic Failure: ${combined.slice(0, 200)}`);
+      return false;
+    }
+
+    const match = expectedPattern.test(combined);
+    if (match) {
+      console.log(`  PASS: ${model} identified correctly`);
+      return true;
+    }
+
+    // Quota/Rate-limit errors — routing reached the provider
+    const isQuotaError = combined.includes('429') ||
+      combined.includes('402') ||
+      combined.includes('insufficient balance') ||
+      combined.includes('insufficient_quota') ||
+      combined.includes('out of tokens') ||
+      combined.includes('limit reached') ||
+      combined.includes("hit your limit");
+    if (isQuotaError) {
+      console.log(`  PASS: ${model} — quota/rate-limit hit, but routing reached the provider correctly.`);
+      return true;
+    }
+
+    const isAuthError = combined.includes('401') || combined.includes('403') || combined.includes('Authentication');
+    if (isAuthError) {
+      console.error(`  FAIL: Auth error for ${model} — proxy may not have injected the API key.`);
+      return false;
+    }
+
+    console.error(`  FAIL: Expected ${expectedPattern} but got "${combined.trim().slice(0, 200)}"`);
     return false;
+  } finally {
+    session.close();
   }
+}
 
-  // Hard proxy logic failures (400 from upstream due to signature issues)
-  if (combined.includes('thinking.signature: Field required') || combined.includes('adjacent text blocks not allowed')) {
-    console.error(`  FAIL: Proxy Logic Failure: ${combined}`);
+async function testModelSwitch() {
+  console.log(`\nTesting in-session model switch (/model)...`);
+
+  const CCB_BIN = path.join(PKG_ROOT, 'bin', 'ccb.js');
+  const session = new InteractiveSession(process.execPath, [CCB_BIN, '--model', 'glm-4.7'], {
+    ...process.env,
+    CCB_CONFIG_DIR: TEST_CONFIG_DIR
+  });
+
+  try {
+    const ready1 = await session.waitFor(/❯/);
+    if (!ready1) {
+      console.error(`  FAIL: Timed out waiting for initial prompt.`);
+      return false;
+    }
+
+    const WAIT_MS = 1500;
+  await new Promise(r => setTimeout(r, WAIT_MS));
+
+    session.clearOutput();
+    session.send('/model sonnet\r');
+
+    // Wait for the UI to acknowledge the change
+    const uiUpdated = await session.waitFor(/Model set to sonnet|❯/, 15000);
+    if (!uiUpdated) {
+      console.error(`  FAIL: Timed out waiting for /model switch acknowledgement.`);
+      console.error(`  [DEBUG OUTPUT]: ${session.output}`);
+      return false;
+    }
+    
+    const UI_WAIT_MS = 1000;
+    await new Promise(r => setTimeout(r, UI_WAIT_MS));
+
+    session.clearOutput();
+    session.send(`Identify yourself with your exact model name.\r`);
+
+    // Wait until the expected model string or auth error appears
+    const waitPattern = /claude|sonnet|401|403|disabled Claude subscription/i;
+    const responded = await session.waitFor(waitPattern, 60000);
+    if (!responded) {
+      console.error(`  FAIL: Timed out waiting for response after switch.`);
+      console.error(`  [DEBUG OUTPUT]: ${session.output}`);
+      return false;
+    }
+
+    const combined = session.output;
+    const match = /claude|sonnet/i.test(combined);
+    
+    // Auth errors are acceptable if Sonnet OAuth isn't set up, means routing worked
+    const isAuthError = combined.includes('401') || combined.includes('403') || combined.includes('disabled Claude subscription');
+    
+    if (match || isAuthError) {
+      console.log(`  PASS: In-session model switch successfully routed to sonnet.`);
+      return true;
+    }
+
+    console.error(`  FAIL: Model did not switch correctly. Got: ${combined.slice(0, 200)}`);
     return false;
+  } finally {
+    session.close();
   }
-
-  const match = expectedPattern.test(combined);
-  if (match) {
-    console.log(`  PASS: ${model} identified correctly`);
-    return true;
-  }
-
-  // Quota/Rate-limit errors — routing worked, provider rejected
-  const isQuotaError = combined.includes('429') ||
-    combined.includes('402') ||
-    combined.includes('insufficient balance') ||
-    combined.includes('insufficient_quota') ||
-    combined.includes('out of tokens') ||
-    combined.includes('limit reached') ||
-    combined.includes("hit your limit");
-  if (isQuotaError) {
-    console.warn(`  WARN: Quota/rate-limit hit for ${model} — routing reached the provider.`);
-    return true;
-  }
-
-  const isAuthError = combined.includes('401') || combined.includes('403') || combined.includes('Authentication');
-  if (isAuthError) {
-    // 401 from a custom provider = proxy failed to inject the API key. This is a real failure.
-    // 401 from Anthropic passthrough = OAuth issue, not a proxy bug — but still unexpected.
-    console.error(`  FAIL: Auth error for ${model} — proxy may not have injected the API key.`);
-    return false;
-  }
-
-  // The request completed but the model didn't identify itself as expected.
-  // This is still a WARN, not a hard failure — model confusion is not a proxy bug.
-  console.warn(`  WARN: Expected ${expectedPattern} but got "${output.trim().slice(0, 200)}"`);
-  return true;
 }
 
 /**
@@ -1730,7 +1861,7 @@ function assertModel(model, expectedPattern) {
  * Returns { hasThinking, details } for diagnostic output.
  */
 function checkThinkingInLogs() {
-  const logsDir = path.join(TEST_CONFIG_DIR, 'logs');
+  const logsDir = path.join(TEST_CONFIG_DIR, LOGS_DIR_NAME);
   if (!fs.existsSync(logsDir)) return { hasThinking: false, details: 'No logs dir' };
 
   const sessionLogs = fs.readdirSync(logsDir)
@@ -1770,7 +1901,7 @@ async function assertWebSearchTransform() {
   const testToken1 = `ws-test-1-${Math.random().toString(36).slice(2)}`;
   const testToken2 = `ws-test-2-${Math.random().toString(36).slice(2)}`;
 
-  const logsDir = path.join(TEST_CONFIG_DIR, 'logs');
+  const logsDir = path.join(TEST_CONFIG_DIR, LOGS_DIR_NAME);
 
   // ── TEST 1: Request Tool Transformation ──
   const body1 = JSON.stringify({
@@ -1815,12 +1946,11 @@ async function assertWebSearchTransform() {
 
   if (transformed1) {
     const wsTool = transformed1.tools?.find(t => t.type === 'web_search');
-    if (wsTool && wsTool.web_search && wsTool.web_search.enable === 'True') {
-      console.log('  PASS: Request tool transformation verified in debug logs');
-    } else {
+    if (!wsTool || !wsTool.web_search || wsTool.web_search.enable !== 'True') {
       console.error('  FAIL: Request tool transformation failed');
       return false;
     }
+    console.log('  PASS: Request tool transformation verified in debug logs');
   }
 
   // ── TEST 2: History Sanitization ──
@@ -1878,12 +2008,11 @@ async function assertWebSearchTransform() {
     const msgWithToolUse = transformed2.messages.find(m => m.role === 'assistant' && JSON.stringify(m.content).includes('[web_search query:'));
     const msgWithToolResult = transformed2.messages.find(m => m.role === 'user' && JSON.stringify(m.content).includes('[web_search results:'));
     
-    if (msgWithToolUse && msgWithToolResult) {
-      console.log('  PASS: History sanitization verified in debug logs');
-    } else {
+    if (!msgWithToolUse || !msgWithToolResult) {
       console.error('  FAIL: History sanitization failed');
       return false;
     }
+    console.log('  PASS: History sanitization verified in debug logs');
   }
 
   // Final checks
@@ -1913,10 +2042,26 @@ async function runIntegrationTests() {
   }
   console.log('Test daemon started.');
 
+  // Open a persistent keepalive to prevent the daemon from auto-shutting down
+  // between sequential test runs.
+  let testKeepaliveSocket = null;
+  try {
+    const req = http.get({
+      hostname: 'localhost',
+      port: TEST_PORT,
+      path: '/__ccb_internal__/keepalive',
+      headers: { connection: 'keep-alive' }
+    });
+    req.on('socket', (sock) => { testKeepaliveSocket = sock; });
+    req.on('error', () => {});
+  } catch (e) {
+    console.error('Warning: failed to open test harness keepalive:', e.message);
+  }
+
   // 1. CLI Management Command Tests (non-destructive — don't touch .env/keys yet)
   console.log('\nTesting CLI Management Commands...');
   const CCB_BIN = path.join(PKG_ROOT, 'bin', 'ccb.js');
-  const runCcb = (args) => spawnSync(process.execPath, [CCB_BIN, ...args], {
+  const runCcb = (args) => runSync(process.execPath, [CCB_BIN, ...args], {
     encoding: 'utf8',
     env: { ...process.env, CCB_CONFIG_DIR: TEST_CONFIG_DIR }
   });
@@ -1928,12 +2073,12 @@ async function runIntegrationTests() {
     let ok = res.status === expectedStatus;
     if (ok && expectedStdout) ok = (res.stdout || '').includes(expectedStdout);
     if (ok && expectedStderr) ok = (res.stderr || '').includes(expectedStderr);
-    if (ok) {
-      console.log(`  PASS: ${label}`);
-    } else {
+    if (!ok) {
       console.error(`  FAIL: ${label} (status: ${res.status}, out: ${res.stdout?.trim()}, err: ${res.stderr?.trim()})`);
       cliSuccess = false;
+      return;
     }
+    console.log(`  PASS: ${label}`);
   };
 
   // Test --x-help
@@ -1948,14 +2093,15 @@ async function runIntegrationTests() {
   // Test --x-clearlogs
   console.log('  Testing --x-clearlogs...');
   // Create a dummy log file to clear
-  const dummyLog = path.join(TEST_CONFIG_DIR, 'logs', 'test-clear.log');
+  const dummyLog = path.join(TEST_CONFIG_DIR, LOGS_DIR_NAME, 'test-clear.log');
   fs.writeFileSync(dummyLog, 'test', 'utf8');
   assertCli(runCcb(['--x-clearlogs']), 0, 'Cleared', null, '--x-clearlogs');
-  if (!fs.existsSync(dummyLog)) {
-    console.log('  PASS: --x-clearlogs deleted log file');
-  } else {
+  if (fs.existsSync(dummyLog)) {
     console.error('  FAIL: --x-clearlogs did not delete log file');
     cliSuccess = false;
+  }
+  if (!fs.existsSync(dummyLog)) {
+    console.log('  PASS: --x-clearlogs deleted log file');
   }
 
   // Test --x-provider
@@ -1965,24 +2111,26 @@ async function runIntegrationTests() {
 
   const addRes = runCcb(['--x-provider', 'add', 'new-p', 'http://new.com', '--non-compliant']);
   if (addRes.status !== 0) console.error('    Error output:', addRes.stderr);
-  providers = JSON.parse(fs.readFileSync(path.join(TEST_CONFIG_DIR, 'providers.json'), 'utf8'));
+  providers = JSON.parse(fs.readFileSync(path.join(TEST_CONFIG_DIR, PROVIDERS_FILENAME), 'utf8'));
   const newP = providers.providers['new-p'];
-  if (newP && newP.url === 'http://new.com' && newP.anthropicCompliant === false) {
-    console.log('  PASS: --x-provider add');
-  } else {
+  if (!newP || newP.url !== 'http://new.com' || newP.anthropicCompliant !== false) {
     console.error('  FAIL: --x-provider add');
     cliSuccess = false;
+  }
+  if (newP && newP.url === 'http://new.com' && newP.anthropicCompliant === false) {
+    console.log('  PASS: --x-provider add');
   }
 
   assertCli(runCcb(['--x-provider', 'add', 'new-p', 'http://new2.com']), 1, null, 'Error:', '--x-provider add duplicate id');
 
   runCcb(['--x-provider', 'remove', 'new-p']);
-  providers = JSON.parse(fs.readFileSync(path.join(TEST_CONFIG_DIR, 'providers.json'), 'utf8'));
-  if (!providers.providers['new-p']) {
-    console.log('  PASS: --x-provider remove');
-  } else {
+  providers = JSON.parse(fs.readFileSync(path.join(TEST_CONFIG_DIR, PROVIDERS_FILENAME), 'utf8'));
+  if (providers.providers['new-p']) {
     console.error('  FAIL: --x-provider remove');
     cliSuccess = false;
+  }
+  if (!providers.providers['new-p']) {
+    console.log('  PASS: --x-provider remove');
   }
 
   // Test --x-route
@@ -1990,29 +2138,30 @@ async function runIntegrationTests() {
   assertCli(runCcb(['--x-route', 'add']), 1, null, 'Error:', '--x-route add missing args');
 
   runCcb(['--x-route', 'add', 'model', 'test-alias', 'zai.test-real']);
-  providers = JSON.parse(fs.readFileSync(path.join(TEST_CONFIG_DIR, 'providers.json'), 'utf8'));
+  providers = JSON.parse(fs.readFileSync(path.join(TEST_CONFIG_DIR, PROVIDERS_FILENAME), 'utf8'));
   const testRoute = providers.routes?.models?.['test-alias'];
-  if (testRoute === 'zai.test-real') {
-    console.log('  PASS: --x-route add model');
-  } else {
+  if (testRoute !== 'zai.test-real') {
     console.error('  FAIL: --x-route add model');
     cliSuccess = false;
+  }
+  if (testRoute === 'zai.test-real') {
+    console.log('  PASS: --x-route add model');
   }
 
   assertCli(runCcb(['--x-route', 'list']), 0, 'test-alias', null, '--x-route list');
   assertCli(runCcb(['--x-route', 'tree']), 0, 'api.z.ai', null, '--x-route tree');
 
   runCcb(['--x-route', 'remove', 'test-alias']);
-  providers = JSON.parse(fs.readFileSync(path.join(TEST_CONFIG_DIR, 'providers.json'), 'utf8'));
-  if (providers.routes?.models?.['test-alias'] === undefined) {
-    console.log('  PASS: --x-route remove');
-  } else {
+  providers = JSON.parse(fs.readFileSync(path.join(TEST_CONFIG_DIR, PROVIDERS_FILENAME), 'utf8'));
+  if (providers.routes?.models?.['test-alias'] !== undefined) {
     console.error('  FAIL: --x-route remove');
     cliSuccess = false;
   }
+  if (providers.routes?.models?.['test-alias'] === undefined) {
+    console.log('  PASS: --x-route remove');
+  }
 
-  // 2. Key management tests — run BEFORE model tests, but we'll restore .env after
-  const testEnvPath = path.join(TEST_CONFIG_DIR, '.env');
+  const testEnvPath = path.join(TEST_CONFIG_DIR, ENV_FILENAME);
   const savedEnvContent = fs.readFileSync(testEnvPath, 'utf8');
 
   console.log('\n  Testing --x-key set/remove/list/prune/exceptions...');
@@ -2024,22 +2173,24 @@ async function runIntegrationTests() {
 
   runCcb(['--x-key', 'set', 'zai', 'sk-test-key']);
   let envContent = fs.readFileSync(testEnvPath, 'utf8');
-  if (envContent.includes('ZAI_KEY=sk-test-key')) {
-    console.log('  PASS: --x-key set updated .env');
-  } else {
+  if (!envContent.includes('ZAI_KEY=sk-test-key')) {
     console.error('  FAIL: --x-key set failed to update .env');
     cliSuccess = false;
+  }
+  if (envContent.includes('ZAI_KEY=sk-test-key')) {
+    console.log('  PASS: --x-key set updated .env');
   }
 
   runCcb(['--x-key', 'remove', 'zai']);
   envContent = fs.readFileSync(testEnvPath, 'utf8');
   if (envContent.includes('ZAI_KEY=')) {
     const val = envContent.split('\n').find(l => l.startsWith('ZAI_KEY=')).split('=')[1];
-    if (val === '') {
-      console.log('  PASS: --x-key remove cleared .env');
-    } else {
+    if (val !== '') {
       console.error('  FAIL: --x-key remove failed to clear .env');
       cliSuccess = false;
+    }
+    if (val === '') {
+      console.log('  PASS: --x-key remove cleared .env');
     }
   }
 
@@ -2047,31 +2198,39 @@ async function runIntegrationTests() {
   fs.appendFileSync(testEnvPath, '\nORPHAN_KEY=old\n');
   runCcb(['--x-key', 'prune']);
   envContent = fs.readFileSync(testEnvPath, 'utf8');
-  if (!envContent.includes('ORPHAN_KEY')) {
-    console.log('  PASS: --x-key prune removed orphan');
-  } else {
+  if (envContent.includes('ORPHAN_KEY')) {
     console.error('  FAIL: --x-key prune failed to remove orphan');
     cliSuccess = false;
+  }
+  if (!envContent.includes('ORPHAN_KEY')) {
+    console.log('  PASS: --x-key prune removed orphan');
   }
 
   // Restore the original .env so model tests have a valid API key.
   fs.writeFileSync(testEnvPath, savedEnvContent, 'utf8');
 
   // Trigger hot-reload so the daemon picks up the restored key
-  const providersContent = fs.readFileSync(path.join(TEST_CONFIG_DIR, 'providers.json'), 'utf8');
-  fs.writeFileSync(path.join(TEST_CONFIG_DIR, 'providers.json'), providersContent, 'utf8');
-  await new Promise(resolve => setTimeout(resolve, 500));
+  const providersContent = fs.readFileSync(path.join(TEST_CONFIG_DIR, PROVIDERS_FILENAME), 'utf8');
+  fs.writeFileSync(path.join(TEST_CONFIG_DIR, PROVIDERS_FILENAME), providersContent, 'utf8');
+  const HOT_RELOAD_MS = 500;
+  await new Promise(resolve => setTimeout(resolve, HOT_RELOAD_MS));
 
   // 3. Real Model Tests
-  console.log('\nRunning model identity tests: GLM -> Claude');
+  console.log('\nRunning model identity tests (Interactive): GLM -> Claude');
 
   let modelSuccess = true;
 
-  const rGlm = assertModel('glm-4.7', /glm-/i);
+  const rGlm = await assertModel('glm-4.7', /glm-/i);
   modelSuccess = modelSuccess && rGlm;
 
-  const rSonnet = assertModel('sonnet', /claude|sonnet/i);
+  const rSonnet = await assertModel('sonnet', /claude|sonnet/i);
   modelSuccess = modelSuccess && rSonnet;
+
+  const rSynth = await assertModel('synthetic.gpt-4', /401|Incorrect API key|Authentication|API Error|Retrying/i);
+  modelSuccess = modelSuccess && rSynth;
+
+  const rSwitch = await testModelSwitch();
+  modelSuccess = modelSuccess && rSwitch;
 
   // 3b. Web search tool transform test (live request through proxy)
   //    The daemon may have shut down after the last model test — restart it.
@@ -2082,7 +2241,8 @@ async function runIntegrationTests() {
     if (!restarted) {
       console.error('  FAIL: Could not restart daemon for web search test');
       modelSuccess = false;
-    } else {
+    }
+    if (restarted) {
       wsDaemonUp = true;
     }
   }
@@ -2096,7 +2256,8 @@ async function runIntegrationTests() {
   const thinkingCheck = checkThinkingInLogs();
   if (thinkingCheck.hasThinking) {
     console.log(`  Thinking blocks detected: ${thinkingCheck.details}`);
-  } else {
+  }
+  if (!thinkingCheck.hasThinking) {
     console.log(`  No thinking blocks found: ${thinkingCheck.details}`);
     console.log(`  (This is informational — models may not always use extended thinking)`);
   }
@@ -2104,6 +2265,7 @@ async function runIntegrationTests() {
     console.log(`  Log file: ${thinkingCheck.logFile}`);
   }
 
+  if (testKeepaliveSocket) testKeepaliveSocket.destroy();
   killTestDaemon();
   return [cliSuccess, modelSuccess];
 }
@@ -2124,12 +2286,13 @@ async function main() {
 
   const integrationResults = await runIntegrationTests();
 
-  if (integrationResults.every(Boolean)) {
-    console.log('\n✨ ALL TESTS PASSED!');
-    process.exit(0);
+  if (!integrationResults.every(Boolean)) {
+    console.error('\n🚨 INTEGRATION TESTS FAILED!');
+    process.exit(1);
   }
-  console.error('\n🚨 INTEGRATION TESTS FAILED!');
-  process.exit(1);
+
+  console.log('\n✨ ALL TESTS PASSED!');
+  process.exit(0);
 }
 
 main();

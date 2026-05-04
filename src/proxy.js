@@ -1,6 +1,5 @@
 import http from 'http';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import fs from 'fs';
 import { createProxyCore } from './proxy-core.js';
 import { loadConfigFromFile, resolveUserConfigDir } from './core/config.js';

@@ -9,7 +9,6 @@
  *   { fallbackProviderId, fallbackModel, hasFallback }
  */
 
-import { Option } from '../../core/types.js';
 import { ProviderMatch } from '../../core/providers.js';
 import { providerIdToEnvKey } from '../../core/providers.js';
 import { MAX_FALLBACK_DEPTH } from '../../core/routing-rules.js';

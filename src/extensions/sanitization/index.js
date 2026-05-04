@@ -12,7 +12,7 @@
 
 import { BLOCK_TYPES } from '../../core/types.js';
 import {
-  getSystemBlockText,
+  getSystemBlockText as _getSystemBlockText,
   getBlockType, getBlockText, getBlockThinking, getBlockRedactedData, getBlockToolContent,
   hasValidSignature, omitCacheControl,
   getSystem, getMessages,

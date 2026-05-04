@@ -9,8 +9,10 @@
 import https from 'https';
 import http from 'http';
 import { URL } from 'url';
+import { UpstreamError } from '../../core/exceptions.js';
 
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const FETCH_TIMEOUT_MS = 5000;
 
 const modelCache = new Map();
 
@@ -45,7 +47,7 @@ async function fetchModels(url, apiKey) {
     if (apiKey) headers['authorization'] = `Bearer ${apiKey}`;
 
     const data = await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('timeout')), 5000);
+      const timeout = setTimeout(() => reject(new UpstreamError('timeout')), FETCH_TIMEOUT_MS);
       transport.get(
         { hostname: modelsUrl.hostname, port: modelsUrl.port, path: modelsUrl.pathname, headers },
         (res) => {
@@ -61,7 +63,10 @@ async function fetchModels(url, apiKey) {
     });
 
     const parsed = JSON.parse(data);
-    const models = new Set((parsed.data ?? []).map((m) => m.id));
+    if (!parsed.data || parsed.error) {
+      throw new UpstreamError(parsed.error?.message || 'Invalid response from models endpoint');
+    }
+    const models = new Set(parsed.data.map((m) => m.id));
     modelCache.set(cacheKey, { models, ts: Date.now() });
     return models;
   } catch {
