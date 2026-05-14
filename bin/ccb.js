@@ -5,32 +5,257 @@ import http from 'http';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import path from 'path';
-import { ReadinessTimeoutException, ConfigurationMissingException, ConfigError, ArgumentError } from '../src/core/exceptions.js';
-import { loadConfigFromFile, resolveUserConfigDir } from '../src/core/config.js';
+import net from 'net';
+
+import { 
+  ReadinessTimeoutException, 
+  ConfigurationMissingException, 
+  ConfigError, 
+  ArgumentError 
+} from '../src/core/exceptions.js';
+
+import { 
+  loadConfigFromFile, 
+  resolveUserConfigDir 
+} from '../src/core/config.js';
+
 import {
+  CCB_VERSION,
   LOGS_DIR_NAME,
   PROVIDERS_FILENAME,
   CONFIG_FILENAME,
+  VERSIONS_FILENAME,
   ENV_FILENAME,
   WATCHDOG_SCRIPT_NAME
 } from '../src/core/constants.js';
-import { addRouteModel, removeRouteModel, formatTree, findProviderKey, addProvider, removeProvider } from '../src/core/model-manager.js';
-import { listApiKeys as _listApiKeys, obfuscateKey } from '../src/core/key-manager.js';
-import { ensureCompleteConfig, ensureCompleteProviders } from '../src/core/migrator.js';
+
+import { 
+  addRouteModel, 
+  removeRouteModel, 
+  formatTree, 
+  findProviderKey, 
+  addProvider, 
+  removeProvider 
+} from '../src/core/model-manager.js';
+
+import { 
+  listApiKeys as _listApiKeys, 
+  obfuscateKey 
+} from '../src/core/key-manager.js';
+
+import { 
+  ensureCompleteConfig, 
+  ensureCompleteProviders 
+} from '../src/core/migrator.js';
+
 import { providerIdToEnvKey } from '../src/core/providers.js';
-import { loadEnv, updateEnvKey, pruneEnvLines } from '../src/core/env-file.js';
-import { parseTarget as _parseTarget, detectFormat as _detectFormat } from '../src/core/config-adapter.js';
-import net from 'net';
+
+import { 
+  loadEnv, 
+  updateEnvKey, 
+  pruneEnvLines 
+} from '../src/core/env-file.js';
+
+import { 
+  parseTarget as _parseTarget, 
+  detectFormat as _detectFormat 
+} from '../src/core/config-adapter.js';
+
 import { getControlIpcPath } from '../src/core/daemon-constants.js';
 import { serializeIpcMessage, parseIpcMessage } from '../src/core/ipc-protocol.js';
-import { runKill, spawnDaemon, spawnCommand } from '../src/infra/process-manager.js';
-import { createProxyCore } from '../src/proxy-core.js';
-
-const PROXY_FLAG = '--__cc-proxy-daemon__';
+import { runKill, spawnDaemon, spawnCommand, getProcesses } from '../src/infra/process-manager.js';
 
 const USER_CONFIG_DIR = resolveUserConfigDir();
 const LOGS_DIR = path.join(USER_CONFIG_DIR, LOGS_DIR_NAME);
 const providersPath = path.join(USER_CONFIG_DIR, PROVIDERS_FILENAME);
+const VERSIONS_PATH = path.join(USER_CONFIG_DIR, VERSIONS_FILENAME);
+
+function loadVersions() {
+  const versions = readJsonFile(VERSIONS_PATH) ?? { current: CCB_VERSION, versions: {} };
+  // Ensure current version is always in the list
+  const pkgRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  const watchdogPath = path.join(pkgRoot, 'bin', WATCHDOG_SCRIPT_NAME);
+  versions.versions[CCB_VERSION] = watchdogPath;
+  return versions;
+}
+
+function saveVersions(versions) {
+  fs.writeFileSync(VERSIONS_PATH, JSON.stringify(versions, null, 2) + '\n', 'utf8');
+}
+
+async function handleVersionsCommand() {
+  const subcommand = process.argv[3];
+  const args = process.argv.slice(4);
+
+  if (subcommand === 'add') {
+    const version = args[0];
+    const watchdogPath = args[1];
+    if (!version || !watchdogPath) {
+      process.stderr.write('Usage: ccb --x-version add <version> <watchdog-path>\n');
+      process.exit(1);
+    }
+    const versions = loadVersions();
+    versions.versions[version] = path.resolve(watchdogPath);
+    saveVersions(versions);
+    console.log(`Added version ${version}: ${watchdogPath}`);
+    return;
+  }
+
+  if (subcommand === 'remove') {
+    const version = args[0];
+    if (!version) {
+      process.stderr.write('Usage: ccb --x-version remove <version>\n');
+      process.exit(1);
+    }
+    const versions = loadVersions();
+    delete versions.versions[version];
+    saveVersions(versions);
+    console.log(`Removed version ${version}`);
+    return;
+  }
+
+  if (subcommand === 'list' || !subcommand) {
+    const versions = loadVersions();
+    console.log('Available Versions:');
+    for (const [v, p] of Object.entries(versions.versions)) {
+      const currentMarker = v === versions.current ? ' (current)' : '';
+      const localMarker = v === CCB_VERSION ? ' (local binary)' : '';
+      console.log(`  ${v.padEnd(8)} ${p}${currentMarker}${localMarker}`);
+    }
+    return;
+  }
+
+  if (subcommand === 'set' || subcommand === 'switch') {
+    const version = args[0];
+    if (!version) {
+      process.stderr.write(`Usage: ccb --x-version ${subcommand} <version>\n`);
+      process.exit(1);
+    }
+    const versions = loadVersions();
+    if (!versions.versions[version]) {
+      process.stderr.write(`Error: Version ${version} not found in registry.\n`);
+      process.exit(1);
+    }
+    versions.current = version;
+    saveVersions(versions);
+    console.log(`Default version set to ${version}`);
+    return;
+  }
+
+  if (subcommand === 'create') {
+    const version = args[0];
+    const targetDir = args[1] || `../cc-bridge-${version}`;
+    if (!version) {
+      process.stderr.write('Usage: ccb --x-version create <version> [target-dir]\n');
+      process.exit(1);
+    }
+    console.log(`Creating git worktree for ${version} at ${targetDir}...`);
+    try {
+      _spawnSync('git', ['worktree', 'add', targetDir, version], { stdio: 'inherit', windowsHide: true });
+      const watchdogPath = path.resolve(targetDir, 'bin', WATCHDOG_SCRIPT_NAME);
+      const versions = loadVersions();
+      versions.versions[version] = watchdogPath;
+      saveVersions(versions);
+      console.log(`Registered version ${version}: ${watchdogPath}`);
+    } catch (e) {
+      process.stderr.write(`Error: ${e.message}\n`);
+      process.exit(1);
+    }
+    return;
+  }
+}
+
+async function listSessions() {
+  const config = loadDaemonConfig();
+  const procs = getProcesses();
+  const workers = procs.filter(p => p.cmd.includes(WATCHDOG_SCRIPT_NAME));
+
+  if (workers.length === 0) {
+    console.log('No active ccb workers found.');
+    return;
+  }
+
+  console.log('Active Sessions:');
+  console.log('  PID    Version  Uptime   Sessions  Connections  Log Path');
+
+  for (const worker of workers) {
+    const port = await findPortForPid(worker.pid);
+    if (!port) {
+      console.log(`  ${String(worker.pid).padEnd(6)} [Unknown Port]`);
+      continue;
+    }
+
+    const socket = await connectToControlIpc(port);
+    if (!socket) {
+      console.log(`  ${String(worker.pid).padEnd(6)} [IPC Unavailable (Port ${port})]`);
+      continue;
+    }
+
+    try {
+      const status = await queryWorkerStatusIpc(socket, config.ipcTimeoutMs);
+      const uptime = formatDuration(status.uptimeMs / 1000);
+      console.log(`  ${String(worker.pid).padEnd(6)} ${CCB_VERSION.padEnd(8)} ${uptime.padEnd(8)} ${String(status.keepalives).padEnd(9)} ${String(status.drainingWorkers).padEnd(12)} (Port ${port})`);
+    } catch (e) {
+      console.log(`  ${String(worker.pid).padEnd(6)} [Query Failed: ${e.message}]`);
+    } finally {
+      socket.end();
+    }
+  }
+}
+
+function queryWorkerStatusIpc(socket, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    socket.write(serializeIpcMessage({ cmd: 'status' }));
+    let buffer = '';
+    const onData = (data) => {
+      buffer += data.toString();
+      const lines = buffer.split('\n');
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const response = parseIpcMessage(line);
+        if (response && response.status === 'ok') {
+          socket.off('data', onData);
+          resolve(response);
+          return;
+        }
+      }
+    };
+    socket.on('data', onData);
+    setTimeout(() => {
+      socket.off('data', onData);
+      reject(new Error('Timeout'));
+    }, timeoutMs);
+  });
+}
+
+async function findPortForPid(pid) {
+  const isWin = process.platform === 'win32';
+  try {
+    if (isWin) {
+      const out = _spawnSync('netstat', ['-ano'], { encoding: 'utf8', windowsHide: true }).stdout;
+      const lines = out.split('\n');
+      for (const line of lines) {
+        if (line.includes('LISTENING') && line.includes(String(pid))) {
+          const match = line.match(/0\.0\.0\.0:(\d+)/) || line.match(/127\.0\.0\.1:(\d+)/) || line.match(/\[::\]:(\d+)/);
+          if (match) return parseInt(match[1], 10);
+        }
+      }
+      return null;
+    }
+
+    const out = _spawnSync('lsof', ['-nP', '-iTCP', '-sTCP:LISTEN', '-p', String(pid)], { encoding: 'utf8' }).stdout;
+    const match = out.match(/:(\d+)\s+\(LISTEN\)/);
+    if (match) return parseInt(match[1], 10);
+  } catch { }
+  return null;
+}
+
+
+function formatDuration(sec) {
+  if (sec < 60) return `${sec}s`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m`;
+  return `${Math.floor(sec / 3600)}h`;
+}
 
 function readJsonFile(filePath) {
   if (!fs.existsSync(filePath)) return null;
@@ -69,35 +294,8 @@ function init() {
   process.stdout.write(writeJsonIfNeeded(configPath, JSON.stringify(mergedConfig, null, 2)) + '\n');
 }
 
-function ensureDaemonConfig() {
-  if (!process.argv.includes(PROXY_FLAG)) return;
-  if (!fs.existsSync(USER_CONFIG_DIR)) {
-    throw new ConfigurationMissingException(`Config directory missing: ${USER_CONFIG_DIR}. Please run 'ccb --x-init' first.`);
-  }
-  if (!fs.existsSync(providersPath)) {
-    throw new ConfigurationMissingException(`providers.json missing: ${providersPath}. Please run 'ccb --x-init' first.`);
-  }
-}
-
-function ensureLogsDir() {
-  if (!fs.existsSync(LOGS_DIR)) fs.mkdirSync(LOGS_DIR, { recursive: true });
-}
-
 function loadDaemonConfig() {
   return loadConfigFromFile(USER_CONFIG_DIR);
-}
-
-function runProxyDaemon() {
-  ensureDaemonConfig();
-  ensureLogsDir();
-  const config = loadDaemonConfig();
-
-  const core = createProxyCore({ configDir: USER_CONFIG_DIR, port: config.port });
-  const server = http.createServer(core.createRequestHandler());
-
-  server.listen(config.port, async () => {
-    core.initProviders();
-  });
 }
 
 export function validateIds(providers) {
@@ -379,10 +577,10 @@ async function connectToControlIpc(port) {
 }
 
 async function handleStatusCommand() {
-  const config = loadDaemonConfig(USER_CONFIG_DIR);
+  const config = loadConfigFromFile(USER_CONFIG_DIR);
   const socket = await connectToControlIpc(config.port);
   if (!socket) {
-    process.stderr.write('ccb: No running proxy daemon found.\n');
+    process.stderr.write(`ccb: No running proxy daemon found on port ${config.port}.\n`);
     process.exit(1);
   }
 
@@ -395,7 +593,7 @@ async function handleStatusCommand() {
     for (const line of lines) {
       if (!line.trim()) continue;
       const response = parseIpcMessage(line);
-      if (response) {
+      if (response && response.status === 'ok') {
         process.stdout.write(`Status: ${response.status}\n`);
         process.stdout.write(`Worker PID: ${response.workerPid}\n`);
         process.stdout.write(`Uptime: ${Math.round(response.uptimeMs / 1000)}s\n`);
@@ -415,53 +613,12 @@ async function handleStatusCommand() {
     process.stderr.write('ccb: Status request timed out\n');
     socket.destroy();
     process.exit(1);
-  }, 5000);
+  }, config.ipcTimeoutMs);
 }
 
 async function handleSessionsCommand() {
-  const config = loadDaemonConfig(USER_CONFIG_DIR);
-  const socket = await connectToControlIpc(config.port);
-  if (!socket) {
-    process.stderr.write('ccb: No running proxy daemon found.\n');
-    process.exit(1);
-  }
-
-  socket.write(serializeIpcMessage({ cmd: 'sessions' }));
-
-  let buffer = '';
-  socket.on('data', (data) => {
-    buffer += data.toString();
-    const lines = buffer.split('\n');
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      const response = parseIpcMessage(line);
-      if (response && response.cmd === 'sessions') {
-        if (response.workers && response.workers.length > 0) {
-          process.stdout.write('Active Sessions:\n');
-          process.stdout.write('  PID    Version  Uptime   Keepalives\n');
-          for (const w of response.workers) {
-            process.stdout.write(`  ${String(w.pid).padEnd(6)} ${String(w.version).padEnd(8)} ${String(Math.round(w.uptimeMs / 1000) + 's').padEnd(8)} ${w.keepalives}\n`);
-          }
-          process.stdout.write(`\nTotal: ${response.totalKeepalives} session(s) across ${response.workers.length} worker(s)\n`);
-        } else {
-          process.stdout.write('No active sessions.\n');
-        }
-        socket.end();
-        process.exit(0);
-      }
-    }
-  });
-
-  socket.on('error', (err) => {
-    process.stderr.write(`ccb: IPC error: ${err.message}\n`);
-    process.exit(1);
-  });
-
-  setTimeout(() => {
-    process.stderr.write('ccb: Sessions request timed out\n');
-    socket.destroy();
-    process.exit(1);
-  }, 5000);
+  await listSessions();
+  process.exit(0);
 }
 
 const CCB_CMDS = {
@@ -469,24 +626,16 @@ const CCB_CMDS = {
     init();
     process.exit(0);
   },
-  '--x-status': () => {
-    handleStatusCommand();
-  },
-  '--x-sessions': () => {
-    handleSessionsCommand();
-  },
+  '--x-status': () => handleStatusCommand(),
+  '--x-sessions': () => handleSessionsCommand(),
   '--x-gui': () => {
     const config = loadDaemonConfig(USER_CONFIG_DIR);
     const url = `http://localhost:${config.port}/gui`;
     const platform = process.platform;
-    let cmd;
-    if (platform === 'darwin') {
-      cmd = 'open';
-    } else if (platform === 'win32') {
-      cmd = 'start';
-    } else {
-      cmd = 'xdg-open';
-    }
+    let cmd = 'xdg-open';
+    if (platform === 'darwin') cmd = 'open';
+    if (platform === 'win32') cmd = 'start';
+
     spawnCommand(cmd, [url], { detached: true }).unref();
     console.log(`Opening GUI: ${url}`);
     process.exit(0);
@@ -496,8 +645,7 @@ const CCB_CMDS = {
     process.exit(0);
   },
   '--x-restart': async () => {
-    const config = loadDaemonConfig(USER_CONFIG_DIR);
-    const socket = await connectToControlIpc(config.port);
+    const socket = await connectToControlIpc();
     if (!socket) {
       process.stderr.write('ccb: No proxy daemon running.\n');
       process.exit(1);
@@ -515,41 +663,33 @@ const CCB_CMDS = {
     clearLogs();
     process.exit(0);
   },
-  '--x-provider': () => {
-    handleProviderCommand();
-  },
-  '--x-route': () => {
-    handleRouteCommand();
-  },
-  '--x-key': () => {
-    handleKeyCommand();
-  },
-  '--x-version': () => {
-    const pkgRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-    const pkg = JSON.parse(fs.readFileSync(path.join(pkgRoot, 'package.json'), 'utf8'));
-    process.stdout.write(`ccb version ${pkg.version}\n`);
-    process.exit(0);
-  },
+  '--x-provider': () => handleProviderCommand(),
+  '--x-route': () => handleRouteCommand(),
+  '--x-key': () => handleKeyCommand(),
+  '--x-version': () => handleVersionsCommand(),
   '--x-help': () => {
     process.stdout.write(`
-CCB (Claude Code Bridge) Management Commands:
-  --x-version       Print the ccb version
-  --x-init          Initialize the config directory (~/.claude/.ccb)
-  --x-status        Show current daemon and worker status
-  --x-sessions      List all active sessions across workers
-  --x-killall       Kill all background proxy processes
-  --x-restart       Gracefully restart the proxy daemon (zero-downtime)
-  --x-gui           Open the GUI dashboard in your browser
-  --x-clearlogs     Delete all log files in the logs directory
-  --x-provider ...  Manage providers (add/remove)
-  --x-route ...     Manage routing rules (model/property/payloadSize)
-  --x-key ...       Manage API keys (.env)
-`);
+  CCB (Claude Code Bridge) Management Commands:
+  --x-version [add|remove|list|set]  Manage or list versions
+  --x-init                           Initialize the config directory (~/.claude/.ccb)
+  --x-status                         Show current daemon and worker status
+  --x-sessions                       List all active sessions across workers
+  --x-killall                        Kill all background proxy processes
+  --x-restart                        Gracefully restart the proxy daemon (zero-downtime)
+  --x-gui                            Open the GUI dashboard in your browser
+  --x-clearlogs                      Delete all log files in the logs directory
+  --x-provider ...                   Manage providers (add/remove)
+  --x-route ...                      Manage routing rules (model/property/payloadSize)
+  --x-key ...                        Manage API keys (.env)
+
+  Usage for Passthrough:
+  ccb [--version <v>] [claude args]
+  `);
     process.exit(0);
   }
-};
+  };
 
-function checkProxy(port, timeoutMs) {
+  function checkProxy(port, timeoutMs) {
   return new Promise((resolve) => {
     const req = http.get(`http://localhost:${port}/v1/models`, { timeout: timeoutMs }, (res) => {
       resolve(res.statusCode === 200);
@@ -559,28 +699,63 @@ function checkProxy(port, timeoutMs) {
   });
 }
 
-function startProxyDaemonProcess() {
+function fetchSessionInfo(port, timeoutMs) {
+  return new Promise((resolve) => {
+    const req = http.get(`http://localhost:${port}/__ccb_internal__/session`, { timeout: timeoutMs }, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+  });
+}
+
+function displaySessionSummary(info) {
+  if (!info) return;
+  process.stdout.write('\n── Session Summary ──\n');
+  if (info.claude_session_id) {
+    process.stdout.write(`  Claude Session: ${info.claude_session_id}\n`);
+  }
+  process.stdout.write(`  Requests: ${info.total_requests} | Tokens: ${info.total_input_tokens} in / ${info.total_output_tokens} out\n`);
+  process.stdout.write(`  Uptime: ${info.uptime_sec}s | Worker PID: ${info.worker_pid}\n`);
+  if (info.history && info.history.length > 0) {
+    process.stdout.write(`  Recent:\n`);
+    for (const line of info.history.slice(-5)) {
+      process.stdout.write(`    ${line}\n`);
+    }
+  }
+  process.stdout.write('─────────────────────\n');
+}
+
+  function startProxyDaemonProcess(versionInfo) {
   const logsDir = path.join(USER_CONFIG_DIR, LOGS_DIR_NAME);
   if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
 
   const out = fs.openSync(path.join(logsDir, 'daemon.log'), 'a');
   const err = fs.openSync(path.join(logsDir, 'daemon.err'), 'a');
 
-  const watchdogPath = path.join(path.dirname(fileURLToPath(import.meta.url)), WATCHDOG_SCRIPT_NAME);
+  let watchdogPath = path.join(path.dirname(fileURLToPath(import.meta.url)), WATCHDOG_SCRIPT_NAME);
+  if (versionInfo && versionInfo.path) {
+    watchdogPath = versionInfo.path;
+  }
 
   const child = spawnDaemon(watchdogPath, [], {
     detached: true,
     stdio: ['ignore', out, err],
-    env: { ...process.env, [PROXY_FLAG]: '1' }
+    env: { ...process.env, CCB_VERSION: versionInfo?.name || CCB_VERSION }
   });
 
   child.unref();
-}
+  }
 
-async function ensureDaemon(config) {
+  async function ensureDaemon(config, versionInfo) {
   const isUp = await checkProxy(config.port, config.healthCheckTimeoutMs);
   if (!isUp) {
-    startProxyDaemonProcess();
+    startProxyDaemonProcess(versionInfo);
     let attempts = 0;
     while (attempts < config.pollMaxAttempts) {
       await new Promise(r => setTimeout(r, config.pollIntervalMs));
@@ -590,6 +765,7 @@ async function ensureDaemon(config) {
     throw new ReadinessTimeoutException('Proxy daemon failed to start within timeout limit');
   }
 }
+
 
 /**
  * Parse a Windows .cmd npm wrapper to extract the real executable path.
@@ -642,26 +818,66 @@ async function entry() {
     Object.assign(process.env, loadEnv(envPath));
   }
 
-  if (process.argv.includes(PROXY_FLAG)) {
-    runProxyDaemon();
-    return;
-  }
-
   for (const cmd of Object.keys(CCB_CMDS)) {
     if (process.argv.includes(cmd)) {
-      CCB_CMDS[cmd]();
+      await CCB_CMDS[cmd]();
       return;
     }
   }
 
+  // Handle version flag for passthrough
+  let requestedVersion = null;
+  const versionIdx = process.argv.indexOf('--version');
+  if (versionIdx !== -1 && process.argv.length > versionIdx + 1) {
+    requestedVersion = process.argv[versionIdx + 1];
+    // Remove --version <v> from args so they don't go to Claude
+    process.argv.splice(versionIdx, 2);
+  }
+
+  const versions = loadVersions();
+  const targetVersionName = requestedVersion || versions.current || CCB_VERSION;
+  const targetVersionPath = versions.versions[targetVersionName];
+
+  if (requestedVersion && !targetVersionPath) {
+    process.stderr.write(`Error: Version ${requestedVersion} not found in registry.\n`);
+    process.exit(1);
+  }
+
   const config = loadConfigFromFile(USER_CONFIG_DIR);
-  await ensureDaemon(config);
+  await ensureDaemon(config, targetVersionPath ? { name: targetVersionName, path: targetVersionPath } : null);
 
   const ipcPath = getControlIpcPath(config.port);
-  const socket = net.connect(ipcPath, () => {
-    socket.write(serializeIpcMessage({ cmd: 'keepalive' }));
-  });
-  socket.on('error', () => {});
+  const KEEPALIVE_INTERVAL_MS = 15000;
+
+  let ipcSocket = null;
+  let keepaliveTimer = null;
+  let claudeAlive = true;
+
+  function connectKeepalive() {
+    if (ipcSocket) {
+      ipcSocket.removeAllListeners();
+      ipcSocket.destroy();
+    }
+
+    ipcSocket = net.connect(ipcPath, () => {
+      ipcSocket.write(serializeIpcMessage({ cmd: 'keepalive' }));
+      if (keepaliveTimer) clearInterval(keepaliveTimer);
+      keepaliveTimer = setInterval(() => {
+        if (ipcSocket && !ipcSocket.destroyed) {
+          ipcSocket.write(serializeIpcMessage({ cmd: 'keepalive' }));
+        }
+      }, KEEPALIVE_INTERVAL_MS);
+    });
+
+    ipcSocket.on('error', () => {});
+
+    ipcSocket.on('close', () => {
+      if (keepaliveTimer) { clearInterval(keepaliveTimer); keepaliveTimer = null; }
+      if (claudeAlive) connectKeepalive();
+    });
+  }
+
+  connectKeepalive();
 
   const args = process.argv.slice(2);
   const baseUrl = `http://localhost:${config.port}`;
@@ -672,8 +888,12 @@ async function entry() {
     env: { ...process.env, ANTHROPIC_BASE_URL: baseUrl }
   });
 
-  child.on('exit', (code) => {
-    socket.destroy();
+  child.on('exit', async (code) => {
+    claudeAlive = false;
+    if (keepaliveTimer) clearInterval(keepaliveTimer);
+    const sessionInfo = await fetchSessionInfo(config.port, config.healthCheckTimeoutMs);
+    displaySessionSummary(sessionInfo);
+    if (ipcSocket) ipcSocket.destroy();
     process.exit(code ?? 0);
   });
 }

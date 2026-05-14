@@ -12,7 +12,7 @@ import { loadConfigFromFile } from './core/config.js';
 import { ensureCompleteProviders } from './core/migrator.js';
 import { ProvidersMap, ProviderConfig } from './core/providers.js';
 import { Result, ProxyRequestContext } from './core/types.js';
-import { ConfigError } from './core/exceptions.js';
+import { ConfigError, ArgumentError } from './core/exceptions.js';
 import { buildRoutingPolicy } from './core/routing-rules.js';
 import { loadEnv } from './core/env-file.js';
 import { decompress, compress } from './core/compression.js';
@@ -27,7 +27,7 @@ import { detectFormat, convertV2ToInternal } from './core/config-adapter.js';
 import { ExtensionRegistry } from './core/extension-registry.js';
 import { discoverExtensions, buildRegistry, watchExtensions } from './core/extension-loader.js';
 export { runKill };
-export { loadEnv };
+export { loadEnv, ProxyState };
 
 class ProxyState {
   #reqCount;
@@ -76,9 +76,14 @@ export function extractUrlSession(url) {
   return { sessionId: m[1], strippedUrl: m[2] || '/' };
 }
 
+function stripBom(str) {
+  if (str.charCodeAt(0) === 0xFEFF) return str.slice(1);
+  return str;
+}
+
 function tryParseProviders(data, filepath) {
   try {
-    const raw = JSON.parse(data);
+    const raw = JSON.parse(stripBom(data));
     const format = detectFormat(raw);
     const merged = ensureCompleteProviders(raw);
 
@@ -110,6 +115,7 @@ function buildErrorResponse(res, error, startTime) {
   if (res.headersSent) return;
   const elapsedMs = startTime ? Date.now() - startTime : null;
   let payload;
+
   if (typeof error.toResponsePayload === 'function') {
     payload = error.toResponsePayload();
     // Inject timing if payload is a JSON string
@@ -124,7 +130,9 @@ function buildErrorResponse(res, error, startTime) {
         // Not valid JSON, leave as-is
       }
     }
-  } else {
+  }
+
+  if (typeof error.toResponsePayload !== 'function') {
     payload = JSON.stringify({
       type: 'error',
       error: {
@@ -134,6 +142,7 @@ function buildErrorResponse(res, error, startTime) {
       }
     });
   }
+
   res.writeHead(400, {
     'content-type': 'application/json',
     'content-length': Buffer.byteLength(payload),
@@ -156,6 +165,11 @@ export function createProxyCore({ configDir, port }) {
   let shellState = new ProxyState(0, buildRoutingPolicy({ rawPolicy: [], providerConfigs: [], legacyProvidersMap: new ProvidersMap([]) }), new ExtensionRegistry());
   let activeKeepalives = 0;
   let hasReceivedKeepalive = false;
+  const proxyStartTime = Date.now();
+  let lastClaudeSessionId = '';
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  let totalRequests = 0;
 
   const keepaliveSecret = process.env.CCB_KEEPALIVE_SECRET ?? '';
   if (keepaliveSecret) {
@@ -183,13 +197,20 @@ export function createProxyCore({ configDir, port }) {
     await logger.emit(msg, sessionId);
   }
 
+  function recordSessionUpdate({ sessionId, inputTokens, outputTokens }) {
+    if (sessionId) lastClaudeSessionId = sessionId;
+    totalInputTokens += inputTokens;
+    totalOutputTokens += outputTokens;
+    totalRequests++;
+  }
+
   // ── Response handler bound with deps ──
 
   function boundHandleResponseEnd({ resCtx, resChunks }) {
     return handleResponseEnd({
       resCtx,
       resChunks,
-      deps: { logger, errorReporter, debugLogger, emit, getConfig }
+      deps: { logger, errorReporter, debugLogger, emit, getConfig, onSessionUpdate: recordSessionUpdate }
     });
   }
 
@@ -380,6 +401,40 @@ export function createProxyCore({ configDir, port }) {
         return;
       }
 
+      if (req.method === 'GET' && req.url === '/__ccb_internal__/status') {
+        const status = {
+          version: CCB_VERSION,
+          worker_pid: process.pid,
+          uptime_sec: Math.round((Date.now() - proxyStartTime) / 1000),
+          log_path: logsDir,
+          config_path: configDir,
+          active_connections: shellState.activeConnections,
+          keepalives: activeKeepalives
+        };
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(status));
+        return;
+      }
+
+      if (req.method === 'GET' && req.url === '/__ccb_internal__/session') {
+        const history = logger.getHistory();
+        const session = {
+          ccb_version: CCB_VERSION,
+          worker_pid: process.pid,
+          uptime_sec: Math.round((Date.now() - proxyStartTime) / 1000),
+          claude_session_id: lastClaudeSessionId,
+          total_requests: totalRequests,
+          total_input_tokens: totalInputTokens,
+          total_output_tokens: totalOutputTokens,
+          log_path: logsDir,
+          active_connections: shellState.activeConnections,
+          history: history.map(s => s.toLogLine())
+        };
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(session));
+        return;
+      }
+
       if (req.method === 'GET' && req.url === '/v1/models') {
         const models = shellState.providers.allTargetModels.map((name) => ({
           id: name,
@@ -428,7 +483,16 @@ export function createProxyCore({ configDir, port }) {
             forwardToUpstream: boundForwardToUpstream,
             buildErrorResponse,
             activeConnections: shellState.activeConnections,
-            logsDir
+            logsDir,
+            sessionMetadata: {
+              version: CCB_VERSION,
+              worker_pid: process.pid,
+              uptime_sec: Math.round((Date.now() - proxyStartTime) / 1000),
+              log_path: logsDir,
+              config_path: configDir,
+              active_connections: shellState.activeConnections,
+              keepalives: activeKeepalives
+            }
           }
         });
       });
@@ -450,13 +514,23 @@ export function createProxyCore({ configDir, port }) {
 
 export function runWorkerMode({ configDir, port }) {
   const core = createProxyCore({ configDir, port });
+  const config = core.getConfig();
   let drained = false;
   let server = null;
   let drainInterval = null;
+  let handleReceived = false;
+
+  const startupTimeout = setTimeout(() => {
+    if (!handleReceived) {
+      process.stderr.write('[worker] Never received socket handle from watchdog, exiting\n');
+      process.exit(1);
+    }
+  }, config.workerInitTimeoutMs);
 
   process.on('message', (msg, handle) => {
-    // Receive socket handle from watchdog
     if (msg?.type === 'socket' && handle) {
+      handleReceived = true;
+      clearTimeout(startupTimeout);
       server = http.createServer(core.createRequestHandler());
 
       server.listen(handle, async () => {
@@ -487,9 +561,9 @@ export function runWorkerMode({ configDir, port }) {
       });
     }
 
-    // Handle drain signal
     if (msg?.type === 'drain' && !drained) {
       drained = true;
+      clearTimeout(startupTimeout);
       process.stdout.write('[worker] Drain signal received, stopping new connections\n');
 
       const config = core.getConfig();
@@ -512,7 +586,6 @@ export function runWorkerMode({ configDir, port }) {
 
       if (server) {
         server.close(() => {
-          // Don't exit — let existing connections finish via drainInterval
           process.stdout.write('[worker] Server closed to new connections\n');
         });
       }

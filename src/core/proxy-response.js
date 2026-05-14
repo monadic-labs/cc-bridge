@@ -2,6 +2,7 @@ import { RequestSummary, Result } from './types.js';
 import { ProxyError } from './exceptions.js';
 import { parseSseMetadata } from './sse-parser.js';
 import { tryParseBody } from './routing.js';
+import { filterResponseHeaders } from './headers.js';
 
 /**
  * Decompress response chunks safely, returning a Result.
@@ -39,7 +40,7 @@ export function extractTokensIfSse(raw, contentType) {
  * @param {function} params.deps.getConfig - Config accessor
  */
 export async function handleResponseEnd({ resCtx, resChunks, deps }) {
-  const { logger, errorReporter, debugLogger, emit, getConfig } = deps;
+  const { logger, errorReporter, debugLogger, emit, getConfig, onSessionUpdate } = deps;
 
   const status = resCtx.proxyRes.statusCode;
   const duration = Date.now() - resCtx.startTime;
@@ -48,19 +49,40 @@ export async function handleResponseEnd({ resCtx, resChunks, deps }) {
   const decompressRes = await decompressBodySafe(resChunks, encoding, logger);
   const raw = decompressRes.isSuccess ? decompressRes.value : Buffer.concat(resChunks).toString();
   if (!decompressRes.isSuccess) {
-    errorReporter.write(decompressRes.error, { requestId: resCtx.id, headers: resCtx.proxyRes.headers });
+    errorReporter.write(decompressRes.error, {
+      requestId: resCtx.id,
+      route: resCtx.routeLabel,
+      model: resCtx.reqModel,
+      sessionId: resCtx.sessionId,
+      headers: resCtx.proxyRes.headers,
+      operation: 'response_decompression',
+      statusCode: status,
+      upstreamUrl: resCtx.req.url,
+      elapsedMs: duration
+    });
   }
 
   try {
     const cfg = getConfig();
     await logger.logResponse(resCtx.id, status, resCtx.proxyRes.headers, raw, resCtx.sessionId, cfg);
   } catch (e) {
-    errorReporter.write(e, { operation: 'logging response' });
+    errorReporter.write(e, {
+      requestId: resCtx.id,
+      route: resCtx.routeLabel,
+      model: resCtx.reqModel,
+      sessionId: resCtx.sessionId,
+      operation: 'logging_response',
+      elapsedMs: duration
+    });
   }
 
   const { inputTokens, outputTokens } = extractTokensIfSse(raw, resCtx.proxyRes.headers['content-type']);
 
   logger.addSummary(new RequestSummary({ id: resCtx.id, route: resCtx.routeLabel, model: resCtx.reqModel, status, duration, inputTokens, outputTokens }));
+
+  if (onSessionUpdate) {
+    onSessionUpdate({ sessionId: resCtx.sessionId, inputTokens, outputTokens });
+  }
 
   const report = resCtx.sanitizationReport;
   if (report && report.convertedCount > 0) {
@@ -82,6 +104,9 @@ export async function handleResponseEnd({ resCtx, resChunks, deps }) {
       history: logger.getHistory(),
       responseBody: raw,
       requestBody,
+      operation: `upstream_http_${status}`,
+      statusCode: status,
+      elapsedMs: duration,
       debugMode: debugLogger.isDebug
     }));
 

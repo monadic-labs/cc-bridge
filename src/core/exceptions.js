@@ -67,3 +67,22 @@ export class UpstreamError extends ProxyError {
   get statusCode() { return this.#statusCode; }
   get responseBody() { return this.#responseBody; }
 }
+
+export class SessionInfoError extends ProxyError {
+  #metadata;
+
+  constructor(metadata) {
+    super('CCB Session Info', { operation: 'session-info' });
+    this.#metadata = metadata;
+  }
+
+  toResponsePayload() {
+    return JSON.stringify({
+      type: 'error',
+      error: {
+        type: 'ccb_session_info',
+        ...this.#metadata
+      }
+    });
+  }
+}
