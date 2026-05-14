@@ -95,7 +95,7 @@ export function addProvider(providers, id, url, compliant = true) {
     }
   }
 
-  updated[id] = { url, anthropicCompliant: compliant };
+  updated[id] = { url, anthropicCompliant: compliant, models: {}, toolTransforms: {} };
   return Result.ok(updated);
 }
 

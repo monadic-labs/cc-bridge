@@ -53,10 +53,6 @@ export const DEFAULT_RAW_PROVIDERS = {
   }
 };
 
-const DEFAULT_PROVIDER_ENTRY = {
-  url: "",
-  anthropicCompliant: false
-};
 
 function deepMerge(target, source) {
   for (const key of Object.keys(source)) {
@@ -102,12 +98,6 @@ export function ensureCompleteProviders(existingRaw) {
   // v2 format: merge defaults into providers object
   if (!merged.providers || typeof merged.providers !== 'object' || Array.isArray(merged.providers)) {
     merged.providers = JSON.parse(JSON.stringify(DEFAULT_RAW_PROVIDERS.providers));
-  }
-
-  if (merged.providers && typeof merged.providers === 'object' && !Array.isArray(merged.providers)) {
-    for (const [_id, cfg] of Object.entries(merged.providers)) {
-      deepMerge(cfg, DEFAULT_PROVIDER_ENTRY);
-    }
   }
 
   // Ensure routes section exists with all sub-sections
