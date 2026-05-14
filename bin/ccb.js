@@ -366,8 +366,8 @@ function clearLogs() {
   console.log(`Cleared ${removed} log file(s) from ${LOGS_DIR_NAME}`);
 }
 
-async function connectToControlIpc() {
-  const ipcPath = getControlIpcPath();
+async function connectToControlIpc(port) {
+  const ipcPath = getControlIpcPath(port);
   return new Promise((resolve) => {
     const socket = net.connect(ipcPath, () => {
       resolve(socket);
@@ -379,7 +379,8 @@ async function connectToControlIpc() {
 }
 
 async function handleStatusCommand() {
-  const socket = await connectToControlIpc();
+  const config = loadDaemonConfig(USER_CONFIG_DIR);
+  const socket = await connectToControlIpc(config.port);
   if (!socket) {
     process.stderr.write('ccb: No running proxy daemon found.\n');
     process.exit(1);
@@ -418,7 +419,8 @@ async function handleStatusCommand() {
 }
 
 async function handleSessionsCommand() {
-  const socket = await connectToControlIpc();
+  const config = loadDaemonConfig(USER_CONFIG_DIR);
+  const socket = await connectToControlIpc(config.port);
   if (!socket) {
     process.stderr.write('ccb: No running proxy daemon found.\n');
     process.exit(1);
@@ -494,7 +496,8 @@ const CCB_CMDS = {
     process.exit(0);
   },
   '--x-restart': async () => {
-    const socket = await connectToControlIpc();
+    const config = loadDaemonConfig(USER_CONFIG_DIR);
+    const socket = await connectToControlIpc(config.port);
     if (!socket) {
       process.stderr.write('ccb: No proxy daemon running.\n');
       process.exit(1);
@@ -546,9 +549,9 @@ CCB (Claude Code Bridge) Management Commands:
   }
 };
 
-function checkProxy(port) {
+function checkProxy(port, timeoutMs) {
   return new Promise((resolve) => {
-    const req = http.get(`http://localhost:${port}/v1/models`, { timeout: 500 }, (res) => {
+    const req = http.get(`http://localhost:${port}/v1/models`, { timeout: timeoutMs }, (res) => {
       resolve(res.statusCode === 200);
     });
     req.on('error', () => resolve(false));
@@ -575,15 +578,13 @@ function startProxyDaemonProcess() {
 }
 
 async function ensureDaemon(config) {
-  const isUp = await checkProxy(config.port);
+  const isUp = await checkProxy(config.port, config.healthCheckTimeoutMs);
   if (!isUp) {
     startProxyDaemonProcess();
     let attempts = 0;
-    const MAX_ATTEMPTS = 10;
-    const POLL_INTERVAL_MS = 300;
-    while (attempts < MAX_ATTEMPTS) {
-      await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
-      if (await checkProxy(config.port)) return;
+    while (attempts < config.pollMaxAttempts) {
+      await new Promise(r => setTimeout(r, config.pollIntervalMs));
+      if (await checkProxy(config.port, config.healthCheckTimeoutMs)) return;
       attempts++;
     }
     throw new ReadinessTimeoutException('Proxy daemon failed to start within timeout limit');
@@ -656,7 +657,7 @@ async function entry() {
   const config = loadConfigFromFile(USER_CONFIG_DIR);
   await ensureDaemon(config);
 
-  const ipcPath = getControlIpcPath();
+  const ipcPath = getControlIpcPath(config.port);
   const socket = net.connect(ipcPath, () => {
     socket.write(serializeIpcMessage({ cmd: 'keepalive' }));
   });

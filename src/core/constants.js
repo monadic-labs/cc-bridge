@@ -8,13 +8,14 @@ export const ENV_FILENAME = '.env';
 export const LOGS_DIR_NAME = 'logs';
 export const WATCHDOG_SCRIPT_NAME = 'ccb-watchdog.js';
 
-export function getControlIpcPath() {
+export function getControlIpcPath(port) {
+  const suffix = port ? `-${port}` : '';
   if (process.platform === 'win32') {
-    return '\\\\?\\pipe\\ccb-ctrl';
+    return `\\\\?\\pipe\\ccb-ctrl${suffix}`;
   }
   // We can't use resolveUserConfigDir here to avoid circular dependency
   // but we can assume the default if CCB_CONFIG_DIR is not set.
   const configDir = process.env.CCB_CONFIG_DIR
     || path.join(process.env.HOME || process.env.USERPROFILE, '.claude', CCB_DIR_NAME);
-  return path.join(configDir, 'ccb-ctrl.sock');
+  return path.join(configDir, `ccb-ctrl${suffix}.sock`);
 }

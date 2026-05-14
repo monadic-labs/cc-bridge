@@ -2,14 +2,16 @@
 
 import net from 'net';
 import http from 'http';
-import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import os from 'os';
-import { CCB_DIR_NAME, CCB_VERSION } from '../src/core/constants.js';
+import { CCB_DIR_NAME, CCB_VERSION as DEFAULT_VERSION } from '../src/core/constants.js';
+
+const CCB_VERSION = process.env.CCB_VERSION || DEFAULT_VERSION;
 import { getControlIpcPath } from '../src/core/daemon-constants.js';
 import { parseIpcMessage, serializeIpcMessage, validateWorkerMessage, validateCommandMessage } from '../src/core/ipc-protocol.js';
 import { loadConfigFromFile } from '../src/core/config.js';
+import { spawnDaemon } from '../src/infra/process-manager.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_SCRIPT = path.join(__dirname, '..', 'src', 'proxy.js');
@@ -17,8 +19,14 @@ const WORKER_SCRIPT = path.join(__dirname, '..', 'src', 'proxy.js');
 let activeWorker = null;
 let sharedServer = null;
 let shuttingDown = false;
+let workerDraining = false;
 let shutdownTimer = null;
+let keepaliveGraceTimer = null;
+const KEEPALIVE_GRACE_MS = 5000;
 let restartInProgress = false;
+let consecutiveCrashCount = 0;
+const MAX_CONSECUTIVE_CRASHES = 5;
+const CRASH_WINDOW_MS = 10000;
 
 const startTime = Date.now();
 
@@ -54,7 +62,7 @@ function spawnWorker() {
     });
   }
 
-  const child = spawn(process.execPath, [WORKER_SCRIPT], {
+  const child = spawnDaemon(WORKER_SCRIPT, [], {
     stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
     windowsHide: true,
     env: { ...process.env, CCB_DAEMON_WORKER: '1' }
@@ -72,6 +80,8 @@ function spawnWorker() {
     if (workerMsg.type === 'ready') {
       clearTimeout(initTimeout);
       restartInProgress = false;
+      consecutiveCrashCount = 0;
+      child._readyAt = Date.now();
       log(`Worker ready (PID ${workerMsg.pid}, ${workerMsg.routes} routes, ${workerMsg.extensions} extensions)`);
 
       // Drain old workers only after new worker is confirmed ready
@@ -115,11 +125,26 @@ function spawnWorker() {
       return;
     }
 
-    if (child === activeWorker && !shuttingDown) {
-      log('Active worker died unexpectedly, respawning...');
+    if (child === activeWorker && !shuttingDown && !workerDraining) {
+      const now = Date.now();
+      if (code !== 0 || !child._readyAt || (now - child._readyAt) < CRASH_WINDOW_MS) {
+        consecutiveCrashCount++;
+      }
+      if (code === 0 && child._readyAt && (now - child._readyAt) >= CRASH_WINDOW_MS) {
+        consecutiveCrashCount = 0;
+      }
+
+      if (consecutiveCrashCount >= MAX_CONSECUTIVE_CRASHES) {
+        log(`${MAX_CONSECUTIVE_CRASHES} consecutive worker crashes, giving up. Check daemon.err for details.`);
+        process.exit(1);
+      }
+
+      log(`Active worker died unexpectedly, respawning... (crash ${consecutiveCrashCount}/${MAX_CONSECUTIVE_CRASHES})`);
       activeWorker = spawnWorker();
     }
   });
+
+  child._readyAt = null;
 
   const handle = sharedServer._handle;
   child.send({ type: 'socket', port: config.port }, handle);
@@ -164,10 +189,16 @@ function handleControlConnection(socket) {
         if (activeWorker) {
           socketWorkerMap.set(socket, activeWorker);
         }
+        if (keepaliveGraceTimer) {
+          clearTimeout(keepaliveGraceTimer);
+          keepaliveGraceTimer = null;
+          log('Keepalive grace cancelled by reconnect');
+        }
         if (shutdownTimer) {
           clearTimeout(shutdownTimer);
           shutdownTimer = null;
           shuttingDown = false;
+          workerDraining = false;
           log('Shutdown cancelled by new keepalive');
         }
         socket.write(serializeIpcMessage({ status: 'ok', cmd: 'keepalive' }));
@@ -197,7 +228,7 @@ function handleControlConnection(socket) {
             status: 'active'
           });
         }
-        for (const [worker, state] of drainingWorkers) {
+        for (const [worker] of drainingWorkers) {
           workers.push({
             pid: worker.pid,
             version: CCB_VERSION,
@@ -279,20 +310,29 @@ function handleControlConnection(socket) {
       }
     }
 
-    // Newest worker: always shut down when last keepalive closes
+    // Newest worker: shut down when last keepalive closes (with grace period)
     if (assignedWorker === activeWorker && keepaliveConnections.size === 0 && !shuttingDown) {
       const activeKeepalives = countKeepalivesFor(activeWorker);
       if (activeKeepalives === 0) {
-        shuttingDown = true;
-        log('All keepalive connections closed for active worker, shutting down');
-        const config = getConfig();
-        if (activeWorker) {
-          activeWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
-        }
-        shutdownTimer = setTimeout(() => {
-          shutdownTimer = null;
-          process.exit(0);
-        }, config.drainTimeoutMs + 1000);
+        log(`Last keepalive closed, starting ${KEEPALIVE_GRACE_MS}ms grace before shutdown`);
+        keepaliveGraceTimer = setTimeout(() => {
+          keepaliveGraceTimer = null;
+          if (keepaliveConnections.size > 0) {
+            log('Grace period ended but new keepalive arrived, cancelling shutdown');
+            return;
+          }
+          shuttingDown = true;
+          workerDraining = true;
+          log('Grace period expired, shutting down');
+          const config = getConfig();
+          if (activeWorker) {
+            activeWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
+          }
+          shutdownTimer = setTimeout(() => {
+            shutdownTimer = null;
+            process.exit(0);
+          }, config.drainTimeoutMs + 1000);
+        }, KEEPALIVE_GRACE_MS);
       }
     }
   });
@@ -305,7 +345,8 @@ function handleControlConnection(socket) {
 
 activeWorker = spawnWorker();
 
-const ipcPath = getControlIpcPath();
+const watchdogConfig = getConfig();
+const ipcPath = getControlIpcPath(watchdogConfig.port);
 const controlServer = net.createServer(handleControlConnection);
 
 controlServer.listen(ipcPath, () => {
@@ -319,6 +360,7 @@ controlServer.on('error', (err) => {
 
 process.on('SIGINT', () => {
   shuttingDown = true;
+  workerDraining = true;
   log('SIGINT received, shutting down');
   const config = getConfig();
   if (activeWorker) {

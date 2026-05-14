@@ -49,6 +49,7 @@ export class ProxyConfig {
   #workerInitTimeoutMs;
   #drainTimeoutMs;
   #workerKeepaliveS;
+  #ipcTimeoutMs;
 
   constructor(raw) {
     if (!raw || typeof raw !== 'object') {
@@ -89,6 +90,7 @@ export class ProxyConfig {
     if (typeof daemon.workerInitTimeoutMs !== 'number' || daemon.workerInitTimeoutMs < 1000) throw new ConfigError('daemon.workerInitTimeoutMs must be a number >= 1000ms');
     if (typeof daemon.drainTimeoutMs !== 'number' || daemon.drainTimeoutMs < 1000) throw new ConfigError('daemon.drainTimeoutMs must be a number >= 1000ms');
     if (typeof daemon.workerKeepaliveS !== 'number' || daemon.workerKeepaliveS < -1) throw new ConfigError('daemon.workerKeepaliveS must be >= -1 (-1=indefinite, 0=exit on last keepalive, >0=grace period in seconds)');
+    if (typeof daemon.ipcTimeoutMs !== 'number' || daemon.ipcTimeoutMs < 100) throw new ConfigError('daemon.ipcTimeoutMs must be a number >= 100ms');
 
     const compression = raw.compression || {};
     if (typeof compression.recompressRequests !== 'boolean') throw new ConfigError('compression.recompressRequests must be explicitly true or false');
@@ -101,6 +103,7 @@ export class ProxyConfig {
     this.#workerInitTimeoutMs = daemon.workerInitTimeoutMs;
     this.#drainTimeoutMs = daemon.drainTimeoutMs;
     this.#workerKeepaliveS = daemon.workerKeepaliveS;
+    this.#ipcTimeoutMs = daemon.ipcTimeoutMs;
 
     this.#loggingEnabled = logging.enabled;
     this.#logRequests = logging.requests;
@@ -131,6 +134,7 @@ export class ProxyConfig {
   get workerInitTimeoutMs() { return this.#workerInitTimeoutMs; }
   get drainTimeoutMs() { return this.#drainTimeoutMs; }
   get workerKeepaliveS() { return this.#workerKeepaliveS; }
+  get ipcTimeoutMs() { return this.#ipcTimeoutMs; }
 }
 
 export function parseConfig(jsonString) {

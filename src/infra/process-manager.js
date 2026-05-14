@@ -29,7 +29,7 @@ export function runSync(cmd, args, options) {
   return spawnSync(cmd, args, { windowsHide: true, ...options });
 }
 
-function getProcesses() {
+export function getProcesses() {
   const isWin = process.platform === 'win32';
   try {
     if (isWin) {
@@ -135,9 +135,9 @@ export async function runKill() {
 
   // Rescan for daemons that might be hanging
   procs = getProcesses();
-  const daemonProcs = procs.filter(p =>
+    const daemonProcs = procs.filter(p =>
     p.pid !== currentPid &&
-    (p.cmd.includes('--__cc-proxy-daemon__') || p.cmd.includes(WATCHDOG_SCRIPT_NAME) || p.cmd.includes('src/proxy.js') || p.cmd.includes('src\\proxy.js'))
+    (p.cmd.includes(WATCHDOG_SCRIPT_NAME) || p.cmd.includes('src/proxy.js') || p.cmd.includes('src\\proxy.js'))
   );
 
   killed = 0;

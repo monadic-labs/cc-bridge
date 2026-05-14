@@ -8,12 +8,14 @@ const USER_CONFIG_DIR = resolveUserConfigDir();
 const config = loadConfigFromFile(USER_CONFIG_DIR);
 const PORT = config.port;
 
-// Worker mode: watchdog passes socket handle via IPC
-if (process.env.CCB_DAEMON_WORKER === '1') {
+const isWorkerMode = process.env.CCB_DAEMON_WORKER === '1';
+
+if (isWorkerMode) {
   runWorkerMode({ configDir: USER_CONFIG_DIR, port: PORT });
 }
-// Standalone mode: bind port directly
-else {
+
+if (!isWorkerMode) {
+  process.stdout.write('[dev] Running in standalone mode (no watchdog). Use `npm run proxy` for local dev only.\n');
   const core = createProxyCore({ configDir: USER_CONFIG_DIR, port: PORT });
   core.initProviders();
 
