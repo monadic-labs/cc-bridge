@@ -375,12 +375,12 @@ async function runUnitTests() {
   assert(validConfig.drainTimeoutMs === 600000, 'drainTimeoutMs');
   assert(validConfig.ipcTimeoutMs === 5000, 'ipcTimeoutMs');
   assertThrows(() => new ProxyConfig({ port: 9099, logging: { enabled: true } }), ConfigError, 'incomplete logging throws');
-  assertThrows(() => new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: -1, ipcTimeoutMs: 50 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } }), ConfigError, 'ipcTimeoutMs < 100 throws');
 
   // Config validation: watchdog timeouts
   assertThrows(() => new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 500, drainTimeoutMs: 600000, workerKeepaliveS: -1, ipcTimeoutMs: 5000 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } }), ConfigError, 'workerInitTimeoutMs < 1000 throws');
   assertThrows(() => new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 500, workerKeepaliveS: -1, ipcTimeoutMs: 5000 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } }), ConfigError, 'drainTimeoutMs < 1000 throws');
   assertThrows(() => new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: -2, ipcTimeoutMs: 5000 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } }), ConfigError, 'workerKeepaliveS < -1 throws');
+  assertThrows(() => new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: -1, ipcTimeoutMs: 50 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } }), ConfigError, 'ipcTimeoutMs < 100 throws');
   // Valid workerKeepaliveS values
   const cfgIndefinite = new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: -1, ipcTimeoutMs: 5000 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } });
   assert(cfgIndefinite.workerKeepaliveS === -1, 'workerKeepaliveS=-1 (indefinite) accepted');
@@ -393,31 +393,29 @@ async function runUnitTests() {
 
   // ── ProxyState withConnectionBump validation ──
   console.log('\nProxyState:');
-  // Test the validation logic (same code as in proxy-core.js ProxyState.withConnectionBump)
-  const makeState = (activeConnections) => ({
-    bump(delta) {
-      if (typeof delta !== 'number' || !Number.isFinite(delta)) {
-        throw new ArgumentError('delta must be a finite number');
-      }
-      const newCount = activeConnections + delta;
-      if (newCount < 0) {
-        throw new ArgumentError(`activeConnections cannot be negative (current: ${activeConnections}, delta: ${delta})`);
-      }
-      return newCount;
-    }
+  const { ProxyState: RealProxyState } = await import('../src/proxy-core.js');
+  const { buildRoutingPolicy: buildBumpPolicy } = await import('../src/core/routing-rules.js');
+  const { ProvidersMap: BumpProvidersMap } = await import('../src/core/providers.js');
+  const { ExtensionRegistry: BumpER } = await import('../src/core/extension-registry.js');
+  const bumpPolicy = buildBumpPolicy({
+    rawPolicy: [],
+    providerConfigs: [],
+    legacyProvidersMap: new BumpProvidersMap([])
   });
-  // Happy path: zero → 1 → 0
-  assert(makeState(0).bump(1) === 1, 'bump 0+1 returns 1');
-  assert(makeState(1).bump(-1) === 0, 'bump 1-1 returns 0');
-  assert(makeState(5).bump(3) === 8, 'bump 5+3 returns 8');
-  // Error path: invalid delta
-  assertThrows(() => makeState(0).bump(NaN), ArgumentError, 'NaN delta throws ArgumentError');
-  assertThrows(() => makeState(0).bump(Infinity), ArgumentError, 'Infinity delta throws ArgumentError');
-  assertThrows(() => makeState(0).bump('1'), ArgumentError, 'string delta throws ArgumentError');
-  assertThrows(() => makeState(0).bump(undefined), ArgumentError, 'undefined delta throws ArgumentError');
-  // Error path: negative result
-  assertThrows(() => makeState(0).bump(-1), ArgumentError, 'negative result throws ArgumentError');
-  assertThrows(() => makeState(2).bump(-3), ArgumentError, 'underflow result throws ArgumentError');
+  const state0 = new RealProxyState(0, bumpPolicy, new BumpER(), {}, 0);
+  assert(state0.activeConnections === 0, 'ProxyState initial connections');
+  const state1 = state0.withConnectionBump(1);
+  assert(state1.activeConnections === 1, 'bump 0+1 returns 1');
+  const stateBack = state1.withConnectionBump(-1);
+  assert(stateBack.activeConnections === 0, 'bump 1-1 returns 0');
+  const state8 = new RealProxyState(0, bumpPolicy, new BumpER(), {}, 5).withConnectionBump(3);
+  assert(state8.activeConnections === 8, 'bump 5+3 returns 8');
+  assertThrows(() => state0.withConnectionBump(NaN), ArgumentError, 'NaN delta throws ArgumentError');
+  assertThrows(() => state0.withConnectionBump(Infinity), ArgumentError, 'Infinity delta throws ArgumentError');
+  assertThrows(() => state0.withConnectionBump('1'), ArgumentError, 'string delta throws ArgumentError');
+  assertThrows(() => state0.withConnectionBump(undefined), ArgumentError, 'undefined delta throws ArgumentError');
+  assertThrows(() => state0.withConnectionBump(-1), ArgumentError, 'negative result throws ArgumentError');
+  assertThrows(() => new RealProxyState(0, bumpPolicy, new BumpER(), {}, 2).withConnectionBump(-3), ArgumentError, 'underflow result throws ArgumentError');
 
   // ── RequestInfo ──
   console.log('\nRequestInfo:');
@@ -885,9 +883,8 @@ async function runUnitTests() {
   const fallbackReg = new FallbackER();
   fallbackReg.register(createFallbackExtension());
 
-  // Mock rule objects for fallback testing
-  const ruleWithFallback = { hasFallback: true, fallbackProviderId: 'mirror', fallbackModel: 'fb-m' };
-  const ruleNoFallback = { hasFallback: false, fallbackProviderId: null, fallbackModel: null };
+  const ruleWithFallback = new ExactRule({ match: 'test-fb', targetProvider: 'mirror', targetModel: 'fb-m', fallback: { providerId: 'mirror', model: 'fb-m' } });
+  const ruleNoFallback = new ExactRule({ match: 'test-no-fb', targetProvider: 'mirror', targetModel: 'direct-m' });
 
   // shouldAttemptFallback — HTTP errors
   assert(fallbackReg.shouldAttemptFallback({ statusCode: 500, matchedRule: ruleWithFallback, fallbackDepth: 0 }) === true, 'fallback 500 with rule');
@@ -1041,7 +1038,7 @@ async function runUnitTests() {
   assert(rrFallback.matchedRule === null, 'resolveRouting no matchedRule without default fallback');
 
   // resolveRouting with default fallback
-  const fallbackProvCfg = new ProviderConfig({ id: 'fb-p', url: 'https://fallback.example.com/v1', models: {}, anthropicCompliant: true, toolTransforms: {} });
+  const fallbackProvCfg = new ProviderConfig({ id: 'fb-p', url: 'https://fallback.example.com/v1', anthropicCompliant: true, toolTransforms: {}, models: {} });
   const policyWithDefaultFallback = buildRoutingPolicy({
     rawPolicy: [],
     providerConfigs: [testProvCfg, fallbackProvCfg],
@@ -1117,11 +1114,11 @@ async function runUnitTests() {
   console.log('\nProviderConfig.toolTransforms:');
   const ProvCfg = (await import('../src/core/providers.js')).ProviderConfig;
 
-  const pcNoTransforms = new ProvCfg({ id: 'x', url: 'https://x.com', anthropicCompliant: false });
+  const pcNoTransforms = new ProvCfg({ id: 'x', url: 'https://x.com', models: {}, anthropicCompliant: false, toolTransforms: {} });
   assert(Object.keys(pcNoTransforms.toolTransforms).length === 0, 'ProviderConfig empty toolTransforms when absent');
 
   const pcWithTransforms = new ProvCfg({
-    id: 'z', url: 'https://z.ai', anthropicCompliant: false,
+    id: 'z', url: 'https://z.ai', models: {}, anthropicCompliant: false,
     toolTransforms: { web_search: { search_engine: 'search-prime', count: '5' } }
   });
   assert(pcWithTransforms.toolTransforms.web_search.count === '5', 'ProviderConfig parses toolTransforms');
@@ -1559,6 +1556,228 @@ async function runUnitTests() {
   // Extension hook converts for openai provider
   const ofTransformed = ofExt.hooks.requestTransform.transform({ body: anthropicReq, provider: { id: 'synthetic' } });
   assert(ofTransformed.messages[0].role === 'system', 'openai provider gets converted request');
+
+  // ── ErrorReporter (zero-mock, writes to real temp dir) ──
+  console.log('\nErrorReporter:');
+
+  const { ErrorReporter } = await import('../src/infra/error-reporter.js');
+  const { UpstreamError } = await import('../src/core/exceptions.js');
+  const errTestDir = path.join(os.tmpdir(), `ccb-err-test-${Date.now()}`);
+  const reporter = new ErrorReporter({ logsDir: errTestDir });
+
+  try {
+
+    // Happy path — upstream error with full context
+    console.log('  upstream error report:');
+    const upstreamErr = new UpstreamError('Upstream HTTP 408', { code: 'ETIMEDOUT' });
+    const result1 = reporter.write(upstreamErr, {
+      requestId: 42,
+      route: 'exact:z→glm-5.1',
+      method: 'POST',
+      url: '/v1/messages?beta=true',
+      model: 'glm-5.1',
+      sessionId: 'sess-abc123',
+      headers: {
+        'authorization': 'Bearer sk-ant-oat01-longsecrettoken1234567890',
+        'x-api-key': 'sk-real-key-1234567890',
+        'content-type': 'application/json',
+        'x-claude-code-session-id': 'real-session-id'
+      },
+      responseBody: '{"error":{"type":"timeout_error","message":"Request timed out"}}',
+      operation: 'upstream_error',
+      statusCode: 408,
+      upstreamUrl: 'https://api.z.ai/api/anthropic',
+      elapsedMs: 30042
+    });
+
+    assert(result1 !== null, 'write returns result');
+    assert(typeof result1.errorId === 'string', 'result has errorId');
+    assert(result1.errorId.startsWith('ccb-'), 'errorId has ccb- prefix');
+    assert(result1.errorId.length > 10, 'errorId is non-trivial');
+    assert(typeof result1.filePath === 'string', 'result has filePath');
+    assert(result1.filePath.endsWith('.err'), 'filePath ends with .err');
+
+    const file1 = fs.readFileSync(result1.filePath, 'utf8');
+
+    assert(file1.includes('Error ID: ccb-'), 'file contains error ID header');
+    assert(file1.includes('Error ID: ' + result1.errorId), 'file contains exact error ID');
+    assert(file1.includes('Operation: upstream_error'), 'file contains operation');
+    assert(file1.includes('Request ID: #42'), 'file contains request ID');
+    assert(file1.includes('Route: exact:z→glm-5.1'), 'file contains route');
+    assert(file1.includes('Method: POST'), 'file contains method');
+    assert(file1.includes('URL: /v1/messages?beta=true'), 'file contains URL with query');
+    assert(file1.includes('Model: glm-5.1'), 'file contains model');
+    assert(file1.includes('Session: sess-abc123'), 'file contains session ID');
+    assert(file1.includes('Status: 408'), 'file contains status code');
+    assert(file1.includes('Upstream: https://api.z.ai/api/anthropic'), 'file contains upstream URL');
+    assert(file1.includes('Elapsed: 30042ms'), 'file contains elapsed time');
+    assert(file1.includes('Upstream HTTP 408'), 'file contains error message');
+    assert(file1.includes('timeout_error'), 'file contains response body content');
+
+    assert(!file1.includes('sk-ant-oat01-longsecrettoken'), 'authorization token is redacted');
+    assert(!file1.includes('Bearer sk-ant'), 'Bearer prefix is not exposed');
+    assert(file1.includes('authorization:'), 'authorization header name is present');
+    assert(file1.includes('...[REDACTED]'), 'redaction marker is present');
+    assert(!file1.includes('sk-real-key-1234567890'), 'x-api-key is redacted');
+    assert(file1.includes('content-type: application/json'), 'non-sensitive header preserved');
+    assert(file1.includes('x-claude-code-session-id: real-session-id'), 'session header preserved');
+
+    assert(file1.includes('Quote the Error ID'), 'footer has correlation hint');
+
+    const errFiles = fs.readdirSync(errTestDir).filter(f => f.endsWith('.err'));
+    assert(errFiles.length === 1, 'exactly one .err file written');
+    assert(errFiles[0].includes('42-'), 'filename contains request ID');
+    assert(errFiles[0].includes(result1.errorId), 'filename contains error ID');
+
+    // Config error — minimal context
+    console.log('  config error report:');
+    const configErr = new ConfigError('Port must be a number');
+    const result2 = reporter.write(configErr, {
+      operation: 'parsing config.json'
+    });
+    assert(result2 !== null, 'config error returns result');
+    assert(result2.errorId.startsWith('ccb-'), 'config error has ccb- prefix');
+    assert(result2.errorId !== result1.errorId, 'error IDs are unique');
+
+    const file2 = fs.readFileSync(result2.filePath, 'utf8');
+    assert(file2.includes('Operation: parsing config.json'), 'config error has operation');
+    assert(file2.includes('Port must be a number'), 'config error has message');
+    assert(!file2.includes('Status:'), 'no status when not provided');
+    assert(!file2.includes('Upstream:'), 'no upstream when not provided');
+    assert(!file2.includes('Elapsed:'), 'no elapsed when not provided');
+
+    // Request body redaction — metadata.user_id must not leak
+    console.log('  request body redaction:');
+    const result3 = reporter.write(new UpstreamError('body redaction test', {}), {
+      requestId: 7,
+      operation: 'request_processing',
+      requestBody: {
+        model: 'glm-5.1',
+        metadata: {
+          user_id: JSON.stringify({ device_id: 'abc123', account_uuid: 'uuid-456' })
+        },
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'secret conversation text here' }] }
+        ],
+        system: [
+          { type: 'thinking', thinking: 'internal reasoning data' }
+        ]
+      },
+      debugMode: true
+    });
+
+    const file3 = fs.readFileSync(result3.filePath, 'utf8');
+    assert(!file3.includes('secret conversation text'), 'text content is redacted');
+    assert(!file3.includes('internal reasoning'), 'thinking content is redacted');
+    assert(!file3.includes('device_id'), 'device_id is redacted');
+    assert(!file3.includes('account_uuid'), 'account_uuid is redacted');
+    assert(!file3.includes('abc123'), 'device_id value is redacted');
+    assert(file3.includes('[redacted:'), 'redaction markers present');
+    assert(file3.includes('"model": "glm-5.1"'), 'model is preserved');
+    assert(file3.includes('"role": "user"'), 'role is preserved');
+
+    // Non-debug mode — no request body section
+    console.log('  non-debug mode:');
+    const result4 = reporter.write(new UpstreamError('non-debug test', {}), {
+      requestId: 8,
+      operation: 'test',
+      requestBody: { model: 'test' }
+    });
+    const file4 = fs.readFileSync(result4.filePath, 'utf8');
+    assert(!file4.includes('Request Body Structure'), 'no body section in non-debug mode');
+
+    // Long response body truncation
+    console.log('  response body truncation:');
+    const longBody = 'x'.repeat(8192);
+    const result5 = reporter.write(new UpstreamError('truncation test', {}), {
+      requestId: 9,
+      operation: 'test',
+      responseBody: longBody
+    });
+    const file5 = fs.readFileSync(result5.filePath, 'utf8');
+    assert(file5.includes('truncated, 8192 chars total'), 'long body is truncated');
+    assert(file5.includes('x'.repeat(4096)), 'first 4096 chars preserved');
+
+    // Sensitive header redaction completeness
+    console.log('  all sensitive headers redacted:');
+    const result6 = reporter.write(new UpstreamError('header redaction test', {}), {
+      requestId: 10,
+      operation: 'test',
+      headers: {
+        'authorization': 'Bearer secret-token-value',
+        'cookie': 'session=abc123',
+        'set-cookie': 'session=abc123',
+        'x-api-key': 'sk-key-1234567890',
+        'anthropic-dangerous-direct-browser-access': 'true',
+        'x-stainless-retry-count': '3',
+        'accept': 'application/json',
+        'user-agent': 'claude-cli/2.1.128'
+      }
+    });
+    const file6 = fs.readFileSync(result6.filePath, 'utf8');
+    assert(!file6.includes('secret-token-value'), 'authorization value redacted');
+    assert(!file6.includes('session=abc123'), 'cookie value redacted');
+    assert(!file6.includes('sk-key-1234567890'), 'x-api-key value redacted');
+    assert(!file6.includes('anthropic-dangerous-direct-browser-access: true'), 'dangerous header redacted');
+    assert(!file6.includes('x-stainless-retry-count: 3'), 'retry count redacted');
+    assert(file6.includes('accept: application/json'), 'accept header preserved');
+    assert(file6.includes('user-agent: claude-cli/2.1.128'), 'user-agent preserved');
+
+    // Error ID uniqueness across rapid writes
+    console.log('  error ID uniqueness:');
+    const ids = new Set();
+    for (let i = 0; i < 50; i++) {
+      const r = reporter.write(new UpstreamError('batch test', {}), { requestId: 100 + i, operation: 'batch' });
+      ids.add(r.errorId);
+    }
+    assert(ids.size === 50, '50 writes produce 50 unique error IDs');
+
+    // Request history inclusion
+    console.log('  request history:');
+    const history = [
+      new RequestSummary({ id: 1, route: 'exact:z→glm-5.1', model: 'glm-5.1', status: 200, duration: 1200, inputTokens: 500, outputTokens: 100 }),
+      new RequestSummary({ id: 2, route: 'exact:z→glm-5.1', model: 'glm-5.1', status: 408, duration: 30000, inputTokens: 500, outputTokens: 0 })
+    ];
+    const result7 = reporter.write(new UpstreamError('after history', {}), {
+      requestId: 3,
+      operation: 'test',
+      history
+    });
+    const file7 = fs.readFileSync(result7.filePath, 'utf8');
+    assert(file7.includes('Recent Requests'), 'history section present');
+    assert(file7.includes('#1 exact:z→glm-5.1 | 200 | 1200ms'), 'first history entry');
+    assert(file7.includes('#2 exact:z→glm-5.1 | 408 | 30000ms'), 'second history entry');
+
+  } finally {
+    fs.rmSync(errTestDir, { recursive: true, force: true });
+  }
+
+  // ── Logger timestamps ──
+  console.log('\nLogger timestamps:');
+
+  const { Logger } = await import('../src/infra/logger.js');
+  const logTestDir = path.join(os.tmpdir(), `ccb-log-test-${Date.now()}`);
+  const logFile = path.join(logTestDir, 'test.log');
+
+  try {
+    const logger = new Logger({ logsDir: logTestDir, defaultLog: logFile, maxHistory: 10 });
+    await logger.emit('[REQ #1] → test /v1/messages', 'sess-test');
+
+    const sessionLog = path.join(logTestDir, 'session-sess-test.log');
+    const logContent = fs.readFileSync(sessionLog, 'utf8');
+    const timeRegex = /^\[sess-test\] \d{2}:\d{2}:\d{2} \[REQ #1\]/;
+    assert(timeRegex.test(logContent), 'log line includes HH:MM:SS timestamp');
+
+    assert(logContent.includes('[sess-test]'), 'session prefix present');
+    assert(logContent.includes('[REQ #1]'), 'log line content preserved');
+
+    await logger.emit('[RES #1] ← 200', null);
+    const logContent2 = fs.readFileSync(logFile, 'utf8');
+    const timeRegex2 = /^\d{2}:\d{2}:\d{2} \[RES #1\]/;
+    assert(timeRegex2.test(logContent2), 'non-session log also has timestamp');
+  } finally {
+    fs.rmSync(logTestDir, { recursive: true, force: true });
+  }
 
 }
 

@@ -136,7 +136,17 @@ function singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, getConfig
 
   proxyReq.on('error', (err) => {
     if (ctx.clientAborted) return;
-    errorReporter.write(err, { operation: 'upstream request', url: target.href });
+    errorReporter.write(new UpstreamError(err.message, { code: err.code }), {
+      requestId: ctx.id,
+      route: ctx.routeLabel,
+      method: ctx.req.method,
+      url: ctx.req.url,
+      model: ctx.reqModel,
+      sessionId: ctx.sessionId,
+      operation: 'upstream_tcp_error',
+      upstreamUrl: target.href,
+      elapsedMs: Date.now() - ctx.startTime
+    });
 
     if (onRetryNeeded && shouldRetryTcpError(err, _retryConfig)) {
       onRetryNeeded(err.code);
@@ -253,7 +263,7 @@ function handleProxyResponse({ reqCtx, proxyRes, headers, handleResponseEnd, err
           }
         }
       }
-      streamBufferedError(reqCtx, proxyRes, chunks, handleResponseEnd, headers);
+      streamBufferedError(reqCtx, proxyRes, chunks, handleResponseEnd, headers, errorReporter);
       return;
     }
 
@@ -280,18 +290,48 @@ function handleNormalResponse(reqCtx, proxyRes, chunks, handleResponseEnd, heade
   });
   handleResponseEnd({ resCtx, resChunks: chunks });
 }
-function streamBufferedError(reqCtx, proxyRes, chunks, _handleResponseEnd, _headers) {
+function streamBufferedError(reqCtx, proxyRes, chunks, _handleResponseEnd, _headers, errorReporter) {
   if (reqCtx.clientAborted) return;
+
+  let errorId = null;
+  const body = Buffer.concat(chunks).toString();
+  if (errorReporter) {
+    const result = errorReporter.write(new UpstreamError(`Upstream HTTP ${proxyRes.statusCode}`), {
+      requestId: reqCtx.id,
+      route: reqCtx.routeLabel,
+      method: reqCtx.req.method,
+      url: reqCtx.req.url,
+      model: reqCtx.reqModel,
+      sessionId: reqCtx.sessionId,
+      headers: proxyRes.headers,
+      responseBody: body,
+      operation: 'upstream_error',
+      statusCode: proxyRes.statusCode,
+      upstreamUrl: reqCtx.targetBase,
+      elapsedMs: Date.now() - reqCtx.startTime
+    });
+    if (result) errorId = result.errorId;
+  }
 
   if (reqCtx.res.headersSent) {
     if (!reqCtx.res.writableEnded) reqCtx.res.end();
     return;
   }
   const resHeaders = filterResponseHeaders(proxyRes.headers);
+  if (errorId) resHeaders['x-ccb-error-id'] = errorId;
   reqCtx.res.writeHead(proxyRes.statusCode, resHeaders);
-  for (const chunk of chunks) {
-    reqCtx.res.write(chunk);
+
+  let outBody = body;
+  if (errorId && body) {
+    try {
+      const parsed = JSON.parse(body);
+      if (parsed.error && typeof parsed.error === 'object') {
+        parsed.error.ccb_error_id = errorId;
+        outBody = JSON.stringify(parsed);
+      }
+    } catch { }
   }
+  reqCtx.res.write(outBody);
   reqCtx.res.end();
 }
 

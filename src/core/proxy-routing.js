@@ -2,6 +2,7 @@ import { RequestInfo, Option } from './types.js';
 import { redactHeaders } from './headers.js';
 import { applyRoutingWithMatch, applyAuthHeaders, extractSessionId } from './routing.js';
 import { providerIdToEnvKey, ProviderMatch } from './providers.js';
+import { SessionInfoError, RoutingError } from './exceptions.js';
 
 /**
  * Resolve routing for an incoming request body against the active policy.
@@ -15,11 +16,19 @@ import { providerIdToEnvKey, ProviderMatch } from './providers.js';
  * @param {string} params.urlSessionId - Session ID from URL prefix (/s/{id}/)
  * @param {object} params.routedHeaders - Headers to forward upstream
  * @param {string} params.anthropicBaseUrl - Fallback Anthropic API base URL
+ * @param {object} params.sessionMetadata - Metadata for ccb.session.info
  * @returns {{ reqModel: string, sessionId: string, routing: RoutingResult, routedHeaders: object, match: ProviderMatch|null }}
  */
-export async function resolveRouting({ policy, body, urlSessionId, routedHeaders, anthropicBaseUrl, extensions, openaiProviders }) {
+export async function resolveRouting({ policy, body, urlSessionId, routedHeaders, anthropicBaseUrl, extensions, openaiProviders, sessionMetadata }) {
   const reqModel = body.model ?? 'unknown';
   const sessionId = urlSessionId || extractSessionId(body);
+
+  if (reqModel === 'ccb.session.info') {
+    throw new SessionInfoError({
+      ...sessionMetadata,
+      session_id: sessionId
+    });
+  }
 
   const evalOpt = policy.evaluateWithRule(body);
 
@@ -90,21 +99,23 @@ export async function resolveRouting({ policy, body, urlSessionId, routedHeaders
  * @param {string} params.anthropicBaseUrl - Fallback Anthropic API base URL
  * @param {Logger} params.logger - Logger instance
  * @param {function} params.getConfig - Config accessor
+ * @param {object} params.sessionMetadata - Metadata for ccb.session.info
  * @returns {Promise<ProxyRequestContext>} Context with routing applied
  */
-export async function processRequestBody({ ctx, body, policy, extensions, anthropicBaseUrl, logger, getConfig, openaiProviders }) {
-  const { reqModel, sessionId, routing, routedHeaders, matchedRule, match } = await resolveRouting({
+export async function processRequestBody({ ctx, body, policy, extensions, anthropicBaseUrl, logger, getConfig, openaiProviders, sessionMetadata }) {
+  const { reqModel, sessionId, routing, routedHeaders, matchedRule } = await resolveRouting({
     policy,
     body,
     urlSessionId: ctx.urlSessionId,
     routedHeaders: ctx.routedHeaders,
     anthropicBaseUrl,
     extensions,
-    openaiProviders
+    openaiProviders,
+    sessionMetadata
   });
 
   if (!routing) {
-    throw new Error('Routing resolution failed: no routing result returned');
+    throw new RoutingError('Routing resolution failed: no routing result returned', { context: { reqModel, sessionId }});
   }
 
   const requestInfo = new RequestInfo({

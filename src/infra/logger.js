@@ -18,8 +18,9 @@ export class Logger {
   }
 
   async emit(line, sessionId) {
+    const ts = new Date().toISOString().slice(11, 19);
     const sessionPrefix = sessionId ? `[${sessionId}] ` : '';
-    const out = sessionPrefix + line + '\n';
+    const out = `${sessionPrefix}${ts} ${line}\n`;
     process.stdout.write(out);
     try {
       if (!fs.existsSync(this.#logsDir)) fs.mkdirSync(this.#logsDir, { recursive: true });

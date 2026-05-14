@@ -1,9 +1,7 @@
 import { copyRequestHeaders } from './headers.js';
 import { tryParseBody } from './routing.js';
 import { processRequestBody } from './proxy-routing.js';
-import { extractSessionId } from './routing.js';
 import { ProxyError } from './exceptions.js';
-import { CCB_VERSION } from './constants.js';
 
 /**
  * Handle the end of an incoming request: decompress, parse, route, compress, forward.
@@ -26,7 +24,11 @@ import { CCB_VERSION } from './constants.js';
  * @param {function} params.deps.buildErrorResponse - Error response builder
  */
 export async function handleRequestEnd({ ctx, chunks, deps }) {
-  const { decompress, compress, errorReporter, debugLogger, getConfig, forwardToUpstream, buildErrorResponse, policy, extensions, logger, openaiProviders } = deps;
+  const { 
+    decompress, compress, errorReporter, debugLogger, getConfig, 
+    forwardToUpstream, buildErrorResponse, policy, extensions, 
+    logger, openaiProviders, sessionMetadata 
+  } = deps;
 
   const rawBuffer = Buffer.concat(chunks);
   const encoding = ctx.req.headers['content-encoding'];
@@ -35,7 +37,14 @@ export async function handleRequestEnd({ ctx, chunks, deps }) {
   if (encoding) {
     const decompressRes = await decompress(rawBuffer, encoding);
     if (!decompressRes.isSuccess) {
-      errorReporter.write(decompressRes.error, { operation: 'decompressing request body', headers: ctx.req.headers });
+      errorReporter.write(decompressRes.error, {
+        operation: 'request_decompression',
+        requestId: ctx.id,
+        route: ctx.routeLabel,
+        method: ctx.req.method,
+        url: ctx.req.url,
+        headers: ctx.req.headers
+      });
     }
     if (decompressRes.isSuccess) {
       decompressedBody = decompressRes.value;
@@ -55,29 +64,6 @@ export async function handleRequestEnd({ ctx, chunks, deps }) {
 
   const bodyOpt = tryParseBody(decompressedBody);
 
-  // Intercept ccb.session.info command
-  if (bodyOpt.isSome && bodyOpt.value.model === 'ccb.session.info') {
-    const sessionId = activeCtx.urlSessionId || extractSessionId(bodyOpt.value) || 'unknown';
-    const response = {
-      type: 'error',
-      error: {
-        type: 'invalid_request_error',
-        message: `Invalid model: ccb.session.info\n\n${JSON.stringify({
-          session_id: sessionId,
-          version: CCB_VERSION,
-          worker_pid: process.pid,
-          uptime_sec: Math.round(process.uptime()),
-          log_path: deps.logsDir || '~/.claude/.ccb/logs',
-          config_path: process.env.CCB_CONFIG_DIR || '~/.claude/.ccb',
-          active_connections: deps.activeConnections || 0
-        }, null, 2)}`
-      }
-    };
-    activeCtx.res.writeHead(400, { 'content-type': 'application/json' });
-    activeCtx.res.end(JSON.stringify(response));
-    return;
-  }
-
   if (bodyOpt.isNone) {
     if (encoding) {
       delete activeCtx.routedHeaders['content-encoding'];
@@ -86,8 +72,14 @@ export async function handleRequestEnd({ ctx, chunks, deps }) {
     if (decompressedBody.length > 0) {
       errorReporter.write(new ProxyError('Failed to parse JSON request body. Bypassing sanitization.', { operation: 'parsing request body' }), {
         requestId: activeCtx.id,
+        route: activeCtx.routeLabel,
+        method: activeCtx.req.method,
+        url: activeCtx.req.url,
+        model: activeCtx.reqModel,
+        sessionId: activeCtx.sessionId,
         headers: activeCtx.req.headers,
-        operation: 'parsing request body',
+        operation: 'request_body_parse',
+        elapsedMs: Date.now() - activeCtx.startTime,
         debugMode: debugLogger.isDebug
       });
     }
@@ -105,7 +97,8 @@ export async function handleRequestEnd({ ctx, chunks, deps }) {
       anthropicBaseUrl: getConfig().anthropicBaseUrl,
       logger,
       getConfig,
-      openaiProviders
+      openaiProviders,
+      sessionMetadata
     });
 
     const config = getConfig();
@@ -143,6 +136,8 @@ export async function handleRequestEnd({ ctx, chunks, deps }) {
       headers: activeCtx.req.headers,
       sessionId: activeCtx.sessionId,
       requestBody: bodyOpt.value,
+      operation: 'request_processing',
+      elapsedMs: Date.now() - activeCtx.startTime,
       debugMode: debugLogger.isDebug
     });
     buildErrorResponse(activeCtx.res, e, activeCtx.startTime);
