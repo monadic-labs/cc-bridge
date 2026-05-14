@@ -173,17 +173,18 @@ async function runUnitTests() {
 
   // ── ProviderConfig ──
   console.log('\nProviderConfig:');
-  const cfg = new ProviderConfig({ id: 'test-id', url: 'https://example.com', models: { a: 'model-a' }, anthropicCompliant: true });
+  const cfg = new ProviderConfig({ id: 'test-id', url: 'https://example.com', models: { a: 'model-a' }, anthropicCompliant: true, toolTransforms: {} });
   assert(cfg.id === 'test-id', 'id getter');
   assert(cfg.url === 'https://example.com', 'url getter');
   assert(cfg.anthropicCompliant === true, 'anthropicCompliant getter');
-  assertThrows(() => new ProviderConfig({ url: '', models: {}, anthropicCompliant: true }), ArgumentError, 'empty url throws');
-  assertThrows(() => new ProviderConfig({ url: 'https://x.com', models: {} }), ArgumentError, 'missing anthropicCompliant throws');
+  assertThrows(() => new ProviderConfig({ id: 'test-id', url: '', models: {}, anthropicCompliant: true, toolTransforms: {} }), ArgumentError, 'empty url throws');
+  assertThrows(() => new ProviderConfig({ id: 'test-id', url: 'https://x.com', models: {}, toolTransforms: {} }), ArgumentError, 'missing anthropicCompliant throws');
+  assertThrows(() => new ProviderConfig({ id: 'test-id', url: 'https://x.com', models: {}, anthropicCompliant: true }), ArgumentError, 'missing toolTransforms throws');
 
   // ── ProvidersMap ──
   console.log('\nProvidersMap:');
-  const p1 = new ProviderConfig({ id: 'p1', url: 'https://a.com', models: { 'glm': 'glm-4.7', 'sonnet': 'claude-sonnet-4-6' }, anthropicCompliant: false });
-  const p2 = new ProviderConfig({ id: 'p2', url: 'https://b.com', models: ['local-model'], anthropicCompliant: true });
+  const p1 = new ProviderConfig({ id: 'p1', url: 'https://a.com', models: { 'glm': 'glm-4.7', 'sonnet': 'claude-sonnet-4-6' }, anthropicCompliant: false, toolTransforms: {} });
+  const p2 = new ProviderConfig({ id: 'p2', url: 'https://b.com', models: ['local-model'], anthropicCompliant: true, toolTransforms: {} });
   const pmap = new ProvidersMap([p1, p2]);
   assert(pmap.size === 3, 'size === 3');
   const match = pmap.resolve('glm');
@@ -478,9 +479,13 @@ async function runUnitTests() {
 
   // parsePayloadSizeKey
   const ps1 = parsePayloadSizeKey('>102400');
-  assert(ps1.operator === '>' && ps1.thresholdBytes === 102400, 'parsePayloadSizeKey gt');
+  assert(ps1.operator === 'gt' && ps1.thresholdBytes === 102400, 'parsePayloadSizeKey gt');
   const ps2 = parsePayloadSizeKey('<50000');
-  assert(ps2.operator === '<' && ps2.thresholdBytes === 50000, 'parsePayloadSizeKey lt');
+  assert(ps2.operator === 'lt' && ps2.thresholdBytes === 50000, 'parsePayloadSizeKey lt');
+  const ps2b = parsePayloadSizeKey('>=50000');
+  assert(ps2b.operator === 'gte' && ps2b.thresholdBytes === 50000, 'parsePayloadSizeKey gte');
+  const ps2c = parsePayloadSizeKey('<=50000');
+  assert(ps2c.operator === 'lte' && ps2c.thresholdBytes === 50000, 'parsePayloadSizeKey lte');
   const ps3 = parsePayloadSizeKey('99999');
   assert(ps3.operator === 'gt' && ps3.thresholdBytes === 99999, 'parsePayloadSizeKey bare number');
   assertThrows(() => parsePayloadSizeKey('invalid'), Error, 'parsePayloadSizeKey invalid');
@@ -731,8 +736,8 @@ async function runUnitTests() {
   // ── RoutingPolicy ──
   console.log('\nRoutingPolicy:');
   const policyProviders = [
-    new ProviderConfig({ id: 'mirror', url: 'https://mirror.example.com/v1', models: { 'mirror-model': 'real-model' }, anthropicCompliant: true }),
-    new ProviderConfig({ id: 'local', url: 'http://localhost:11434/v1', models: {}, anthropicCompliant: false })
+    new ProviderConfig({ id: 'mirror', url: 'https://mirror.example.com/v1', models: { 'mirror-model': 'real-model' }, anthropicCompliant: true, toolTransforms: {} }),
+    new ProviderConfig({ id: 'local', url: 'http://localhost:11434/v1', models: {}, anthropicCompliant: false, toolTransforms: {} })
   ];
   const legacyMap = new ProvidersMap(policyProviders);
 
@@ -1001,7 +1006,7 @@ async function runUnitTests() {
   const { resolveRouting: resolveRoutingFn } = await import('../src/core/proxy-routing.js');
 
   // Build a simple policy for testing
-  const testProvCfg = new ProviderConfig({ id: 'test-p', url: 'https://test.com/v1', models: { 't-model': 'real-model' }, anthropicCompliant: false });
+  const testProvCfg = new ProviderConfig({ id: 'test-p', url: 'https://test.com/v1', models: { 't-model': 'real-model' }, anthropicCompliant: false, toolTransforms: {} });
   const testPolicy = buildRoutingPolicy({
     rawPolicy: [],
     providerConfigs: [testProvCfg],
@@ -1033,7 +1038,7 @@ async function runUnitTests() {
   assert(rrFallback.matchedRule === null, 'resolveRouting no matchedRule without default fallback');
 
   // resolveRouting with default fallback
-  const fallbackProvCfg = new ProviderConfig({ id: 'fb-p', url: 'https://fallback.example.com/v1', anthropicCompliant: true });
+  const fallbackProvCfg = new ProviderConfig({ id: 'fb-p', url: 'https://fallback.example.com/v1', models: {}, anthropicCompliant: true, toolTransforms: {} });
   const policyWithDefaultFallback = buildRoutingPolicy({
     rawPolicy: [],
     providerConfigs: [testProvCfg, fallbackProvCfg],
@@ -1322,7 +1327,7 @@ async function runUnitTests() {
 
   // buildRegistry with provider that has toolTransforms.web_search
   const providerWithWs = new ProviderConfig({
-    id: 'z', url: 'https://api.z.ai/api/anthropic', anthropicCompliant: false,
+    id: 'z', url: 'https://api.z.ai/api/anthropic', models: {}, anthropicCompliant: false,
     toolTransforms: { web_search: {} }
   });
   const { registry: regWithWs } = buildRegistry(discovered, [providerWithWs]);

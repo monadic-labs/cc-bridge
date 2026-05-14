@@ -62,16 +62,17 @@ function transformRequest({ body, provider }, searchConfig) {
   if (!provider?.toolTransforms?.web_search) return body;
 
   let transformed = false;
-  const tools = Array.isArray(body.tools) ? [...body.tools] : null;
+  let newTools = body.tools;
 
   // Rewrite tool definitions
-  if (tools) {
-    for (let i = 0; i < tools.length; i++) {
-      if (typeof tools[i]?.type === 'string' && WEB_SEARCH_TOOL_RE.test(tools[i].type)) {
-        tools[i] = { type: 'web_search', name: 'web_search', web_search: { ...searchConfig } };
+  if (Array.isArray(body.tools)) {
+    newTools = body.tools.map(tool => {
+      if (typeof tool?.type === 'string' && WEB_SEARCH_TOOL_RE.test(tool.type)) {
         transformed = true;
+        return { type: 'web_search', name: 'web_search', web_search: { ...searchConfig } };
       }
-    }
+      return tool;
+    });
   }
 
   // Sanitize history: convert web_search tool_use/tool_result to text blocks
@@ -79,7 +80,10 @@ function transformRequest({ body, provider }, searchConfig) {
   if (messages !== body.messages) transformed = true;
 
   if (!transformed) return body;
-  return { ...body, ...(tools ? { tools } : {}), messages };
+  
+  const result = { ...body, messages };
+  if (newTools) result.tools = newTools;
+  return result;
 }
 
 /**

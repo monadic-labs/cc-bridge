@@ -77,8 +77,9 @@ export function parsePayloadSizeKey(key) {
     throw new ArgumentError('payloadSize key must be a non-empty string', { context: { key } });
   }
 
+  const SYMBOL_TO_OP = Object.freeze({ '>': 'gt', '<': 'lt', '>=': 'gte', '<=': 'lte' });
   const m = key.match(/^([<>]=?)\s*(\d+)$/);
-  if (m) return { operator: m[1], thresholdBytes: parseInt(m[2], 10) };
+  if (m) return { operator: SYMBOL_TO_OP[m[1]], thresholdBytes: parseInt(m[2], 10) };
 
   const bareNum = key.match(/^(\d+)$/);
   if (bareNum) return { operator: 'gt', thresholdBytes: parseInt(bareNum[1], 10) };
@@ -117,11 +118,11 @@ export function convertV2ToInternal(v2Json) {
   for (const [id, cfg] of Object.entries(providersObj)) {
     providers.push({
       id,
-      url: cfg.url ?? '',
-      models: {},
-      anthropicCompliant: cfg.anthropicCompliant ?? false,
+      url: cfg.url,
+      models: cfg.models,
+      anthropicCompliant: cfg.anthropicCompliant,
       apiKey: cfg.apiKey,
-      toolTransforms: cfg.toolTransforms ?? null
+      toolTransforms: cfg.toolTransforms
     });
   }
 
@@ -182,6 +183,11 @@ export function convertV2ToInternal(v2Json) {
       rule.targetModel = target.model;
     }
 
+    if (value.pool) {
+      rule.type = 'pool'; // Property rules can act as pool selectors too
+      rule.pool = typeof value.pool === 'string' ? { entries: [value.pool] } : value.pool;
+    }
+
     if (value.fallback && value.fallback.length > 0) {
       const fb = parseTarget(value.fallback[0]);
       rule.fallback = { providerId: fb.providerId, model: fb.model };
@@ -206,6 +212,11 @@ export function convertV2ToInternal(v2Json) {
       const target = parseTarget(value.target);
       rule.targetProvider = target.providerId;
       rule.targetModel = target.model;
+    }
+
+    if (value.pool) {
+      rule.type = 'pool';
+      rule.pool = typeof value.pool === 'string' ? { entries: [value.pool] } : value.pool;
     }
 
     if (value.fallback && value.fallback.length > 0) {

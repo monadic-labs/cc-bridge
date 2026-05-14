@@ -21,20 +21,27 @@ export class ProviderConfig {
   #toolTransforms;
 
   constructor({ id, url, models, anthropicCompliant, toolTransforms }) {
-    if (id !== undefined && typeof id !== 'string') {
-      throw new ArgumentError('ProviderConfig.id must be a string', { context: { id: typeof id } });
+    if (typeof id !== 'string' || !id) {
+      throw new ArgumentError('ProviderConfig.id is required and must be a non-empty string', { context: { id } });
     }
-    if (!url || typeof url !== 'string') {
-      throw new ArgumentError('ProviderConfig.url is required', { context: { url } });
+    if (typeof url !== 'string' || !url) {
+      throw new ArgumentError('ProviderConfig.url is required and must be a non-empty string', { context: { url } });
     }
-    if (anthropicCompliant === undefined) {
-      throw new ArgumentError('ProviderConfig.anthropicCompliant must be explicitly true or false', { context: { url } });
+    if (models === undefined || models === null) {
+      throw new ArgumentError('ProviderConfig.models must be explicitly provided (use {} for empty)', { context: { id } });
     }
-    this.#id = id ?? '';
+    if (anthropicCompliant === undefined || anthropicCompliant === null) {
+      throw new ArgumentError('ProviderConfig.anthropicCompliant must be explicitly true or false', { context: { id } });
+    }
+    if (toolTransforms === undefined || toolTransforms === null) {
+      throw new ArgumentError('ProviderConfig.toolTransforms must be explicitly provided (use {} for empty)', { context: { id } });
+    }
+
+    this.#id = id;
     this.#url = url;
-    this.#models = normalizeModelsToObject(models ?? {});
+    this.#models = normalizeModelsToObject(models);
     this.#anthropicCompliant = anthropicCompliant;
-    this.#toolTransforms = toolTransforms ? Object.freeze({ ...toolTransforms }) : Object.freeze({});
+    this.#toolTransforms = Object.freeze({ ...toolTransforms });
     Object.freeze(this);
   }
 
