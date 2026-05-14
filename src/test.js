@@ -9,7 +9,8 @@ import {
   PROVIDERS_FILENAME,
   CONFIG_FILENAME,
   ENV_FILENAME,
-  CCB_DIR_NAME
+  CCB_DIR_NAME,
+  WATCHDOG_SCRIPT_NAME
 } from '../src/core/constants.js';
 import { ArgumentError } from '../src/core/exceptions.js';
 
@@ -363,7 +364,7 @@ async function runUnitTests() {
   const validConfig = new ProxyConfig({
     port: 9099,
     anthropicBaseUrl: 'https://api.anthropic.com',
-    daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: -1 },
+    daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: -1, ipcTimeoutMs: 5000 },
     logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 },
     compression: { recompressRequests: true }
   });
@@ -372,20 +373,22 @@ async function runUnitTests() {
   assert(validConfig.upstreamTimeoutMs === 600000, 'upstreamTimeoutMs');
   assert(validConfig.workerInitTimeoutMs === 20000, 'workerInitTimeoutMs');
   assert(validConfig.drainTimeoutMs === 600000, 'drainTimeoutMs');
+  assert(validConfig.ipcTimeoutMs === 5000, 'ipcTimeoutMs');
   assertThrows(() => new ProxyConfig({ port: 9099, logging: { enabled: true } }), ConfigError, 'incomplete logging throws');
+  assertThrows(() => new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: -1, ipcTimeoutMs: 50 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } }), ConfigError, 'ipcTimeoutMs < 100 throws');
 
   // Config validation: watchdog timeouts
-  assertThrows(() => new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 500, drainTimeoutMs: 600000, workerKeepaliveS: -1 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } }), ConfigError, 'workerInitTimeoutMs < 1000 throws');
-  assertThrows(() => new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 500, workerKeepaliveS: -1 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } }), ConfigError, 'drainTimeoutMs < 1000 throws');
-  assertThrows(() => new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: -2 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } }), ConfigError, 'workerKeepaliveS < -1 throws');
+  assertThrows(() => new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 500, drainTimeoutMs: 600000, workerKeepaliveS: -1, ipcTimeoutMs: 5000 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } }), ConfigError, 'workerInitTimeoutMs < 1000 throws');
+  assertThrows(() => new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 500, workerKeepaliveS: -1, ipcTimeoutMs: 5000 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } }), ConfigError, 'drainTimeoutMs < 1000 throws');
+  assertThrows(() => new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: -2, ipcTimeoutMs: 5000 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } }), ConfigError, 'workerKeepaliveS < -1 throws');
   // Valid workerKeepaliveS values
-  const cfgIndefinite = new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: -1 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } });
+  const cfgIndefinite = new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: -1, ipcTimeoutMs: 5000 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } });
   assert(cfgIndefinite.workerKeepaliveS === -1, 'workerKeepaliveS=-1 (indefinite) accepted');
-  const cfgZero = new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: 0 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } });
+  const cfgZero = new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: 0, ipcTimeoutMs: 5000 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } });
   assert(cfgZero.workerKeepaliveS === 0, 'workerKeepaliveS=0 (last keepalive) accepted');
-  const cfgGrace = new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: 60 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } });
+  const cfgGrace = new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: 60, ipcTimeoutMs: 5000 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } });
   assert(cfgGrace.workerKeepaliveS === 60, 'workerKeepaliveS=60 (grace period) accepted');
-  const cfgDecimal = new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: 0.5 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } });
+  const cfgDecimal = new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: 0.5, ipcTimeoutMs: 5000 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } });
   assert(cfgDecimal.workerKeepaliveS === 0.5, 'workerKeepaliveS=0.5 (decimal) accepted');
 
   // ── ProxyState withConnectionBump validation ──
@@ -1628,6 +1631,7 @@ async function setupTestConfig() {
     providers: {
       "zai": {
         url: "https://api.z.ai/api/anthropic",
+        models: {},
         anthropicCompliant: false,
         toolTransforms: {
           web_search: {
@@ -1639,7 +1643,10 @@ async function setupTestConfig() {
         }
       },
       "synthetic": {
-        "url": "https://api.openai.com/v1"
+        "url": "https://api.openai.com/v1",
+        models: {},
+        anthropicCompliant: false,
+        toolTransforms: {}
       }
     },
     extensions: {
@@ -1659,7 +1666,7 @@ async function setupTestConfig() {
 
   const config = {
     port: TEST_PORT,
-    daemon: { healthCheckTimeoutMs: 1000, pollIntervalMs: 200, pollMaxAttempts: 15 },
+    daemon: { healthCheckTimeoutMs: 1000, pollIntervalMs: 200, pollMaxAttempts: 15, upstreamTimeoutMs: 0, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: -1, ipcTimeoutMs: 5000 },
     logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000, level: 'trace' }
   };
   fs.writeFileSync(path.join(TEST_CONFIG_DIR, CONFIG_FILENAME), JSON.stringify(config, null, 2), 'utf8');
@@ -1684,11 +1691,11 @@ import { spawnDaemon, runSync } from '../src/infra/process-manager.js';
 let testDaemonPid = null;
 
 async function startTestDaemon() {
-  const CCB_BIN = path.join(PKG_ROOT, 'bin', 'ccb.js');
+  const WATCHDOG_BIN = path.join(PKG_ROOT, 'bin', WATCHDOG_SCRIPT_NAME);
   const out = fs.openSync(path.join(TEST_CONFIG_DIR, LOGS_DIR_NAME, 'daemon.log'), 'a');
   const err = fs.openSync(path.join(TEST_CONFIG_DIR, LOGS_DIR_NAME, 'daemon.err'), 'a');
 
-  const child = spawnDaemon(CCB_BIN, ['--__cc-proxy-daemon__'], {
+  const child = spawnDaemon(WATCHDOG_BIN, [], {
     detached: true,
     stdio: ['ignore', out, err],
     windowsHide: true,
