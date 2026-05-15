@@ -786,14 +786,44 @@ function displaySessionSummary(info) {
 
   startProxyDaemonProcess(versionInfo);
 
-  let attempts = 0;
-  while (attempts < config.pollMaxAttempts) {
+  // Phase-aware startup wait. The hard ceiling is daemonStartTimeoutMs (defaults
+  // to workerInitTimeoutMs — typically 20s — so a slow first boot can finish).
+  // The "stuck" detector is daemonStartProgressGraceMs: if no new bytes appear
+  // in daemon.log for that long AND the daemon isn't reachable, declare it
+  // stuck. Each new chunk of log resets the stuck timer because that's evidence
+  // the worker is still making forward progress through bind/initProviders/
+  // extension-discovery.
+  const totalBudgetMs = config.daemonStartTimeoutMs;
+  const stuckGraceMs = config.daemonStartProgressGraceMs;
+  const logPath = path.join(LOGS_DIR, 'daemon.log');
+
+  const started = Date.now();
+  let lastLogSize = (() => { try { return fs.statSync(logPath).size; } catch { return 0; } })();
+  let lastProgressAt = Date.now();
+
+  while (Date.now() - started < totalBudgetMs) {
     await new Promise(r => setTimeout(r, config.pollIntervalMs));
-    // runtime.json may appear after the first few attempts; keep re-reading.
+
+    // Did the daemon write anything new? Treat that as forward progress.
+    let currentSize;
+    try { currentSize = fs.statSync(logPath).size; } catch { currentSize = lastLogSize; }
+    if (currentSize > lastLogSize) {
+      lastLogSize = currentSize;
+      lastProgressAt = Date.now();
+    }
+
     if (await checkProxy(readActivePort(config), config.healthCheckTimeoutMs)) return;
-    attempts++;
+
+    if (Date.now() - lastProgressAt > stuckGraceMs) {
+      throw new ReadinessTimeoutException(
+        `Proxy daemon stuck — no log activity for ${stuckGraceMs}ms. See ${logPath} and ${path.join(LOGS_DIR, 'daemon.err')}.`
+      );
+    }
   }
-  throw new ReadinessTimeoutException('Proxy daemon failed to start within timeout limit');
+  throw new ReadinessTimeoutException(
+    `Proxy daemon failed to start within ${totalBudgetMs}ms (daemonStartTimeoutMs). ` +
+    `Raise it in your ccb config.json if your startup is legitimately slow, or check ${path.join(LOGS_DIR, 'daemon.err')}.`
+  );
 }
 
 

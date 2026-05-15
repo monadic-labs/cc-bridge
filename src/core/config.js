@@ -50,6 +50,8 @@ export class ProxyConfig {
   #drainTimeoutMs;
   #workerKeepaliveS;
   #ipcTimeoutMs;
+  #daemonStartTimeoutMs;
+  #daemonStartProgressGraceMs;
 
   constructor(raw) {
     if (!raw || typeof raw !== 'object') {
@@ -91,6 +93,8 @@ export class ProxyConfig {
     if (typeof daemon.drainTimeoutMs !== 'number' || daemon.drainTimeoutMs < 1000) throw new ConfigError('daemon.drainTimeoutMs must be a number >= 1000ms');
     if (typeof daemon.workerKeepaliveS !== 'number' || daemon.workerKeepaliveS < -1) throw new ConfigError('daemon.workerKeepaliveS must be >= -1 (-1=indefinite, 0=exit on last keepalive, >0=grace period in seconds)');
     if (typeof daemon.ipcTimeoutMs !== 'number' || daemon.ipcTimeoutMs < 100) throw new ConfigError('daemon.ipcTimeoutMs must be a number >= 100ms');
+    if (typeof daemon.daemonStartTimeoutMs !== 'number' || daemon.daemonStartTimeoutMs < 1000) throw new ConfigError('daemon.daemonStartTimeoutMs must be a number >= 1000ms (overall ceiling the CLI waits for the worker to become reachable)');
+    if (typeof daemon.daemonStartProgressGraceMs !== 'number' || daemon.daemonStartProgressGraceMs < 500) throw new ConfigError('daemon.daemonStartProgressGraceMs must be a number >= 500ms (how long the CLI waits with no daemon.log progress before declaring stuck)');
 
     const compression = raw.compression || {};
     if (typeof compression.recompressRequests !== 'boolean') throw new ConfigError('compression.recompressRequests must be explicitly true or false');
@@ -104,6 +108,8 @@ export class ProxyConfig {
     this.#drainTimeoutMs = daemon.drainTimeoutMs;
     this.#workerKeepaliveS = daemon.workerKeepaliveS;
     this.#ipcTimeoutMs = daemon.ipcTimeoutMs;
+    this.#daemonStartTimeoutMs = daemon.daemonStartTimeoutMs;
+    this.#daemonStartProgressGraceMs = daemon.daemonStartProgressGraceMs;
 
     this.#loggingEnabled = logging.enabled;
     this.#logRequests = logging.requests;
@@ -135,6 +141,8 @@ export class ProxyConfig {
   get drainTimeoutMs() { return this.#drainTimeoutMs; }
   get workerKeepaliveS() { return this.#workerKeepaliveS; }
   get ipcTimeoutMs() { return this.#ipcTimeoutMs; }
+  get daemonStartTimeoutMs() { return this.#daemonStartTimeoutMs; }
+  get daemonStartProgressGraceMs() { return this.#daemonStartProgressGraceMs; }
 }
 
 export function parseConfig(jsonString) {
