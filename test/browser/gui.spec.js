@@ -228,23 +228,50 @@ test('Extensions tab: activation tag rendered for each card', async ({ page }) =
   await expect(page.locator('main .card[data-extension="web-search-zai"] .tag')).toContainText('Activates per-provider');
 });
 
-test('Daemon Config tab: JSON editor renders current config and accepts save', async ({ page }) => {
+// Select an input by the dot-path it writes to. We bake the path into the
+// onchange attribute of each form field (e.g.
+//   onchange="updateConfigNumber('daemon.daemonStartProgressGraceMs', ...)").
+// Matching on that attribute is precise: each path is unique and the locator
+// can't accidentally resolve to a parent form-group that contains the field.
+function inputForPath(page, path) {
+  return page.locator(`main input[onchange*="'${path}'"]`);
+}
+function selectForPath(page, path) {
+  return page.locator(`main select[onchange*="'${path}'"]`);
+}
+
+test('Daemon Config tab: form renders fields and edits round-trip', async ({ page }) => {
   await page.goto('/gui');
   await appReady(page);
   await page.locator('nav li[data-tab="daemon"]').click();
 
   await expect(page.locator('main h2')).toHaveText('Daemon Config');
-  const editor = page.locator('#daemon-config-editor');
-  await expect(editor).toBeVisible();
 
-  const initial = await editor.inputValue();
-  const parsed = JSON.parse(initial);
-  expect(parsed.port).toBe(PORT);
-  expect(parsed.daemon.ipcTimeoutMs).toBe(5000);
+  // Top-level port field
+  await expect(inputForPath(page, 'port')).toHaveValue(String(PORT));
 
-  // Flip logging.level to debug, save, verify on-disk persistence.
-  parsed.logging.level = 'debug';
-  await editor.fill(JSON.stringify(parsed, null, 2));
+  // Edit daemonStartProgressGraceMs via the form
+  const graceInput = inputForPath(page, 'daemon.daemonStartProgressGraceMs');
+  await graceInput.fill('20000');
+  await graceInput.blur();
+
+  await page.locator('#save-btn').click();
+
+  const persisted = await pollDaemonReload(() => {
+    try {
+      const onDisk = JSON.parse(fs.readFileSync(DAEMON_CFG_PATH, 'utf8'));
+      return onDisk.daemon?.daemonStartProgressGraceMs === 20000;
+    } catch { return false; }
+  });
+  expect(persisted).toBe(true);
+});
+
+test('Daemon Config tab: enum field (logging.level) round-trips', async ({ page }) => {
+  await page.goto('/gui');
+  await appReady(page);
+  await page.locator('nav li[data-tab="daemon"]').click();
+
+  await selectForPath(page, 'logging.level').selectOption('debug');
   await page.locator('#save-btn').click();
 
   const persisted = await pollDaemonReload(() => {
@@ -256,18 +283,39 @@ test('Daemon Config tab: JSON editor renders current config and accepts save', a
   expect(persisted).toBe(true);
 });
 
-test('Daemon Config tab: invalid JSON surfaces a parse error in-line', async ({ page }) => {
+test('Daemon Config tab: boolean field (compression.recompressRequests) toggles', async ({ page }) => {
   await page.goto('/gui');
   await appReady(page);
   await page.locator('nav li[data-tab="daemon"]').click();
 
-  const editor = page.locator('#daemon-config-editor');
-  await editor.fill('{not valid json');
-  // Dispatch an explicit input event in case fill() didn't trigger one
-  // for the listener (Playwright fill normally does; this is belt + braces).
-  await editor.evaluate((el) => el.dispatchEvent(new Event('input', { bubbles: true })));
+  const cb = inputForPath(page, 'compression.recompressRequests');
+  // Fixture has it true; flip to false.
+  await expect(cb).toBeChecked();
+  await cb.uncheck();
+  await page.locator('#save-btn').click();
 
-  await expect(page.locator('main').getByText(/JSON parse error/)).toBeVisible();
+  const persisted = await pollDaemonReload(() => {
+    try {
+      const onDisk = JSON.parse(fs.readFileSync(DAEMON_CFG_PATH, 'utf8'));
+      return onDisk.compression?.recompressRequests === false;
+    } catch { return false; }
+  });
+  expect(persisted).toBe(true);
+});
+
+test('Daemon Config tab: raw JSON details surface reflects current state', async ({ page }) => {
+  await page.goto('/gui');
+  await appReady(page);
+  await page.locator('nav li[data-tab="daemon"]').click();
+
+  // Expand the <details>
+  await page.locator('main summary').click();
+  const rawPre = page.locator('main pre');
+  await expect(rawPre).toBeVisible();
+  const raw = await rawPre.textContent();
+  const parsed = JSON.parse(raw);
+  expect(parsed.port).toBe(PORT);
+  expect(parsed.daemon.ipcTimeoutMs).toBe(5000);
 });
 
 test('Status tab: shows daemon metadata, log tail, and restart button', async ({ page }) => {
@@ -470,10 +518,15 @@ test('Daemon Config tab: save with a busted port shows a backend error toast', a
   await appReady(page);
   await page.locator('nav li[data-tab="daemon"]').click();
 
-  const editor = page.locator('#daemon-config-editor');
-  const original = JSON.parse(await editor.inputValue());
-  original.port = -1;  // domain-invalid but JSON-valid
-  await editor.fill(JSON.stringify(original, null, 2));
+  // The new form renders <input type="number" min="1" max="65535"> for port.
+  // The browser's number-input validation would block typing -1, so we bypass
+  // it the way the daemon would actually receive a bad value: set via JS and
+  // dispatch the change event.
+  await page.evaluate(() => {
+    const portInput = document.querySelector('main input[type="number"]');
+    portInput.value = '-1';
+    portInput.dispatchEvent(new Event('change', { bubbles: true }));
+  });
 
   await page.locator('#save-btn').click();
 

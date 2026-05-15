@@ -1,11 +1,10 @@
 const state = {
     config: null,
     daemonConfig: null,
+    daemonConfigSchema: null,
     schema: null,
     extensions: null,
     activeTab: 'providers',
-    daemonConfigDraft: null,
-    daemonConfigError: ''
 };
 
 const $ = (id) => document.getElementById(id);
@@ -27,18 +26,18 @@ function escapeAttr(value) {
 
 async function load() {
     try {
-        const [configRes, schemaRes, daemonRes, extensionsRes] = await Promise.all([
+        const [configRes, schemaRes, daemonRes, extensionsRes, daemonSchemaRes] = await Promise.all([
             fetch('/api/config'),
             fetch('/api/schema'),
             fetch('/api/daemon-config'),
-            fetch('/api/extensions')
+            fetch('/api/extensions'),
+            fetch('/api/daemon-config-schema')
         ]);
         state.config = await configRes.json();
         state.schema = await schemaRes.json();
         state.daemonConfig = await daemonRes.json();
         state.extensions = await extensionsRes.json();
-        state.daemonConfigDraft = JSON.stringify(state.daemonConfig, null, 2);
-        state.daemonConfigError = '';
+        state.daemonConfigSchema = daemonSchemaRes.ok ? await daemonSchemaRes.json() : null;
         render();
     } catch (e) {
         showToast('Failed to load configuration: ' + e.message, 'error');
@@ -307,7 +306,10 @@ function renderSchemaForm(p, schema, value) {
     if (schema.type !== 'object') return '';
 
     if (schema.properties) {
-        return Object.entries(schema.properties).map(([key, prop]) => renderProperty(`${p}.${key}`, key, prop, value?.[key])).join('');
+        return Object.entries(schema.properties).map(([key, prop]) => {
+            const childPath = p ? `${p}.${key}` : key;
+            return renderProperty(childPath, key, prop, value?.[key]);
+        }).join('');
     }
 
     if (schema.additionalProperties) {
@@ -407,49 +409,66 @@ function renderInput(p, prop, value) {
         return `<input type="checkbox" ${value === true ? 'checked' : ''} onchange="updateConfig('${p}', this.checked)" style="width: auto;">`;
     }
     if (prop.type === 'array') {
+        const items = prop.items?.type;
         const lines = Array.isArray(value) ? value.join('\n') : '';
-        return `<textarea onchange="updateConfig('${p}', this.value.split('\\n').filter(Boolean))">${escapeHtml(lines)}</textarea>`;
+        // updateConfigArray casts to the right element type so config.json
+        // round-trips with proper numbers/strings, not stringified numbers.
+        return `<textarea onchange="updateConfigArray('${p}', this.value, '${escapeAttr(items ?? 'string')}')">${escapeHtml(lines)}</textarea>`;
+    }
+    if (prop.type === 'integer' || prop.type === 'number') {
+        const step = prop.type === 'integer' ? '1' : 'any';
+        const minAttr = typeof prop.minimum === 'number' ? ` min="${prop.minimum}"` : '';
+        const maxAttr = typeof prop.maximum === 'number' ? ` max="${prop.maximum}"` : '';
+        return `<input type="number" step="${step}"${minAttr}${maxAttr} value="${escapeAttr(value ?? '')}" onchange="updateConfigNumber('${p}', this.value, '${prop.type}')">`;
     }
     return `<input type="text" value="${escapeAttr(value)}" onchange="updateConfig('${p}', this.value)">`;
+}
+
+function updateConfigNumber(p, raw, kind) {
+    const parsed = kind === 'integer' ? parseInt(raw, 10) : parseFloat(raw);
+    if (!Number.isFinite(parsed)) {
+        showToast(`Invalid number for ${p}`, 'error');
+        return;
+    }
+    updateConfigOn(state.daemonConfig, p, parsed);
+}
+
+function updateConfigArray(p, raw, itemKind) {
+    const lines = raw.split('\n').map(s => s.trim()).filter(Boolean);
+    const cast = lines.map(line => {
+        if (itemKind === 'integer') return parseInt(line, 10);
+        if (itemKind === 'number') return parseFloat(line);
+        return line;
+    }).filter(v => itemKind === 'string' || Number.isFinite(v));
+    updateConfigOn(state.daemonConfig, p, cast);
 }
 
 // ── Daemon Config ───────────────────────────────────────────────────────
 
 function renderDaemonConfig() {
-    const draft = state.daemonConfigDraft ?? JSON.stringify(state.daemonConfig ?? {}, null, 2);
-    content.innerHTML = `
-        <h2>Daemon Config</h2>
-        <p style="color: #94a3b8;">Settings stored in <code>~/.claude/.ccb/config.json</code>. Validated before write; the daemon hot-reloads on save.</p>
-        <div class="card">
-            <div class="form-group">
-                <label>config.json</label>
-                <textarea id="daemon-config-editor" rows="24" style="font-family: ui-monospace, 'SF Mono', Consolas, monospace; font-size: 0.85rem;">${escapeHtml(draft)}</textarea>
-                <p id="daemon-config-error" style="color: var(--error); font-size: 0.85rem; margin: 0.5rem 0; display: none;"></p>
-            </div>
-            <p style="color: #64748b; font-size: 0.8rem;">Key fields: <code>port</code>, <code>daemon.healthCheckTimeoutMs</code>, <code>daemon.upstreamTimeoutMs</code>, <code>daemon.workerKeepaliveS</code>, <code>daemon.ipcTimeoutMs</code>, <code>logging.level</code>, <code>compression.recompressRequests</code>.</p>
-        </div>
-    `;
-    const editor = $('daemon-config-editor');
-    const errorEl = $('daemon-config-error');
-    // If the previous render had an error pending (tab switch with pending
-    // error), surface it immediately.
-    if (state.daemonConfigError) {
-        errorEl.textContent = state.daemonConfigError;
-        errorEl.style.display = 'block';
+    const schema = state.daemonConfigSchema;
+    const cfg = state.daemonConfig ?? {};
+    let html = '<h2>Daemon Config</h2>';
+    html += '<p style="color: #94a3b8;">Settings stored in <code>~/.claude/.ccb/config.json</code>. Saves validate against the ProxyConfig contract; the daemon hot-reloads on success.</p>';
+
+    if (!schema) {
+        html += '<p style="color: var(--error);">Schema unavailable — daemon may not be running.</p>';
+        content.innerHTML = html;
+        return;
     }
-    editor.addEventListener('input', () => {
-        state.daemonConfigDraft = editor.value;
-        try {
-            JSON.parse(editor.value);
-            state.daemonConfigError = '';
-            errorEl.textContent = '';
-            errorEl.style.display = 'none';
-        } catch (e) {
-            state.daemonConfigError = `JSON parse error: ${e.message}`;
-            errorEl.textContent = state.daemonConfigError;
-            errorEl.style.display = 'block';
-        }
-    });
+
+    html += `<div class="card">${renderSchemaForm('', schema, cfg)}</div>`;
+
+    // Power-user escape hatch: full JSON, collapsed by default. Kept so a user
+    // can paste-edit / diff / inspect the raw shape without the form UI.
+    const rawJson = JSON.stringify(cfg, null, 2);
+    html += `
+        <details class="card" style="cursor: pointer;">
+            <summary style="font-weight: 600; user-select: none;">Raw JSON (read-only — edit fields above to change)</summary>
+            <pre style="background: #0f172a; padding: 1rem; border-radius: 0.4rem; max-height: 400px; overflow: auto; font-size: 0.8rem; color: #cbd5e1; margin: 0.75rem 0 0;">${escapeHtml(rawJson)}</pre>
+        </details>
+    `;
+    content.innerHTML = html;
 }
 
 // ── Status ──────────────────────────────────────────────────────────────
@@ -539,14 +558,28 @@ function formatDuration(seconds) {
 
 // ── Provider/route shared helpers ──────────────────────────────────────
 
-function updateConfig(p, value) {
+// Generic path-write into any root object. updateConfig is the
+// providers.json-rooted shorthand; the daemon-config form uses updateConfigOn
+// against state.daemonConfig so the two configs don't clobber each other.
+function updateConfigOn(root, p, value) {
     const parts = p.split('.');
-    let current = state.config;
+    let current = root;
     for (let i = 0; i < parts.length - 1; i++) {
         if (!current[parts[i]]) current[parts[i]] = {};
         current = current[parts[i]];
     }
     current[parts[parts.length - 1]] = value;
+}
+
+function updateConfig(p, value) {
+    // The form schema renderer is shared between providers.json (which roots
+    // at state.config) and daemon config (state.daemonConfig). Detect which
+    // surface this path targets and route accordingly.
+    if (p.startsWith('daemon.') || p === 'port' || p === 'anthropicBaseUrl'
+        || p.startsWith('logging.') || p.startsWith('compression.')) {
+        return updateConfigOn(state.daemonConfig, p, value);
+    }
+    return updateConfigOn(state.config, p, value);
 }
 
 function addProvider() {
@@ -599,13 +632,15 @@ async function save() {
         return;
     }
 
-    if (state.daemonConfigDraft && state.daemonConfigDraft !== JSON.stringify(state.daemonConfig, null, 2)) {
+    // Daemon config form writes directly into state.daemonConfig. POST it
+    // regardless of whether anything changed — the daemon's POST handler is
+    // idempotent (writes the same bytes back, hot-reload no-ops).
+    if (state.daemonConfig) {
         try {
-            const parsed = JSON.parse(state.daemonConfigDraft);
             const res = await fetch('/api/daemon-config', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(parsed)
+                body: JSON.stringify(state.daemonConfig)
             });
             if (!res.ok) {
                 showToast('Daemon config rejected: ' + await res.text(), 'error');
@@ -633,6 +668,8 @@ window.deleteRoute = deleteRoute;
 window.addRouteEntry = addRouteEntry;
 window.deleteRouteEntry = deleteRouteEntry;
 window.updateConfig = updateConfig;
+window.updateConfigNumber = updateConfigNumber;
+window.updateConfigArray = updateConfigArray;
 window.addMapEntry = addMapEntry;
 window.deleteMapEntry = deleteMapEntry;
 window.restartDaemon = restartDaemon;
