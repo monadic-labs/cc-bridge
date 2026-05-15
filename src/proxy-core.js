@@ -446,6 +446,13 @@ export function createProxyCore({ configDir, port }) {
         const lines = Math.min(Math.max(parseInt(url.searchParams.get('lines') || '200', 10), 1), 5000);
         const logFile = path.join(logsDir, 'daemon.log');
         fs.readFile(logFile, 'utf8', (err, data) => {
+          if (err && err.code === 'ENOENT') {
+            // Log was rotated/cleared — return empty 200 rather than confusing a
+            // dashboard with a 500.
+            res.writeHead(200, { 'Content-Type': 'text/plain' });
+            res.end('');
+            return;
+          }
           if (err) {
             res.writeHead(500, { 'Content-Type': 'text/plain' });
             res.end(`Cannot read ${logFile}: ${err.message}`);
