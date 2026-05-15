@@ -1649,10 +1649,13 @@ async function runUnitTests() {
 
     assert(file1.includes('Quote the Error ID'), 'footer has correlation hint');
 
-    const errFiles = fs.readdirSync(errTestDir).filter(f => f.endsWith('.err'));
-    assert(errFiles.length === 1, 'exactly one .err file written');
+    const sessionSubdir = path.join(errTestDir, 'sess-abc123');
+    assert(fs.existsSync(sessionSubdir), 'per-session subdir created from sessionId');
+    const errFiles = fs.readdirSync(sessionSubdir).filter(f => f.endsWith('.err'));
+    assert(errFiles.length === 1, 'exactly one .err file written in session subdir');
     assert(errFiles[0].includes('42-'), 'filename contains request ID');
     assert(errFiles[0].includes(result1.errorId), 'filename contains error ID');
+    assert(result1.filePath.includes(path.join('sess-abc123', errFiles[0])), 'returned filePath points into session subdir');
 
     // Config error — minimal context
     console.log('  config error report:');
@@ -1788,7 +1791,8 @@ async function runUnitTests() {
     const logger = new Logger({ logsDir: logTestDir, defaultLog: logFile, maxHistory: 10 });
     await logger.emit('[REQ #1] → test /v1/messages', 'sess-test');
 
-    const sessionLog = path.join(logTestDir, 'session-sess-test.log');
+    const sessionLog = path.join(logTestDir, 'sess-test', 'session.log');
+    assert(fs.existsSync(path.join(logTestDir, 'sess-test')), 'per-session subdir created');
     const logContent = fs.readFileSync(sessionLog, 'utf8');
     const timeRegex = /^\[sess-test\] \d{2}:\d{2}:\d{2} \[REQ #1\]/;
     assert(timeRegex.test(logContent), 'log line includes HH:MM:SS timestamp');
@@ -2401,15 +2405,16 @@ function checkThinkingInLogs() {
   const logsDir = path.join(TEST_CONFIG_DIR, LOGS_DIR_NAME);
   if (!fs.existsSync(logsDir)) return { hasThinking: false, details: 'No logs dir' };
 
-  const sessionLogs = fs.readdirSync(logsDir)
-    .filter(f => f.startsWith('session-') && f.endsWith('.log'))
-    .map(f => ({ name: f, time: fs.statSync(path.join(logsDir, f)).mtime.getTime() }))
+  const sessionLogs = fs.readdirSync(logsDir, { withFileTypes: true })
+    .filter(d => d.isDirectory() && d.name !== '_unknown' && d.name !== 'api-samples' && !d.name.startsWith('archive-'))
+    .map(d => path.join(logsDir, d.name, 'session.log'))
+    .filter(p => fs.existsSync(p))
+    .map(p => ({ path: p, time: fs.statSync(p).mtime.getTime() }))
     .sort((a, b) => b.time - a.time);
 
   if (sessionLogs.length === 0) return { hasThinking: false, details: 'No session logs' };
 
-  const latest = path.join(logsDir, sessionLogs[0].name);
-  const content = fs.readFileSync(latest, 'utf8');
+  const content = fs.readFileSync(sessionLogs[0].path, 'utf8');
 
   // Check for thinking blocks in response logs (SSE events)
   const hasThinkingBlock = content.includes('"type":"thinking"') || content.includes('"type":"thinking_delta"');

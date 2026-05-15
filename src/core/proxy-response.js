@@ -111,7 +111,7 @@ export async function handleResponseEnd({ resCtx, resChunks, deps }) {
     }));
 
     if (debugLogger.isDebug) {
-      await debugLogger.dumpErrorPayloads(resCtx.id, {
+      await debugLogger.dumpErrorPayloads(resCtx.sessionId, resCtx.id, {
         raw: resCtx.rawBody,
         sanitized: resCtx.forwardBody
       });
