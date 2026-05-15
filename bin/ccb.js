@@ -717,6 +717,28 @@ const CCB_CMDS = {
   }
   };
 
+  // Cheap "is anything listening on this TCP port" probe. Faster than
+  // checkProxy (which does an HTTP GET and waits for /v1/models to respond)
+  // and — critically — doesn't depend on log-file buffering, so it works
+  // as a progress signal during daemon startup on Windows where stdout is
+  // block-buffered. The port is listenable as soon as the worker's bind
+  // returns, often seconds before the first log line flushes to disk.
+  function tcpProbe(port, timeoutMs) {
+    return new Promise((resolve) => {
+      const sock = net.connect({ host: '127.0.0.1', port });
+      let done = false;
+      const finish = (ok) => {
+        if (done) return;
+        done = true;
+        try { sock.destroy(); } catch { /* already destroyed */ }
+        resolve(ok);
+      };
+      sock.once('connect', () => finish(true));
+      sock.once('error', () => finish(false));
+      sock.setTimeout(timeoutMs, () => finish(false));
+    });
+  }
+
   function checkProxy(port, timeoutMs) {
   return new Promise((resolve) => {
     const req = http.get(`http://localhost:${port}/v1/models`, { timeout: timeoutMs }, (res) => {
@@ -786,13 +808,16 @@ function displaySessionSummary(info) {
 
   startProxyDaemonProcess(versionInfo);
 
-  // Phase-aware startup wait. The hard ceiling is daemonStartTimeoutMs (defaults
-  // to workerInitTimeoutMs — typically 20s — so a slow first boot can finish).
-  // The "stuck" detector is daemonStartProgressGraceMs: if no new bytes appear
-  // in daemon.log for that long AND the daemon isn't reachable, declare it
-  // stuck. Each new chunk of log resets the stuck timer because that's evidence
-  // the worker is still making forward progress through bind/initProviders/
-  // extension-discovery.
+  // Phase-aware startup wait with two progress signals:
+  //  1. TCP port becomes listenable (insensitive to stdout buffering — works
+  //     on Windows where Node block-buffers daemon.log and the file may not
+  //     grow for >15s during a successful startup)
+  //  2. daemon.log size grows (catches the case where the worker is still
+  //     in module-loading / initProviders phase before the bind)
+  // Either signal resets the stuck timer. The hard ceiling is
+  // daemonStartTimeoutMs (defaults 60s); progress grace is
+  // daemonStartProgressGraceMs (defaults 15s) — fires only if NEITHER signal
+  // fires within that window.
   const totalBudgetMs = config.daemonStartTimeoutMs;
   const stuckGraceMs = config.daemonStartProgressGraceMs;
   const logPath = path.join(LOGS_DIR, 'daemon.log');
@@ -800,11 +825,12 @@ function displaySessionSummary(info) {
   const started = Date.now();
   let lastLogSize = (() => { try { return fs.statSync(logPath).size; } catch { return 0; } })();
   let lastProgressAt = Date.now();
+  let portWasListenable = false;
 
   while (Date.now() - started < totalBudgetMs) {
     await new Promise(r => setTimeout(r, config.pollIntervalMs));
 
-    // Did the daemon write anything new? Treat that as forward progress.
+    // Signal 1: log file growth
     let currentSize;
     try { currentSize = fs.statSync(logPath).size; } catch { currentSize = lastLogSize; }
     if (currentSize > lastLogSize) {
@@ -812,11 +838,20 @@ function displaySessionSummary(info) {
       lastProgressAt = Date.now();
     }
 
-    if (await checkProxy(readActivePort(config), config.healthCheckTimeoutMs)) return;
+    // Signal 2: TCP port listenable. Promotion from "not listening" to
+    // "listening" is itself a progress event (worker just finished bind).
+    const port = readActivePort(config);
+    const portUp = await tcpProbe(port, config.healthCheckTimeoutMs);
+    if (portUp && !portWasListenable) {
+      portWasListenable = true;
+      lastProgressAt = Date.now();
+    }
+
+    if (await checkProxy(port, config.healthCheckTimeoutMs)) return;
 
     if (Date.now() - lastProgressAt > stuckGraceMs) {
       throw new ReadinessTimeoutException(
-        `Proxy daemon stuck — no log activity for ${stuckGraceMs}ms. See ${logPath} and ${path.join(LOGS_DIR, 'daemon.err')}.`
+        `Proxy daemon stuck — no progress (no log growth, port ${port} not listening) for ${stuckGraceMs}ms. See ${logPath} and ${path.join(LOGS_DIR, 'daemon.err')}.`
       );
     }
   }
