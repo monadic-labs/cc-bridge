@@ -55,7 +55,11 @@ export function fixtureDaemonConfig() {
       upstreamTimeoutMs: 600000,
       workerInitTimeoutMs: 20000,
       drainTimeoutMs: 5000,
-      workerKeepaliveS: -1,
+      // 0 = drain old worker immediately after the new one is ready, so the
+      // browser-test restart assertion (which fetches /status to verify
+      // worker_pid changed) doesn't have to race a still-alive old worker
+      // sharing the port via SO_REUSEPORT.
+      workerKeepaliveS: 0,
       ipcTimeoutMs: 5000,
       retry: {
         maxAttempts: 2,
