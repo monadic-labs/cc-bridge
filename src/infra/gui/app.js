@@ -395,9 +395,6 @@ function renderInput(p, prop, value) {
 
 function renderDaemonConfig() {
     const draft = state.daemonConfigDraft ?? JSON.stringify(state.daemonConfig ?? {}, null, 2);
-    const errorBlock = state.daemonConfigError
-        ? `<p style="color: var(--error); font-size: 0.85rem; margin: 0.5rem 0;">${escapeHtml(state.daemonConfigError)}</p>`
-        : '';
     content.innerHTML = `
         <h2>Daemon Config</h2>
         <p style="color: #94a3b8;">Settings stored in <code>~/.claude/.ccb/config.json</code>. Validated before write; the daemon hot-reloads on save.</p>
@@ -405,19 +402,30 @@ function renderDaemonConfig() {
             <div class="form-group">
                 <label>config.json</label>
                 <textarea id="daemon-config-editor" rows="24" style="font-family: ui-monospace, 'SF Mono', Consolas, monospace; font-size: 0.85rem;">${escapeHtml(draft)}</textarea>
-                ${errorBlock}
+                <p id="daemon-config-error" style="color: var(--error); font-size: 0.85rem; margin: 0.5rem 0; display: none;"></p>
             </div>
             <p style="color: #64748b; font-size: 0.8rem;">Key fields: <code>port</code>, <code>daemon.healthCheckTimeoutMs</code>, <code>daemon.upstreamTimeoutMs</code>, <code>daemon.workerKeepaliveS</code>, <code>daemon.ipcTimeoutMs</code>, <code>logging.level</code>, <code>compression.recompressRequests</code>.</p>
         </div>
     `;
     const editor = $('daemon-config-editor');
+    const errorEl = $('daemon-config-error');
+    // If the previous render had an error pending (tab switch with pending
+    // error), surface it immediately.
+    if (state.daemonConfigError) {
+        errorEl.textContent = state.daemonConfigError;
+        errorEl.style.display = 'block';
+    }
     editor.addEventListener('input', () => {
         state.daemonConfigDraft = editor.value;
         try {
             JSON.parse(editor.value);
             state.daemonConfigError = '';
+            errorEl.textContent = '';
+            errorEl.style.display = 'none';
         } catch (e) {
             state.daemonConfigError = `JSON parse error: ${e.message}`;
+            errorEl.textContent = state.daemonConfigError;
+            errorEl.style.display = 'block';
         }
     });
 }

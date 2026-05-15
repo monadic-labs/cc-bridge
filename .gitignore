@@ -8,4 +8,6 @@ config.json
 test_output.txt
 providers.json
 .test-config/
+test-results/
+playwright-report/
 **.**/
