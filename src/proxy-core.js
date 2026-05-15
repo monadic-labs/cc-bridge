@@ -321,6 +321,15 @@ export function createProxyCore({ configDir, port }) {
 
   function createRequestHandler() {
     return (req, res) => {
+      // Browsers auto-request /favicon.ico. We don't ship one — return a
+      // bare 204 so it doesn't fall through to the upstream proxy and cause
+      // a slow 404 from anthropic.com.
+      if (req.method === 'GET' && req.url === '/favicon.ico') {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+
       // ── GUI Static Files ──
       if (req.method === 'GET' && req.url.startsWith('/gui')) {
         let filePath = req.url === '/gui' || req.url === '/gui/'

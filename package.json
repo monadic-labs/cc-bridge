@@ -12,6 +12,7 @@
     "proxy": "node src/proxy.js",
     "lint": "eslint src/ bin/",
     "test": "eslint src/ bin/ && node src/test.js",
+    "test:browser": "playwright test --config=test/browser/playwright.config.js",
     "install-cmd": "npm install -g .",
     "kill": "node scripts/kill.js",
     "killall": "node scripts/kill.js all",
@@ -43,6 +44,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.60.0",
     "eslint": "^10.2.0",
     "node-pty": "^1.1.0"
   }
