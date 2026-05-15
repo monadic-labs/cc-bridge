@@ -1779,6 +1779,91 @@ async function runUnitTests() {
     fs.rmSync(logTestDir, { recursive: true, force: true });
   }
 
+  // ── convertV1ToV2 fills models/toolTransforms ──
+  console.log('\nconvertV1ToV2 schema completeness:');
+  const { convertV1ToV2: convertV1ToV2Fn } = await import('../src/core/config-adapter.js');
+  const v1Fixture = {
+    providers: [
+      { id: 'p1', url: 'https://x.com', anthropicCompliant: true, models: { 'alias-1': 'real-1' } },
+      { id: 'p2', url: 'https://y.com', anthropicCompliant: false, apiKey: 'ENV:KEY', toolTransforms: { web_search: { foo: 'bar' } } }
+    ],
+    routingPolicy: []
+  };
+  const v2Out = convertV1ToV2Fn(v1Fixture);
+  assert(v2Out.providers.p1.models !== undefined, 'p1 receives explicit models object');
+  assert(typeof v2Out.providers.p1.models === 'object', 'p1.models is an object');
+  assert(v2Out.providers.p1.toolTransforms !== undefined, 'p1 receives explicit toolTransforms');
+  assert(v2Out.providers.p2.toolTransforms.web_search.foo === 'bar', 'p2 toolTransforms preserved');
+  assert(v2Out.providers.p2.apiKey === 'ENV:KEY', 'p2 apiKey preserved');
+  assert(v2Out.routes.models['alias-1'] === 'p1.real-1', 'p1 models migrated into routes.models');
+
+  // The resulting v2 must satisfy ProviderConfig's strict validation
+  const { ProviderConfig: PCfg } = await import('../src/core/providers.js');
+  for (const [id, cfg] of Object.entries(v2Out.providers)) {
+    new PCfg({ id, url: cfg.url, models: cfg.models, anthropicCompliant: cfg.anthropicCompliant, toolTransforms: cfg.toolTransforms });
+  }
+
+  // ── UpstreamError accepts missing opts (regression) ──
+  console.log('\nUpstreamError construction:');
+  const { UpstreamError: UE } = await import('../src/core/exceptions.js');
+  const ue1 = new UE('one-arg construction');
+  assert(ue1.message.includes('one-arg construction'), 'message preserved with one-arg form');
+  assert(ue1.statusCode === 0, 'statusCode defaults to 0 when no opts');
+  assert(ue1.responseBody === '', 'responseBody defaults to empty when no opts');
+  const ue2 = new UE('with opts', { statusCode: 502, responseBody: 'bad gateway' });
+  assert(ue2.statusCode === 502, 'statusCode from opts');
+  assert(ue2.responseBody === 'bad gateway', 'responseBody from opts');
+
+  // ── getControlIpcPath with port ──
+  console.log('\ngetControlIpcPath with port:');
+  const { getControlIpcPath: gcip } = await import('../src/core/constants.js');
+  const ipc9099 = gcip(9099);
+  const ipc9100 = gcip(9100);
+  assert(ipc9099 !== ipc9100, 'different ports yield different IPC paths');
+  assert(ipc9099.includes('9099'), 'IPC path embeds port 9099');
+  assert(ipc9100.includes('9100'), 'IPC path embeds port 9100');
+  const ipcEmpty = gcip();
+  assert(!ipcEmpty.includes('-9099'), 'no port arg = no port suffix');
+
+  // ── ensureCompleteConfig fills ipcTimeoutMs and retry block ──
+  console.log('\nensureCompleteConfig defaults:');
+  const { ensureCompleteConfig: ecc } = await import('../src/core/migrator.js');
+  const legacy = {
+    port: 9099,
+    daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10 }
+  };
+  const completed = ecc(legacy);
+  assert(completed.daemon.ipcTimeoutMs === 5000, 'ipcTimeoutMs default applied');
+  assert(completed.daemon.workerKeepaliveS === -1, 'workerKeepaliveS default applied');
+  assert(completed.daemon.upstreamTimeoutMs === 600000, 'upstreamTimeoutMs default applied');
+  assert(completed.daemon.workerInitTimeoutMs === 20000, 'workerInitTimeoutMs default applied');
+  assert(completed.daemon.drainTimeoutMs === 600000, 'drainTimeoutMs default applied');
+  assert(typeof completed.daemon.retry === 'object', 'retry block populated');
+  assert(completed.daemon.retry.maxAttempts === 2, 'retry.maxAttempts default');
+  assert(completed.logging.enabled === true, 'logging.enabled default');
+  assert(completed.compression.recompressRequests === true, 'compression default');
+
+  // ── stripAnsi (terminal emulator helper) ──
+  console.log('\nstripAnsi:');
+  assert(stripAnsi('plain') === 'plain', 'plain string unchanged');
+  assert(stripAnsi('\x1b[31mred\x1b[0m').includes('red'), 'color sequence stripped');
+  assert(!stripAnsi('\x1b[31mred\x1b[0m').includes('\x1b'), 'no ESC after strip');
+  assert(stripAnsi('\x1b[2;5H❯ prompt').endsWith('❯ prompt'), 'cursor positioning stripped');
+  assert(stripAnsi('\x1b]0;title\x07after') === 'after', 'OSC title stripped');
+  // ZOMBIES boundary: empty, one char, near-only-escape, no escape
+  assert(stripAnsi('') === '', '0 length input');
+  assert(stripAnsi('x') === 'x', 'single char');
+  assert(stripAnsi('\x1b[K') === '', 'only escape leaves empty');
+
+  // ── ipc-protocol restart-request validation ──
+  console.log('\nrestart-request worker message:');
+  const { validateWorkerMessage: vwm } = await import('../src/core/ipc-protocol.js');
+  assert(vwm({ type: 'restart-request' })?.type === 'restart-request', 'restart-request accepted');
+  assert(vwm({ type: 'bogus' }) === null, 'unknown type rejected');
+  assert(vwm(null) === null, 'null rejected');
+  assert(vwm({ type: 'error', message: 'oops' })?.message === 'oops', 'error type still works');
+  assert(vwm({ type: 'ready', pid: 1, routes: 2, extensions: 3 })?.routes === 2, 'ready type still works');
+
 }
 
 // ── Integration test (isolated daemon) ──
@@ -1959,44 +2044,105 @@ function killTestDaemon() {
   } catch { }
 }
 
+// ANSI CSI / OSC escape strip — turns terminal output into something
+// regex-matchable without false hits on color sequences or cursor codes.
+// Pattern adapted from the standard "ansi-regex" coverage set. The
+// no-control-regex rule fires on ESC / BEL characters at the heart of
+// CSI/OSC matching; matching them is exactly what this regex is for.
+// eslint-disable-next-line no-control-regex
+const ANSI_ESCAPE_PATTERN = new RegExp('[\\u001b\\u009b][[\\]()#;?]*(?:(?:(?:[a-zA-Z0-9]*(?:;[a-zA-Z0-9]*)*)?\\u0007)|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PRZcf-ntqry=><~]))', 'g');
+function stripAnsi(s) {
+  return s.replace(ANSI_ESCAPE_PATTERN, '');
+}
+
+const INTERACTIVE_POLL_MS = 100;
+const INTERACTIVE_QUIESCE_MS = 250;
+const INTERACTIVE_MAX_OUTPUT_BYTES = 2 * 1024 * 1024; // 2 MiB cap per session
+const INTERACTIVE_CLOSE_GRACE_MS = 1000;
+
 class InteractiveSession {
   constructor(cmd, args, env) {
     this.output = '';
+    this.lastDataAt = Date.now();
     this.closed = false;
+    this.exited = false;
+    this.exitInfo = null;
     this.ptyProcess = pty.spawn(cmd, args, {
-      name: 'xterm-color',
-      cols: 100,
+      name: 'xterm-256color',
+      cols: 120,
       rows: 40,
       cwd: process.cwd(),
       env: env
     });
     this.ptyProcess.onData((data) => {
       this.output += data;
+      this.lastDataAt = Date.now();
+      if (this.output.length > INTERACTIVE_MAX_OUTPUT_BYTES) {
+        // Drop the oldest half; keep recent context for assertions.
+        this.output = this.output.slice(-INTERACTIVE_MAX_OUTPUT_BYTES / 2);
+      }
+    });
+    this.ptyProcess.onExit((info) => {
+      this.exited = true;
+      this.exitInfo = info;
     });
   }
 
+  // Match pattern against ANSI-stripped output so assertions are stable across
+  // terminal escape variations. Returns early if the pty exits.
   async waitFor(pattern, timeoutMs = 60000) {
     const start = Date.now();
-    const POLL_MS = 100;
     while (Date.now() - start <= timeoutMs) {
-      if (pattern.test(this.output)) return true;
-      await new Promise(r => setTimeout(r, POLL_MS));
+      if (pattern.test(stripAnsi(this.output))) return true;
+      if (this.exited) return pattern.test(stripAnsi(this.output));
+      await sleep(INTERACTIVE_POLL_MS);
+    }
+    return false;
+  }
+
+  // Wait until no new data has arrived for `quiesceMs`. Used to let the CLI
+  // settle its initial render before we start sending keys, rather than
+  // sleeping a hard-coded duration.
+  async waitForQuiescence(quiesceMs = INTERACTIVE_QUIESCE_MS, timeoutMs = 15000) {
+    const start = Date.now();
+    while (Date.now() - start <= timeoutMs) {
+      if (Date.now() - this.lastDataAt >= quiesceMs) return true;
+      if (this.exited) return true;
+      await sleep(INTERACTIVE_POLL_MS);
     }
     return false;
   }
 
   send(text) {
+    if (this.exited) return;
     this.ptyProcess.write(text);
   }
 
   clearOutput() {
     this.output = '';
+    this.lastDataAt = Date.now();
   }
 
-  close() {
+  // Returns the ANSI-stripped accumulated output. Use this for any structural
+  // assertion (substring contains, regex match against plain text).
+  get visible() {
+    return stripAnsi(this.output);
+  }
+
+  async close() {
     if (this.closed) return;
     this.closed = true;
-    this.send('\x03\x03'); // Ctrl+C twice to gracefully exit Claude CLI
+    // Ctrl+C twice asks Claude CLI to exit cleanly.
+    try { this.ptyProcess.write('\x03\x03'); } catch { /* may already be gone */ }
+
+    // Give it up to INTERACTIVE_CLOSE_GRACE_MS to exit on its own; otherwise kill.
+    const graceStart = Date.now();
+    while (!this.exited && Date.now() - graceStart < INTERACTIVE_CLOSE_GRACE_MS) {
+      await sleep(INTERACTIVE_POLL_MS);
+    }
+    if (!this.exited) {
+      try { this.ptyProcess.kill('SIGKILL'); } catch { /* best effort */ }
+    }
   }
 }
 
@@ -2014,12 +2160,12 @@ async function assertModel(model, expectedPattern) {
     const ready = await session.waitFor(/❯/);
     if (!ready) {
       console.error(`  FAIL: Timed out waiting for CLI prompt for ${model} after 60s.`);
-      console.error(`  [DEBUG OUTPUT]: ${session.output.slice(0, 500)}`);
+      console.error(`  [DEBUG OUTPUT]: ${session.visible.slice(0, 500)}`);
       return false;
     }
-    
-    const WAIT_MS = 1500;
-  await new Promise(r => setTimeout(r, WAIT_MS));
+
+    // Wait until the CLI stops drawing (avoids racing the prompt's settle animation).
+    await session.waitForQuiescence();
 
     session.clearOutput();
     session.send(`State your exact model name.\r`);
@@ -2029,11 +2175,11 @@ async function assertModel(model, expectedPattern) {
     const responded = await session.waitFor(waitPattern, 60000);
     if (!responded) {
       console.error(`  FAIL: Timed out waiting for response for ${model} after 60s.`);
-      console.error(`  [DEBUG OUTPUT]: ${session.output}`);
+      console.error(`  [DEBUG OUTPUT]: ${session.visible}`);
       return false;
     }
 
-    const combined = session.output;
+    const combined = session.visible;
     
     // Hard proxy logic failures
     if (combined.includes('thinking.signature: Field required') || combined.includes('adjacent text blocks not allowed')) {
@@ -2069,7 +2215,7 @@ async function assertModel(model, expectedPattern) {
     console.error(`  FAIL: Expected ${expectedPattern} but got "${combined.trim().slice(0, 200)}"`);
     return false;
   } finally {
-    session.close();
+    await session.close();
   }
 }
 
@@ -2089,8 +2235,7 @@ async function testModelSwitch() {
       return false;
     }
 
-    const WAIT_MS = 1500;
-  await new Promise(r => setTimeout(r, WAIT_MS));
+    await session.waitForQuiescence();
 
     session.clearOutput();
     session.send('/model sonnet\r');
@@ -2099,12 +2244,11 @@ async function testModelSwitch() {
     const uiUpdated = await session.waitFor(/Model set to sonnet|❯/, 15000);
     if (!uiUpdated) {
       console.error(`  FAIL: Timed out waiting for /model switch acknowledgement.`);
-      console.error(`  [DEBUG OUTPUT]: ${session.output}`);
+      console.error(`  [DEBUG OUTPUT]: ${session.visible}`);
       return false;
     }
-    
-    const UI_WAIT_MS = 1000;
-    await new Promise(r => setTimeout(r, UI_WAIT_MS));
+
+    await session.waitForQuiescence();
 
     session.clearOutput();
     session.send(`Identify yourself with your exact model name.\r`);
@@ -2114,11 +2258,11 @@ async function testModelSwitch() {
     const responded = await session.waitFor(waitPattern, 60000);
     if (!responded) {
       console.error(`  FAIL: Timed out waiting for response after switch.`);
-      console.error(`  [DEBUG OUTPUT]: ${session.output}`);
+      console.error(`  [DEBUG OUTPUT]: ${session.visible}`);
       return false;
     }
 
-    const combined = session.output;
+    const combined = session.visible;
     const match = /claude|sonnet/i.test(combined);
     
     // Auth errors are acceptable if Sonnet OAuth isn't set up, means routing worked
@@ -2132,7 +2276,7 @@ async function testModelSwitch() {
     console.error(`  FAIL: Model did not switch correctly. Got: ${combined.slice(0, 200)}`);
     return false;
   } finally {
-    session.close();
+    await session.close();
   }
 }
 
@@ -2202,6 +2346,7 @@ async function assertWebSearchTransform() {
       res.on('end', () => resolve({ statusCode: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString() }));
     });
     req.on('error', (e) => resolve({ error: e }));
+    req.on('timeout', () => { req.destroy(); resolve({ error: { code: 'HTTP_TIMEOUT', message: 'upstream timeout after 30s' } }); });
     req.write(body1);
     req.end();
   });
@@ -2262,6 +2407,7 @@ async function assertWebSearchTransform() {
       res.on('end', () => resolve({ statusCode: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString() }));
     });
     req.on('error', (e) => resolve({ error: e }));
+    req.on('timeout', () => { req.destroy(); resolve({ error: { code: 'HTTP_TIMEOUT', message: 'upstream timeout after 30s' } }); });
     req.write(body2);
     req.end();
   });
@@ -2308,6 +2454,86 @@ async function assertWebSearchTransform() {
   return true;
 }
 
+async function runPortFallbackTest() {
+  console.log('\n── Port fallback test (occupies TEST_PORT, asserts watchdog bumps) ──');
+
+  killTestDaemon();
+  await setupTestConfig();
+
+  const { RUNTIME_FILENAME } = await import('../src/core/constants.js');
+  const runtimePath = path.join(TEST_CONFIG_DIR, RUNTIME_FILENAME);
+  if (fs.existsSync(runtimePath)) fs.unlinkSync(runtimePath);
+
+  // Hold TEST_PORT with a real TCP listener
+  const net = await import('net');
+  const blocker = net.createServer();
+  await new Promise((resolve, reject) => {
+    blocker.once('error', reject);
+    blocker.listen(TEST_PORT, '127.0.0.1', resolve);
+  });
+
+  try {
+    const WATCHDOG_BIN = path.join(PKG_ROOT, 'bin', WATCHDOG_SCRIPT_NAME);
+    const out = fs.openSync(path.join(TEST_CONFIG_DIR, LOGS_DIR_NAME, 'daemon.log'), 'a');
+    const err = fs.openSync(path.join(TEST_CONFIG_DIR, LOGS_DIR_NAME, 'daemon.err'), 'a');
+    const child = spawnDaemon(WATCHDOG_BIN, [], {
+      detached: true,
+      stdio: ['ignore', out, err],
+      windowsHide: true,
+      env: { ...process.env, CCB_CONFIG_DIR: TEST_CONFIG_DIR }
+    });
+    testDaemonPid = child.pid;
+    child.unref();
+
+    // Wait for runtime.json to appear and for the new port to answer
+    const RUNTIME_TIMEOUT_MS = 15000;
+    const RUNTIME_POLL_MS = 200;
+    const startTs = Date.now();
+    let runtime = null;
+    while (Date.now() - startTs < RUNTIME_TIMEOUT_MS) {
+      if (fs.existsSync(runtimePath)) {
+        try {
+          runtime = JSON.parse(fs.readFileSync(runtimePath, 'utf8'));
+          if (typeof runtime.port === 'number') break;
+        } catch { /* file may be mid-write */ }
+      }
+      await sleep(RUNTIME_POLL_MS);
+    }
+
+    if (!runtime) {
+      console.error('  FAIL: runtime.json never appeared after 15s');
+      return false;
+    }
+    assert(runtime.port !== TEST_PORT, 'watchdog did NOT bind blocked TEST_PORT');
+    assert(runtime.port > TEST_PORT && runtime.port <= TEST_PORT + 10, `watchdog bound a port within fallback range (got ${runtime.port})`);
+    assert(typeof runtime.watchdogPid === 'number' && runtime.watchdogPid > 0, 'runtime.json records a watchdog PID');
+    assert(typeof runtime.version === 'string', 'runtime.json records the version');
+
+    // Verify the bumped port actually answers /v1/models
+    const probeStart = Date.now();
+    let alive = false;
+    while (Date.now() - probeStart < RUNTIME_TIMEOUT_MS) {
+      const probe = await new Promise((resolve) => {
+        const req = http.get(`http://localhost:${runtime.port}/v1/models`, () => resolve(true));
+        req.on('error', () => resolve(false));
+        req.setTimeout(500, () => { req.destroy(); resolve(false); });
+      });
+      if (probe) { alive = true; break; }
+      await sleep(RUNTIME_POLL_MS);
+    }
+    assert(alive, 'bumped-port daemon answers HTTP');
+
+    console.log(`  PASS: watchdog fell back from ${TEST_PORT} to ${runtime.port} and wrote runtime.json correctly`);
+    return true;
+  } finally {
+    await new Promise((resolve) => blocker.close(() => resolve()));
+    killTestDaemon();
+    if (fs.existsSync(runtimePath)) {
+      try { fs.unlinkSync(runtimePath); } catch { /* best effort */ }
+    }
+  }
+}
+
 async function runIntegrationTests() {
   console.log('\n── Integration Tests (isolated daemon on port ' + TEST_PORT + ') ──');
 
@@ -2337,6 +2563,220 @@ async function runIntegrationTests() {
   } catch (e) {
     console.error('Warning: failed to open test harness keepalive:', e.message);
   }
+
+  // ── GUI HTTP API tests (zero-mock, real daemon) ──
+  console.log('\nTesting GUI HTTP API endpoints...');
+  let apiSuccess = true;
+  const POLL_INTERVAL_MS = 100;
+  const POST_RESTART_POLL_MS = 200;
+
+  const HTTP_TIMEOUT_MS = 10000;
+  // Dedicated keep-alive agent for the API test block. Sharing a single warm
+  // socket across the (mostly serial) calls avoids the per-connection
+  // cold-start path that occasionally takes longer than HTTP_TIMEOUT_MS on
+  // freshly-spawned daemons, and avoids the agent:false flake we saw with
+  // fresh-socket-per-request.
+  const apiAgent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  const httpJsonOnce = (method, path_, body) => new Promise((resolve) => {
+    const data = body ? JSON.stringify(body) : '';
+    const headers = {};
+    if (body) {
+      headers['content-type'] = 'application/json';
+      headers['content-length'] = Buffer.byteLength(data);
+    }
+    const req = http.request({
+      hostname: 'localhost',
+      port: TEST_PORT,
+      path: path_,
+      method,
+      headers,
+      timeout: HTTP_TIMEOUT_MS,
+      agent: apiAgent
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ statusCode: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString() }));
+    });
+    req.on('error', (e) => resolve({ error: e }));
+    req.on('timeout', () => { req.destroy(); resolve({ error: { code: 'HTTP_TIMEOUT', message: 'HTTP timeout' } }); });
+    if (body) req.write(data);
+    req.end();
+  });
+  const httpJson = async (method, path_, body) => {
+    // One-retry envelope: if the cold-start first request times out, the next
+    // attempt warms the keep-alive socket. Real failures still surface.
+    const first = await httpJsonOnce(method, path_, body);
+    if (first.error?.code === 'HTTP_TIMEOUT') {
+      return httpJsonOnce(method, path_, body);
+    }
+    return first;
+  };
+
+  // Warmup probe — the very first HTTP request to a freshly-started daemon
+  // occasionally takes >10s while the worker finishes its provider/extension
+  // registry. Issue a throwaway /__ccb_internal__/status first; the result is
+  // ignored.
+  await httpJson('GET', '/__ccb_internal__/status');
+
+  // GET /api/config: returns v2-shaped config
+  const r1 = await httpJson('GET', '/api/config');
+  if (r1.statusCode === 200) {
+    const cfg = JSON.parse(r1.body);
+    if (!cfg.providers || Array.isArray(cfg.providers)) {
+      console.error('  FAIL: /api/config did not return v2 (object) provider shape');
+      apiSuccess = false;
+    }
+    if (cfg.providers && !cfg.providers.zai) {
+      console.error('  FAIL: /api/config missing zai provider');
+      apiSuccess = false;
+    }
+    if (apiSuccess) console.log('  PASS: GET /api/config returns v2-shaped config with provider entries');
+  }
+  if (r1.statusCode !== 200) {
+    console.error(`  FAIL: GET /api/config returned ${r1.statusCode}`);
+    apiSuccess = false;
+  }
+
+  // GET /api/daemon-config: returns full config with ipcTimeoutMs
+  const r2 = await httpJson('GET', '/api/daemon-config');
+  if (r2.statusCode === 200) {
+    const cfg = JSON.parse(r2.body);
+    if (typeof cfg.port !== 'number') {
+      console.error('  FAIL: /api/daemon-config missing port');
+      apiSuccess = false;
+    }
+    if (cfg.daemon?.ipcTimeoutMs !== 5000) {
+      console.error(`  FAIL: /api/daemon-config missing or wrong ipcTimeoutMs (got ${cfg.daemon?.ipcTimeoutMs})`);
+      apiSuccess = false;
+    }
+    if (cfg.logging?.enabled === undefined) {
+      console.error('  FAIL: /api/daemon-config missing logging section');
+      apiSuccess = false;
+    }
+    if (cfg.port === TEST_PORT && cfg.daemon.ipcTimeoutMs === 5000) console.log('  PASS: GET /api/daemon-config returns complete config');
+  }
+  if (r2.statusCode !== 200) {
+    console.error(`  FAIL: GET /api/daemon-config returned ${r2.statusCode}`);
+    apiSuccess = false;
+  }
+
+  // POST /api/daemon-config with invalid input: 400 + error body
+  const r3 = await httpJson('POST', '/api/daemon-config', { port: 'not-a-number' });
+  if (r3.statusCode !== 400) {
+    console.error(`  FAIL: POST /api/daemon-config with invalid input expected 400, got ${r3.statusCode}`);
+    apiSuccess = false;
+  }
+  if (r3.statusCode === 400 && r3.body.length > 0) {
+    console.log('  PASS: POST /api/daemon-config rejects invalid input with 400 + message');
+  }
+
+  // POST /api/daemon-config with valid input: 200, persisted to disk
+  const validCfg = JSON.parse(r2.body);
+  validCfg.logging.level = 'debug';
+  const r4 = await httpJson('POST', '/api/daemon-config', validCfg);
+  if (r4.statusCode !== 200) {
+    console.error(`  FAIL: POST /api/daemon-config with valid input expected 200, got ${r4.statusCode}: ${r4.body}`);
+    apiSuccess = false;
+  }
+  if (r4.statusCode === 200) {
+    const onDisk = JSON.parse(fs.readFileSync(path.join(TEST_CONFIG_DIR, CONFIG_FILENAME), 'utf8'));
+    if (onDisk.logging.level !== 'debug') {
+      console.error(`  FAIL: POST /api/daemon-config did not persist logging.level (on disk: ${onDisk.logging.level})`);
+      apiSuccess = false;
+    }
+    if (onDisk.logging.level === 'debug') {
+      console.log('  PASS: POST /api/daemon-config persisted logging.level=debug');
+    }
+  }
+
+  // GET /api/logs?lines=N: returns tail
+  const r5 = await httpJson('GET', '/api/logs?lines=10');
+  if (r5.statusCode !== 200) {
+    console.error(`  FAIL: GET /api/logs returned ${r5.statusCode}`);
+    apiSuccess = false;
+  }
+  if (r5.statusCode === 200) {
+    const lineCount = (r5.body.match(/\n/g) || []).length;
+    if (lineCount > 11) {
+      console.error(`  FAIL: GET /api/logs?lines=10 returned ${lineCount} lines (expected <= 11)`);
+      apiSuccess = false;
+    }
+    if (lineCount <= 11) {
+      console.log(`  PASS: GET /api/logs?lines=10 returned <= 10 lines (${lineCount})`);
+    }
+  }
+
+  // GET /gui: serves index.html
+  const r6 = await httpJson('GET', '/gui');
+  if (r6.statusCode !== 200 || !r6.body.includes('<html')) {
+    console.error(`  FAIL: GET /gui returned ${r6.statusCode} or missing HTML`);
+    apiSuccess = false;
+  }
+  if (r6.statusCode === 200 && r6.body.includes('<html')) {
+    console.log('  PASS: GET /gui serves index.html');
+  }
+
+  // GET /gui/app.js: served as text/javascript
+  const r7 = await httpJson('GET', '/gui/app.js');
+  if (r7.statusCode !== 200) {
+    console.error(`  FAIL: GET /gui/app.js returned ${r7.statusCode}`);
+    apiSuccess = false;
+  }
+  if (r7.statusCode === 200 && r7.headers['content-type']?.includes('javascript')) {
+    console.log('  PASS: GET /gui/app.js served as text/javascript');
+  }
+
+  // POST /api/restart: 202 + watchdog spawns new worker
+  const daemonLogPath = path.join(TEST_CONFIG_DIR, LOGS_DIR_NAME, 'daemon.log');
+  const readLogSafely = () => {
+    try { return fs.readFileSync(daemonLogPath, 'utf8'); }
+    catch { return ''; }
+  };
+  const beforeLog = readLogSafely();
+  const r8 = await httpJson('POST', '/api/restart');
+  if (r8.statusCode !== 202) {
+    console.error(`  FAIL: POST /api/restart returned ${r8.statusCode} (expected 202)`);
+    apiSuccess = false;
+  }
+  // Poll for "Restart requested" in daemon log instead of arbitrary sleep
+  const RESTART_LOG_TIMEOUT_MS = 5000;
+  const restartStart = Date.now();
+  let restartLogged = false;
+  while (Date.now() - restartStart < RESTART_LOG_TIMEOUT_MS) {
+    const after = readLogSafely();
+    if (after.length > beforeLog.length && after.slice(beforeLog.length).includes('Restart requested')) {
+      restartLogged = true;
+      break;
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+  if (r8.statusCode === 202 && restartLogged) {
+    console.log('  PASS: POST /api/restart triggered watchdog restart');
+  }
+  if (r8.statusCode === 202 && !restartLogged) {
+    console.error('  FAIL: POST /api/restart returned 202 but no restart logged in 5s');
+    apiSuccess = false;
+  }
+
+  // After restart, wait for new worker to be ready before continuing (no arbitrary sleeps).
+  const POST_RESTART_TIMEOUT_MS = 15000;
+  const postRestartStart = Date.now();
+  let workerReady = false;
+  while (Date.now() - postRestartStart < POST_RESTART_TIMEOUT_MS) {
+    const probe = await httpJson('GET', '/__ccb_internal__/status');
+    if (probe.statusCode === 200) {
+      workerReady = true;
+      break;
+    }
+    await sleep(POST_RESTART_POLL_MS);
+  }
+  if (!workerReady) {
+    console.error('  FAIL: Worker did not become ready after restart within 15s');
+    apiSuccess = false;
+  }
+
+  if (apiSuccess) console.log('  PASS: GUI HTTP API endpoints verified');
+  if (!apiSuccess) console.error('  FAIL: One or more GUI HTTP API checks failed');
 
   // 1. CLI Management Command Tests (non-destructive — don't touch .env/keys yet)
   console.log('\nTesting CLI Management Commands...');
@@ -2487,6 +2927,7 @@ async function runIntegrationTests() {
     console.log('  PASS: --x-key prune removed orphan');
   }
 
+
   // Restore the original .env so model tests have a valid API key.
   fs.writeFileSync(testEnvPath, savedEnvContent, 'utf8');
 
@@ -2548,7 +2989,7 @@ async function runIntegrationTests() {
 
   if (testKeepaliveSocket) testKeepaliveSocket.destroy();
   killTestDaemon();
-  return [cliSuccess, modelSuccess];
+  return [cliSuccess, apiSuccess, modelSuccess];
 }
 
 // ── Main ──
@@ -2565,9 +3006,11 @@ async function main() {
     process.exit(1);
   }
 
+  const portFallback = await runPortFallbackTest();
+
   const integrationResults = await runIntegrationTests();
 
-  if (!integrationResults.every(Boolean)) {
+  if (!portFallback || !integrationResults.every(Boolean)) {
     console.error('\n🚨 INTEGRATION TESTS FAILED!');
     process.exit(1);
   }
