@@ -2,7 +2,6 @@
 
 import fs from 'fs';
 import net from 'net';
-import http from 'http';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import os from 'os';
@@ -14,13 +13,10 @@ import { parseIpcMessage, serializeIpcMessage, validateWorkerMessage, validateCo
 import { loadConfigFromFile } from '../src/core/config.js';
 import { spawnDaemon } from '../src/infra/process-manager.js';
 
-const PORT_FALLBACK_RANGE = 10;
-
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_SCRIPT = path.join(__dirname, '..', 'src', 'proxy.js');
 
 let activeWorker = null;
-let sharedServer = null;
 let activePort = null;
 let shuttingDown = false;
 let workerDraining = false;
@@ -53,43 +49,6 @@ function log(msg) {
 
 function getConfig() {
   return loadConfigFromFile(_configDir);
-}
-
-function tryListen(server, port) {
-  return new Promise((resolve, reject) => {
-    const onError = (err) => {
-      server.removeListener('listening', onListening);
-      reject(err);
-    };
-    const onListening = () => {
-      server.removeListener('error', onError);
-      resolve();
-    };
-    server.once('error', onError);
-    server.once('listening', onListening);
-    server.listen(port);
-  });
-}
-
-async function bindSharedServer(config) {
-  const candidates = [];
-  for (let i = 0; i < PORT_FALLBACK_RANGE; i++) candidates.push(config.port + i);
-  candidates.push(0); // OS-assigned port as last resort
-
-  for (const port of candidates) {
-    const server = http.createServer();
-    try {
-      await tryListen(server, port);
-      return server;
-    } catch (err) {
-      if (err.code !== 'EADDRINUSE') throw err;
-      const msg = port === config.port
-        ? `Configured port ${config.port} in use, searching for alternate...`
-        : `Port ${port} in use, trying next...`;
-      log(msg);
-    }
-  }
-  throw new Error('All candidate ports exhausted');
 }
 
 function writeRuntimeFile(port) {
@@ -143,29 +102,31 @@ async function spawnWorker() {
   log('Spawning new worker...');
   const config = getConfig();
 
-  if (!sharedServer) {
-    sharedServer = await bindSharedServer(config);
-    activePort = sharedServer.address().port;
-    const listenMsg = activePort === config.port
-      ? `Watchdog listening on port ${activePort}`
-      : `Watchdog listening on port ${activePort} (configured ${config.port} was unavailable)`;
-    log(listenMsg);
-    writeRuntimeFile(activePort);
-    sharedServer.on('error', (err) => {
-      log(`Shared server error: ${err.message}`);
-      process.exit(1);
-    });
-  }
+  // No more handle handoff. Workers self-bind via SO_REUSEPORT. The
+  // first worker establishes the actual port; subsequent restart-spawned
+  // workers reuse that port through env CCB_DAEMON_PORT so we don't walk
+  // the fallback range every time.
+  const env = { ...process.env, CCB_DAEMON_WORKER: '1' };
+  if (activePort) env.CCB_DAEMON_PORT = String(activePort);
 
   const child = spawnDaemon(WORKER_SCRIPT, [], {
     stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
     windowsHide: true,
-    env: { ...process.env, CCB_DAEMON_WORKER: '1' }
+    env
   });
+
+  // Resolve when the worker reports ready (first-ready); reject on init
+  // timeout or worker-side error. Callers that need to know the bound port
+  // (entry path setting up IPC) await this.
+  let readyResolve;
+  let readyReject;
+  const readyPromise = new Promise((res, rej) => { readyResolve = res; readyReject = rej; });
+  child._readyPromise = readyPromise;
 
   const initTimeout = setTimeout(() => {
     log(`Worker initialization timeout (${config.workerInitTimeoutMs}ms) exceeded, killing hung worker`);
     child.kill('SIGKILL');
+    readyReject(new Error(`Worker init timeout (${config.workerInitTimeoutMs}ms)`));
   }, config.workerInitTimeoutMs);
 
   child.on('message', (msg) => {
@@ -177,7 +138,20 @@ async function spawnWorker() {
       restartInProgress = false;
       consecutiveCrashCount = 0;
       child._readyAt = Date.now();
+      // First-ready: record the worker's chosen port and write runtime.json.
+      if (typeof workerMsg.port === 'number' && (!activePort || activePort !== workerMsg.port)) {
+        const previous = activePort;
+        activePort = workerMsg.port;
+        writeRuntimeFile(activePort);
+        if (!previous) {
+          const fallbackNote = activePort === config.port
+            ? ''
+            : ` (configured ${config.port} was unavailable)`;
+          log(`Active port: ${activePort}${fallbackNote}`);
+        }
+      }
       log(`Worker ready (PID ${workerMsg.pid}, ${workerMsg.routes} routes, ${workerMsg.extensions} extensions)`);
+      readyResolve({ child, port: activePort });
 
       // Drain old workers only after new worker is confirmed ready
       if (drainingWorkers.size > 0) {
@@ -205,6 +179,7 @@ async function spawnWorker() {
     if (workerMsg.type === 'error') {
       clearTimeout(initTimeout);
       log(`Worker error: ${workerMsg.message}`);
+      readyReject(new Error(workerMsg.message));
     }
 
     if (workerMsg.type === 'restart-request') {
@@ -249,9 +224,6 @@ async function spawnWorker() {
   });
 
   child._readyAt = null;
-
-  const handle = sharedServer._handle;
-  child.send({ type: 'socket', port: activePort }, handle);
 
   return child;
 }
@@ -436,6 +408,7 @@ function handleControlConnection(socket) {
 (async () => {
   try {
     activeWorker = await spawnWorker();
+    await activeWorker._readyPromise; // populates activePort
   } catch (err) {
     log(`Failed to start worker: ${err.message}`);
     process.exit(1);

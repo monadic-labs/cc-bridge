@@ -13,7 +13,7 @@ import { loadConfigFromFile, ProxyConfig } from './core/config.js';
 import { ensureCompleteProviders, ensureCompleteConfig } from './core/migrator.js';
 import { ProvidersMap, ProviderConfig } from './core/providers.js';
 import { Result, ProxyRequestContext } from './core/types.js';
-import { ConfigError, ArgumentError } from './core/exceptions.js';
+import { ConfigError, ArgumentError, ReadinessTimeoutException } from './core/exceptions.js';
 import { buildRoutingPolicy } from './core/routing-rules.js';
 import { loadEnv } from './core/env-file.js';
 import { decompress, compress } from './core/compression.js';
@@ -608,53 +608,99 @@ export function createProxyCore({ configDir, port }) {
   };
 }
 
+// Per-worker port fallback: try the configured port first, then walk up to
+// PORT_FALLBACK_RANGE adjacent ports, then OS-assigned (0). With reusePort,
+// multiple workers can bind the same kernel socket — the OS load-balances
+// new connections across them, which is the foundation for zero-downtime
+// restart without socket-handle sharing across processes.
+const WORKER_PORT_FALLBACK_RANGE = 10;
+
+async function bindWorkerServer(server, basePort) {
+  const candidates = [];
+  for (let i = 0; i < WORKER_PORT_FALLBACK_RANGE; i++) candidates.push(basePort + i);
+  candidates.push(0);
+
+  for (const port of candidates) {
+    try {
+      await new Promise((resolve, reject) => {
+        const onError = (err) => { server.removeListener('listening', onListening); reject(err); };
+        const onListening = () => { server.removeListener('error', onError); resolve(); };
+        server.once('error', onError);
+        server.once('listening', onListening);
+        server.listen({ port, host: '0.0.0.0', reusePort: true });
+      });
+      return server.address().port;
+    } catch (err) {
+      if (err.code !== 'EADDRINUSE') throw err;
+      if (port !== basePort) process.stdout.write(`[worker] Port ${port} unavailable, trying next...\n`);
+    }
+  }
+  throw new ReadinessTimeoutException('All candidate ports exhausted');
+}
+
 export function runWorkerMode({ configDir, port }) {
   const core = createProxyCore({ configDir, port });
   const config = core.getConfig();
   let drained = false;
   let server = null;
   let drainInterval = null;
-  let handleReceived = false;
+  let bindCompleted = false;
+
+  // Workers self-bind with SO_REUSEPORT instead of receiving a TCP handle
+  // from the watchdog. The watchdog assigns the target port via the env
+  // var CCB_DAEMON_PORT (set when respawning after the first worker has
+  // already established the actual bound port). First worker walks the
+  // fallback range starting at config.port.
+  const basePort = parseInt(process.env.CCB_DAEMON_PORT || String(config.port), 10);
 
   const startupTimeout = setTimeout(() => {
-    if (!handleReceived) {
-      process.stderr.write('[worker] Never received socket handle from watchdog, exiting\n');
+    if (!bindCompleted) {
+      process.stderr.write('[worker] Failed to bind within startup timeout, exiting\n');
       process.exit(1);
     }
   }, config.workerInitTimeoutMs);
 
-  process.on('message', (msg, handle) => {
-    if (msg?.type === 'socket' && handle) {
-      handleReceived = true;
-      clearTimeout(startupTimeout);
-      server = http.createServer(core.createRequestHandler());
+  (async () => {
+    server = http.createServer(core.createRequestHandler());
+    let actualPort;
+    try {
+      actualPort = await bindWorkerServer(server, basePort);
+    } catch (e) {
+      process.stderr.write(`[worker] Bind failed: ${e.message}\n`);
+      if (process.send) process.send({ type: 'error', message: e.message });
+      process.exit(1);
+    }
+    bindCompleted = true;
+    clearTimeout(startupTimeout);
+    process.stdout.write(`[worker] Listening on port ${actualPort}\n`);
 
-      server.listen(handle, async () => {
-        process.stdout.write(`[worker] Listening on passed socket handle (port ${msg.port})\n`);
+    try {
+      await core.initProviders();
+      const readyMsg = {
+        type: 'ready',
+        pid: process.pid,
+        port: actualPort,
+        routes: core.providerCount,
+        extensions: core.extensions?.size ?? 0
+      };
+      if (process.send) process.send(readyMsg);
+    } catch (e) {
+      const errorMsg = { type: 'error', message: e.message };
+      if (process.send) process.send(errorMsg);
+      process.exit(1);
+    }
 
-        try {
-          await core.initProviders();
-          const readyMsg = {
-            type: 'ready',
-            pid: process.pid,
-            routes: core.providerCount,
-            extensions: core.extensions?.size ?? 0
-          };
-          if (process.send) process.send(readyMsg);
-        } catch (e) {
-          const errorMsg = {
-            type: 'error',
-            message: e.message
-          };
-          if (process.send) process.send(errorMsg);
-          process.exit(1);
-        }
-      });
+    server.on('error', (err) => {
+      process.stdout.write(`[worker] Server error: ${err.message}\n`);
+      process.exit(1);
+    });
+  })();
 
-      server.on('error', (err) => {
-        process.stdout.write(`[worker] Server error: ${err.message}\n`);
-        process.exit(1);
-      });
+  process.on('message', (msg) => {
+    if (msg?.type === 'socket') {
+      // Legacy handle-handoff path is no longer used. Kept as no-op to
+      // tolerate stale watchdogs during a rolling upgrade.
+      return;
     }
 
     if (msg?.type === 'drain' && !drained) {

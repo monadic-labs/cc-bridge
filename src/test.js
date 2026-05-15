@@ -2281,6 +2281,84 @@ async function testModelSwitch() {
 }
 
 /**
+ * Concurrency stress through the full Claude → ccb → z.ai → response chain.
+ * Spawns the real CLI under PTY (just like a user), fires several prompts in
+ * a row without waiting for the previous response to fully complete, asserts
+ * every prompt eventually got an answer with no proxy-side errors.
+ *
+ * Needs ZAI_KEY in .env. Returns false if the key isn't set so the suite can
+ * skip rather than fail on missing credentials.
+ */
+async function assertTtyConcurrency() {
+  if (!process.env.ZAI_KEY) {
+    console.log('  SKIP: ZAI_KEY not set in env');
+    return true;
+  }
+
+  const CCB_BIN = path.join(PKG_ROOT, 'bin', 'ccb.js');
+  const session = new InteractiveSession(process.execPath, [CCB_BIN, '--model', 'glm-4.7'], {
+    ...process.env,
+    CCB_CONFIG_DIR: TEST_CONFIG_DIR
+  });
+
+  const PROMPTS = [
+    'Reply with exactly: APPLE',
+    'Reply with exactly: BANANA',
+    'Reply with exactly: CHERRY',
+    'Reply with exactly: DATE'
+  ];
+  const TOKENS = ['APPLE', 'BANANA', 'CHERRY', 'DATE'];
+
+  try {
+    const ready = await session.waitFor(/❯/);
+    if (!ready) {
+      console.error('  FAIL: TTY concurrency — CLI prompt never appeared');
+      return false;
+    }
+    await session.waitForQuiescence();
+
+    // Send all prompts back-to-back; Claude CLI handles them serially but
+    // each turn round-trips through ccb. We're stressing the proxy's
+    // sequential responsiveness through the full PTY → fork → fork chain
+    // and verifying the daemon doesn't wedge between turns.
+    for (const prompt of PROMPTS) {
+      session.send(`${prompt}\r`);
+      // Briefly let the CLI accept input before the next send (it lines them).
+      await sleep(150);
+    }
+
+    // Now wait for ALL tokens to appear. Each turn the CLI shows the answer.
+    // Cap at a generous 5 min for 4 turns through z.ai.
+    const TTY_CONCURRENCY_TIMEOUT_MS = 300000;
+    const start = Date.now();
+    let seen = 0;
+    while (Date.now() - start < TTY_CONCURRENCY_TIMEOUT_MS) {
+      const visible = session.visible;
+      seen = TOKENS.filter(tok => visible.includes(tok)).length;
+      if (seen === TOKENS.length) break;
+      // Surface proxy logic failures fast
+      if (visible.includes('thinking.signature: Field required') ||
+          visible.includes('adjacent text blocks not allowed') ||
+          visible.includes('ccb_error_id')) {
+        console.error(`  FAIL: TTY concurrency — proxy logic error in output: ${visible.slice(-300)}`);
+        return false;
+      }
+      await sleep(500);
+    }
+
+    if (seen === TOKENS.length) {
+      console.log(`  PASS: All ${TOKENS.length} sequential prompts round-tripped through ccb → z.ai`);
+      return true;
+    }
+    console.error(`  FAIL: TTY concurrency — only ${seen}/${TOKENS.length} tokens seen in output after ${TTY_CONCURRENCY_TIMEOUT_MS}ms`);
+    console.error(`  Last 500 chars: ${session.visible.slice(-500)}`);
+    return false;
+  } finally {
+    await session.close();
+  }
+}
+
+/**
  * Scan the most recent session log for thinking block evidence.
  * Returns { hasThinking, details } for diagnostic output.
  */
@@ -2778,6 +2856,50 @@ async function runIntegrationTests() {
   if (apiSuccess) console.log('  PASS: GUI HTTP API endpoints verified');
   if (!apiSuccess) console.error('  FAIL: One or more GUI HTTP API checks failed');
 
+  // ── Concurrent-request stress (regression guard for watchdog/worker handle sharing) ──
+  console.log('\nStress: 50 parallel HTTP requests across mixed endpoints...');
+  const STRESS_TOTAL = 50;
+  const STRESS_TIMEOUT_MS = 5000;
+  const STRESS_ENDPOINTS = [
+    { method: 'GET', path: '/api/config' },
+    { method: 'GET', path: '/api/schema' },
+    { method: 'GET', path: '/api/daemon-config' },
+    { method: 'GET', path: '/__ccb_internal__/status' },
+    { method: 'GET', path: '/gui/app.js' },
+    { method: 'GET', path: '/v1/models' }
+  ];
+  // Independent connections per request (no shared agent). Each request gets
+  // its own socket so we genuinely exercise concurrent kernel accept dispatch.
+  const stressOne = (ep) => new Promise((resolve) => {
+    const req = http.request({
+      hostname: 'localhost',
+      port: TEST_PORT,
+      path: ep.path,
+      method: ep.method,
+      headers: { connection: 'close' },
+      timeout: STRESS_TIMEOUT_MS,
+      agent: false
+    }, (res) => {
+      res.on('data', () => {}); // consume to free the socket
+      res.on('end', () => resolve({ statusCode: res.statusCode }));
+    });
+    req.on('error', () => resolve({ error: 'connect' }));
+    req.on('timeout', () => { req.destroy(); resolve({ error: 'timeout' }); });
+    req.end();
+  });
+  const stressResults = await Promise.all(
+    Array.from({ length: STRESS_TOTAL }, (_, i) => stressOne(STRESS_ENDPOINTS[i % STRESS_ENDPOINTS.length]))
+  );
+  const stressOk = stressResults.filter(r => r.statusCode === 200).length;
+  const stressBad = STRESS_TOTAL - stressOk;
+  if (stressOk === STRESS_TOTAL) {
+    console.log(`  PASS: ${stressOk}/${STRESS_TOTAL} concurrent requests all returned 200`);
+  }
+  if (stressOk !== STRESS_TOTAL) {
+    console.error(`  FAIL: only ${stressOk}/${STRESS_TOTAL} concurrent requests succeeded (${stressBad} timed out or errored)`);
+    apiSuccess = false;
+  }
+
   // 1. CLI Management Command Tests (non-destructive — don't touch .env/keys yet)
   console.log('\nTesting CLI Management Commands...');
   const CCB_BIN = path.join(PKG_ROOT, 'bin', 'ccb.js');
@@ -2953,6 +3075,10 @@ async function runIntegrationTests() {
 
   const rSwitch = await testModelSwitch();
   modelSuccess = modelSuccess && rSwitch;
+
+  console.log('\nRunning TTY concurrency stress (real z.ai through Claude CLI)...');
+  const rTtyConcurrency = await assertTtyConcurrency();
+  modelSuccess = modelSuccess && rTtyConcurrency;
 
   // 3b. Web search tool transform test (live request through proxy)
   //    The daemon may have shut down after the last model test — restart it.

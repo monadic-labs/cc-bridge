@@ -233,13 +233,6 @@ test('Status tab: shows daemon metadata, log tail, and restart button', async ({
 });
 
 test('Status tab: restart button triggers daemon restart with uptime reset', async ({ page }) => {
-  // /api/restart needs the watchdog (it sends an IPC restart-request via
-  // process.send). When this suite runs against the standalone proxy for
-  // socket-sharing reasons, the endpoint returns 503 — exercise the restart
-  // contract under the production daemon path via src/test.js instead.
-  const restartProbe = await fetch(`http://localhost:${PORT}/api/restart`, { method: 'POST' });
-  test.skip(restartProbe.status === 503, 'standalone proxy cannot self-restart; covered by src/test.js');
-
   page.on('dialog', async (d) => { if (d.type() === 'confirm') await d.accept(); });
   await page.goto('/gui');
   await appReady(page);
