@@ -8,6 +8,13 @@
 
 import { getSystem } from '../../core/api-adapter.js';
 
+export const EXTENSION_META = {
+  activation: 'always',
+  title: 'Non-Compliant Transform',
+  description: 'For providers with anthropicCompliant=false: strips the betas field and flattens the system prompt array into a single string. Fires per-request based on the matched provider, not globally.',
+  configuredBy: 'providers[*].anthropicCompliant',
+};
+
 function flattenSystemPrompt(system) {
   if (!Array.isArray(system)) return system;
   const flattened = system

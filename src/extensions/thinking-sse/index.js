@@ -12,6 +12,13 @@ import {
   getBlockType, getDeltaType, getDeltaThinking, getDeltaRedactedData,
 } from '../../core/api-adapter.js';
 
+export const EXTENSION_META = {
+  activation: 'always',
+  title: 'Thinking SSE Transform',
+  description: 'Converts thinking / redacted_thinking SSE blocks from non-compliant providers into text blocks wrapped in ```thinking fences, so Claude Code CLI does not choke on unsupported block types mid-stream.',
+  configuredBy: 'providers[*].anthropicCompliant',
+};
+
 export function createThinkingSseExtension() {
   return {
     name: 'thinking-sse',

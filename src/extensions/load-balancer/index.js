@@ -12,6 +12,41 @@ import { selectRoundRobin } from './strategies/round-robin.js';
 import { selectLeastConn, entryKey } from './strategies/least-conn.js';
 import { selectRandom, selectWeighted } from './strategies/random.js';
 
+export const EXTENSION_META = {
+  activation: 'always',
+  title: 'Load Balancer',
+  description: 'Routes a request to one of N providers in a pool. Strategies: round-robin, least-conn, random, weighted. Pools are declared under extensions.load-balancer in providers.json; routes target the pool by name.',
+  schema: {
+    type: 'object',
+    title: 'Load Balancer',
+    description: 'Provider pools for routing.',
+    properties: {
+      pools: {
+        type: 'object',
+        title: 'Pools',
+        description: 'Named pools, each with strategy + entries.',
+        additionalProperties: {
+          type: 'object',
+          properties: {
+            strategy: {
+              type: 'string',
+              title: 'Strategy',
+              enum: ['round-robin', 'least-conn', 'random', 'weighted'],
+              default: 'round-robin',
+            },
+          },
+        },
+      },
+      aliases: {
+        type: 'object',
+        title: 'Aliases',
+        description: 'Map a wildcard model alias to a pool name.',
+      },
+    },
+  },
+  configuredBy: 'extensions.load-balancer',
+};
+
 export function createLoadBalancerExtension(config = {}) {
   const pools = config.pools ?? {};
   const aliases = config.aliases ?? {};

@@ -72,6 +72,19 @@ export async function discoverExtensions(dir) {
   return results;
 }
 
+// Copy the discovered EXTENSION_META onto the runtime extension instance so
+// downstream code (registry.getAll, /api/extensions) can return human-readable
+// metadata without re-importing the module.
+function attachMeta(ext, meta) {
+  if (!meta) return;
+  if (meta.schema) ext.schema = meta.schema;
+  ext.activation = meta.activation ?? 'always';
+  if (meta.title) ext.title = meta.title;
+  if (meta.description) ext.description = meta.description;
+  if (meta.configuredBy) ext.configuredBy = meta.configuredBy;
+  if (meta.providerTrigger) ext.providerTrigger = meta.providerTrigger;
+}
+
 export function buildRegistry(discoveredModules, providerConfigs, extensionConfigs = {}) {
   const registry = new ExtensionRegistry();
   const errors = [];
@@ -87,7 +100,10 @@ export function buildRegistry(discoveredModules, providerConfigs, extensionConfi
           const triggerValue = getNestedValue(cfg, mod.meta.providerTrigger);
           if (triggerValue) {
             const ext = mod.factory(triggerValue);
-            if (ext) registry.register(ext);
+            if (ext) {
+              attachMeta(ext, mod.meta);
+              registry.register(ext);
+            }
           }
         }
         continue;
@@ -98,7 +114,7 @@ export function buildRegistry(discoveredModules, providerConfigs, extensionConfi
       const extConfig = extensionConfigs[dirName] ?? {};
       const ext = mod.factory(extConfig);
       if (ext) {
-        if (mod.meta.schema) ext.schema = mod.meta.schema;
+        attachMeta(ext, mod.meta);
         registry.register(ext);
       }
     } catch (e) {
