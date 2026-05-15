@@ -49,12 +49,13 @@ export class ErrorReporter {
 
   write(error, { requestId, route, method, url, model, sessionId, headers, history, responseBody, requestBody, operation, debugMode = false, statusCode, upstreamUrl, elapsedMs } = {}) {
     try {
-      if (!fs.existsSync(this.#logsDir)) fs.mkdirSync(this.#logsDir, { recursive: true });
+      const sessionDir = path.join(this.#logsDir, sessionId || '_unknown');
+      if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
       const timestamp = new Date().toISOString();
       const id = requestId ?? 'unknown';
       const errorId = generateErrorId();
       const fileName = `error-${id}-${errorId}-${timestamp.replace(/[:.]/g, '-')}.err`;
-      const filePath = path.join(this.#logsDir, fileName);
+      const filePath = path.join(sessionDir, fileName);
 
       const headersBlock = headers
         ? Object.entries(headers)

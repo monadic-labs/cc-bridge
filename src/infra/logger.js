@@ -23,11 +23,14 @@ export class Logger {
     const out = `${sessionPrefix}${ts} ${line}\n`;
     process.stdout.write(out);
     try {
-      if (!fs.existsSync(this.#logsDir)) fs.mkdirSync(this.#logsDir, { recursive: true });
-      const logPath = sessionId
-        ? path.join(this.#logsDir, `session-${sessionId}.log`)
-        : this.#defaultLog;
-      await fs.promises.appendFile(logPath, out);
+      if (!sessionId) {
+        if (!fs.existsSync(this.#logsDir)) fs.mkdirSync(this.#logsDir, { recursive: true });
+        await fs.promises.appendFile(this.#defaultLog, out);
+        return;
+      }
+      const sessionDir = path.join(this.#logsDir, sessionId);
+      if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+      await fs.promises.appendFile(path.join(sessionDir, 'session.log'), out);
     } catch { /* best effort */ }
   }
 

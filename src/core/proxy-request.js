@@ -125,8 +125,8 @@ export async function handleRequestEnd({ ctx, chunks, deps }) {
     }
 
     if (debugLogger.isTrace) {
-      await debugLogger.logPayload(activeCtx.id, 'raw', rawBuffer);
-      await debugLogger.logPayload(activeCtx.id, 'sanitized', activeCtx.forwardBody);
+      await debugLogger.logPayload(activeCtx.sessionId, activeCtx.id, 'raw', rawBuffer);
+      await debugLogger.logPayload(activeCtx.sessionId, activeCtx.id, 'sanitized', activeCtx.forwardBody);
     }
   } catch (e) {
     errorReporter.write(e, {
