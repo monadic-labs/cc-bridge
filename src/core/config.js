@@ -181,3 +181,62 @@ export function resolveUserConfigDir() {
   if (process.env.CCB_CONFIG_DIR) return process.env.CCB_CONFIG_DIR;
   return path.join(os.homedir(), '.claude', CCB_DIR_NAME);
 }
+
+// JSON-Schema-like description of config.json. The GUI's Daemon Config tab
+// renders a form from this; the daemon itself validates via ProxyConfig's
+// constructor, so this schema is authoritative for the UI shape but
+// non-authoritative for runtime — ProxyConfig is the source of truth on
+// what's valid.
+export const DAEMON_CONFIG_SCHEMA = Object.freeze({
+  type: 'object',
+  title: 'Daemon Config',
+  properties: {
+    port: {
+      type: 'integer', title: 'Port', minimum: 1, maximum: 65535,
+      description: 'TCP port the proxy listens on. If unavailable at startup, workers walk up to +9 then fall back to an OS-assigned port.',
+    },
+    anthropicBaseUrl: {
+      type: 'string', title: 'Anthropic Base URL', format: 'uri',
+      description: 'Fallback upstream for requests whose model doesn\'t match any custom provider.',
+    },
+    daemon: {
+      type: 'object', title: 'Daemon', properties: {
+        healthCheckTimeoutMs: { type: 'integer', title: 'Health-check timeout (ms)', minimum: 100, description: 'How long the CLI waits per HTTP probe of /v1/models.' },
+        pollIntervalMs: { type: 'integer', title: 'Poll interval (ms)', minimum: 50, description: 'Gap between health-check probes during daemon startup.' },
+        pollMaxAttempts: { type: 'integer', title: 'Poll max attempts', minimum: 1, description: 'Legacy upper bound on startup polls. The newer daemonStartTimeoutMs / daemonStartProgressGraceMs supersede this.' },
+        upstreamTimeoutMs: { type: 'integer', title: 'Upstream inactivity timeout (ms)', minimum: 0, description: 'Resets on every byte from upstream. 0 disables.' },
+        workerInitTimeoutMs: { type: 'integer', title: 'Worker init timeout (ms)', minimum: 1000, description: 'How long the watchdog waits for a worker to send "ready" before killing it.' },
+        drainTimeoutMs: { type: 'integer', title: 'Drain timeout (ms)', minimum: 1000, description: 'Max grace for a draining worker to finish in-flight requests on shutdown / restart.' },
+        workerKeepaliveS: { type: 'integer', title: 'Worker keepalive policy (seconds)', minimum: -1, description: '-1 = keep old workers alive indefinitely. 0 = drain immediately when new worker ready. N>0 = grace period before draining.' },
+        ipcTimeoutMs: { type: 'integer', title: 'IPC timeout (ms)', minimum: 100, description: 'How long CLI commands like --x-status wait for the control IPC to respond.' },
+        daemonStartTimeoutMs: { type: 'integer', title: 'Daemon start ceiling (ms)', minimum: 1000, description: 'Hard upper bound the CLI waits for the daemon to start. Cold starts with many extensions / on Windows can exceed 20s.' },
+        daemonStartProgressGraceMs: { type: 'integer', title: 'Daemon start progress grace (ms)', minimum: 500, description: 'If daemon.log doesn\'t grow for this long AND HTTP isn\'t up, the CLI declares stuck. Each new log chunk resets the timer.' },
+        retry: {
+          type: 'object', title: 'Retry policy', properties: {
+            maxAttempts: { type: 'integer', title: 'Max attempts', minimum: 0 },
+            baseDelayMs: { type: 'integer', title: 'Base delay (ms)', minimum: 0 },
+            maxDelayMs: { type: 'integer', title: 'Max delay (ms)', minimum: 0 },
+            retryOnStatusCodes: { type: 'array', title: 'Retry on HTTP status codes', items: { type: 'integer' } },
+            retryOnTcpErrors: { type: 'array', title: 'Retry on TCP error codes', items: { type: 'string' } },
+            retryOnBodyPatterns: { type: 'array', title: 'Retry on body substrings', items: { type: 'string' } },
+          },
+        },
+      },
+    },
+    logging: {
+      type: 'object', title: 'Logging', properties: {
+        enabled: { type: 'boolean', title: 'Enabled' },
+        requests: { type: 'boolean', title: 'Log requests' },
+        responses: { type: 'boolean', title: 'Log responses' },
+        history: { type: 'integer', title: 'History size', minimum: 0, description: 'How many recent requests to keep in memory for /__ccb_internal__/session.' },
+        maxBodyLog: { type: 'integer', title: 'Max body log (bytes)', minimum: 0, description: 'Cap on per-request body logging. 0 disables body logging.' },
+        level: { type: 'string', title: 'Level', enum: ['info', 'debug', 'trace'] },
+      },
+    },
+    compression: {
+      type: 'object', title: 'Compression', properties: {
+        recompressRequests: { type: 'boolean', title: 'Re-compress requests', description: 'Re-encode the request body in the same Content-Encoding ccb received. Disable if upstream complains about double-encoding.' },
+      },
+    },
+  },
+});

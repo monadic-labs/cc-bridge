@@ -9,7 +9,7 @@ import {
   CONFIG_FILENAME,
   ENV_FILENAME
 } from './core/constants.js';
-import { loadConfigFromFile, ProxyConfig } from './core/config.js';
+import { loadConfigFromFile, ProxyConfig, DAEMON_CONFIG_SCHEMA } from './core/config.js';
 import { ensureCompleteProviders, ensureCompleteConfig } from './core/migrator.js';
 import { ProvidersMap, ProviderConfig } from './core/providers.js';
 import { Result, ProxyRequestContext } from './core/types.js';
@@ -385,6 +385,12 @@ export function createProxyCore({ configDir, port }) {
         const list = shellState.extensions.getAll();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(list));
+        return;
+      }
+
+      if (req.method === 'GET' && req.url === '/api/daemon-config-schema') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(DAEMON_CONFIG_SCHEMA));
         return;
       }
 
