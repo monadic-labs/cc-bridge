@@ -61,8 +61,8 @@ export function fixtureDaemonConfig() {
       // sharing the port via SO_REUSEPORT.
       workerKeepaliveS: 0,
       ipcTimeoutMs: 5000,
-      daemonStartTimeoutMs: 20000,
-      daemonStartProgressGraceMs: 4000,
+      daemonStartTimeoutMs: 60000,
+      daemonStartProgressGraceMs: 15000,
       retry: {
         maxAttempts: 2,
         baseDelayMs: 500,
