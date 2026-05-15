@@ -58,7 +58,8 @@ export class UpstreamError extends ProxyError {
   #statusCode;
   #responseBody;
 
-  constructor(message, { statusCode, responseBody, ...props }) {
+  constructor(message, opts = {}) {
+    const { statusCode, responseBody, ...props } = opts;
     super(message, { operation: 'upstream', ...props });
     this.#statusCode = statusCode ?? 0;
     this.#responseBody = responseBody ?? '';

@@ -23,7 +23,7 @@ import { Logger } from './infra/logger.js';
 import { ErrorReporter } from './infra/error-reporter.js';
 import { DebugLogger } from './core/debug-logger.js';
 import { runKill } from './infra/process-manager.js';
-import { detectFormat, convertV2ToInternal } from './core/config-adapter.js';
+import { detectFormat, convertV2ToInternal, convertV1ToV2 } from './core/config-adapter.js';
 import { ExtensionRegistry } from './core/extension-registry.js';
 import { discoverExtensions, buildRegistry, watchExtensions } from './core/extension-loader.js';
 export { runKill };
@@ -347,8 +347,16 @@ export function createProxyCore({ configDir, port }) {
             res.end('Error reading config');
             return;
           }
+          let payload = data;
+          try {
+            const raw = JSON.parse(stripBom(data));
+            const normalized = detectFormat(raw) === 'v1' ? convertV1ToV2(raw) : raw;
+            payload = JSON.stringify(normalized);
+          } catch {
+            // Pass raw through; the GUI will surface the parse error.
+          }
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(data);
+          res.end(payload);
         });
         return;
       }
