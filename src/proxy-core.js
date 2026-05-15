@@ -6,10 +6,11 @@ import {
   CCB_VERSION,
   LOGS_DIR_NAME,
   PROVIDERS_FILENAME,
+  CONFIG_FILENAME,
   ENV_FILENAME
 } from './core/constants.js';
-import { loadConfigFromFile } from './core/config.js';
-import { ensureCompleteProviders } from './core/migrator.js';
+import { loadConfigFromFile, ProxyConfig } from './core/config.js';
+import { ensureCompleteProviders, ensureCompleteConfig } from './core/migrator.js';
 import { ProvidersMap, ProviderConfig } from './core/providers.js';
 import { Result, ProxyRequestContext } from './core/types.js';
 import { ConfigError, ArgumentError } from './core/exceptions.js';
@@ -154,6 +155,7 @@ function buildErrorResponse(res, error, startTime) {
 export function createProxyCore({ configDir, port }) {
   const logsDir = path.join(configDir, LOGS_DIR_NAME);
   const providersPath = path.join(configDir, PROVIDERS_FILENAME);
+  const daemonConfigPath = path.join(configDir, CONFIG_FILENAME);
 
   Object.assign(process.env, loadEnv(path.join(configDir, ENV_FILENAME)));
 
@@ -382,6 +384,46 @@ export function createProxyCore({ configDir, port }) {
           } catch {
             res.writeHead(400);
             res.end('Invalid JSON');
+          }
+        });
+        return;
+      }
+
+      if (req.method === 'GET' && req.url === '/api/daemon-config') {
+        fs.readFile(daemonConfigPath, 'utf8', (err, data) => {
+          if (err) {
+            res.writeHead(500);
+            res.end('Error reading daemon config');
+            return;
+          }
+          let payload = data;
+          try {
+            const raw = JSON.parse(stripBom(data));
+            payload = JSON.stringify(ensureCompleteConfig(raw));
+          } catch {
+            // Pass raw through; the GUI will surface the parse error.
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(payload);
+        });
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/api/daemon-config') {
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', () => {
+          try {
+            const raw = JSON.parse(body);
+            const complete = ensureCompleteConfig(raw);
+            // Validate by constructing the config — throws ConfigError on bad input.
+            new ProxyConfig(complete);
+            fs.writeFileSync(daemonConfigPath, JSON.stringify(complete, null, 2) + '\n', 'utf8');
+            res.writeHead(200);
+            res.end('OK');
+          } catch (e) {
+            res.writeHead(400, { 'Content-Type': 'text/plain' });
+            res.end(e?.message ?? 'Invalid daemon config');
           }
         });
         return;

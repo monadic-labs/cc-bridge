@@ -1,7 +1,10 @@
 const state = {
     config: null,
+    daemonConfig: null,
     schema: null,
-    activeTab: 'providers'
+    activeTab: 'providers',
+    daemonConfigDraft: null,
+    daemonConfigError: ''
 };
 
 const $ = (id) => document.getElementById(id);
@@ -23,12 +26,16 @@ function escapeAttr(value) {
 
 async function load() {
     try {
-        const [configRes, schemaRes] = await Promise.all([
+        const [configRes, schemaRes, daemonRes] = await Promise.all([
             fetch('/api/config'),
-            fetch('/api/schema')
+            fetch('/api/schema'),
+            fetch('/api/daemon-config')
         ]);
         state.config = await configRes.json();
         state.schema = await schemaRes.json();
+        state.daemonConfig = await daemonRes.json();
+        state.daemonConfigDraft = JSON.stringify(state.daemonConfig, null, 2);
+        state.daemonConfigError = '';
         render();
     } catch (e) {
         showToast('Failed to load configuration: ' + e.message, 'error');
@@ -40,7 +47,7 @@ function showToast(msg, type) {
     toast.textContent = msg;
     toast.style.display = 'block';
     toast.style.background = type === 'error' ? 'var(--error)' : 'var(--success)';
-    setTimeout(() => { toast.style.display = 'none'; }, 3000);
+    setTimeout(() => { toast.style.display = 'none'; }, 4000);
 }
 
 function render() {
@@ -50,14 +57,18 @@ function render() {
     if (tab === 'providers') return renderProviders();
     if (tab === 'routes') return renderRoutes();
     if (tab === 'extensions') return renderExtensions();
+    if (tab === 'daemon') return renderDaemonConfig();
     if (tab === 'status') return renderStatus();
 }
+
+// ── Providers ───────────────────────────────────────────────────────────
 
 function renderProviders() {
     const providers = state.config.providers || {};
     let html = '<h2>Upstream Providers</h2>';
 
     Object.entries(providers).forEach(([id, cfg]) => {
+        const compliant = cfg.anthropicCompliant === true ? 'checked' : '';
         html += `
             <div class="card">
                 <div class="form-group">
@@ -72,6 +83,15 @@ function renderProviders() {
                     <label>API Key (use ENV:VAR_NAME to read from .env)</label>
                     <input type="text" value="${escapeAttr(cfg.apiKey)}" onchange="updateConfig('providers.${id}.apiKey', this.value)">
                 </div>
+                <div class="form-group">
+                    <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer;">
+                        <input type="checkbox" ${compliant} onchange="updateConfig('providers.${id}.anthropicCompliant', this.checked)" style="width: auto;">
+                        <span>Anthropic-compliant (preserve cache_control, betas, system array, thinking signatures)</span>
+                    </label>
+                    <small style="color: #64748b; font-size: 0.8rem;">Enable for endpoints that speak Anthropic protocol natively (anthropic.com, z.ai /api/anthropic, mirrors). Disable for OpenAI-shape and unknown backends.</small>
+                </div>
+                ${renderModelsTable(id, cfg.models || {})}
+                ${renderToolTransforms(id, cfg.toolTransforms || {})}
                 <button class="secondary" onclick="deleteProvider('${escapeAttr(id)}')">Remove Provider</button>
             </div>
         `;
@@ -81,46 +101,160 @@ function renderProviders() {
     content.innerHTML = html;
 }
 
-function renderRoutes() {
-    const models = state.config.routes?.models || {};
-    let html = '<h2>Model Routing</h2>';
+function renderModelsTable(providerId, models) {
+    const rows = Object.entries(models).map(([alias, real]) => `
+        <div class="list-item">
+            <div style="flex: 1; display: flex; gap: 0.5rem; align-items: center;">
+                <input type="text" value="${escapeAttr(alias)}" disabled style="flex: 1;">
+                <span>→</span>
+                <input type="text" value="${escapeAttr(real)}" onchange="updateConfig('providers.${providerId}.models.${alias}', this.value)" style="flex: 1;">
+            </div>
+            <button class="secondary" onclick="deleteModel('${escapeAttr(providerId)}', '${escapeAttr(alias)}')">Remove</button>
+        </div>
+    `).join('');
 
-    html += '<div class="card">';
-    if (Object.keys(models).length === 0) {
-        html += '<p style="color: #94a3b8;">No routes configured.</p>';
-    }
-    Object.entries(models).forEach(([alias, target]) => {
-        const targetStr = typeof target === 'string'
-            ? target
-            : (target.target || target.pool || JSON.stringify(target));
-        html += `
-            <div class="list-item">
-                <div>
-                    <strong>${escapeHtml(alias)}</strong>
-                    <span class="tag">➔ ${escapeHtml(targetStr)}</span>
+    return `
+        <div class="form-group">
+            <label>Models (alias → real model name)</label>
+            <div class="card" style="background: rgba(15, 23, 42, 0.5); padding: 0.75rem; margin: 0;">
+                ${rows || '<p style="color: #64748b; font-size: 0.85rem;">No model aliases.</p>'}
+                <div style="display: flex; gap: 0.5rem; margin-top: 0.75rem;">
+                    <input type="text" placeholder="alias (e.g. fast)" id="new-model-alias-${providerId}" style="flex: 1;">
+                    <input type="text" placeholder="real model (e.g. glm-4.7)" id="new-model-real-${providerId}" style="flex: 1;">
+                    <button onclick="addModel('${escapeAttr(providerId)}')">+ Add</button>
                 </div>
-                <button class="secondary" onclick="deleteRoute('${escapeAttr(alias)}')">Remove</button>
             </div>
-        `;
-    });
-    html += '</div>';
-
-    html += `
-        <div class="card">
-            <h3>Add Route</h3>
-            <div class="form-group">
-                <label>Model Name / Wildcard (e.g. *sonnet*)</label>
-                <input type="text" id="new-route-key" placeholder="*sonnet*">
-            </div>
-            <div class="form-group">
-                <label>Target (provider.model or poolName)</label>
-                <input type="text" id="new-route-val" placeholder="z.glm-4.7">
-            </div>
-            <button onclick="addRoute()">Add Route</button>
         </div>
     `;
+}
+
+function renderToolTransforms(providerId, toolTransforms) {
+    const json = JSON.stringify(toolTransforms || {}, null, 2);
+    return `
+        <div class="form-group">
+            <label>Tool Transforms (JSON)</label>
+            <textarea rows="4" onchange="updateToolTransforms('${escapeAttr(providerId)}', this.value)">${escapeHtml(json)}</textarea>
+            <small style="color: #64748b; font-size: 0.8rem;">Per-tool overrides forwarded to extensions. Example: <code>{ "web_search": { "search_engine": "search-prime" } }</code></small>
+        </div>
+    `;
+}
+
+function addModel(providerId) {
+    const alias = $(`new-model-alias-${providerId}`).value.trim();
+    const real = $(`new-model-real-${providerId}`).value.trim();
+    if (!alias || !real) {
+        showToast('Both alias and real model are required', 'error');
+        return;
+    }
+    if (!state.config.providers[providerId].models) state.config.providers[providerId].models = {};
+    state.config.providers[providerId].models[alias] = real;
+    render();
+}
+
+function deleteModel(providerId, alias) {
+    delete state.config.providers[providerId].models[alias];
+    render();
+}
+
+function updateToolTransforms(providerId, jsonStr) {
+    try {
+        const parsed = JSON.parse(jsonStr);
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+            showToast('Tool transforms must be a JSON object', 'error');
+            return;
+        }
+        state.config.providers[providerId].toolTransforms = parsed;
+    } catch (e) {
+        showToast(`Invalid JSON for ${providerId} toolTransforms: ${e.message}`, 'error');
+    }
+}
+
+// ── Routes ──────────────────────────────────────────────────────────────
+
+function renderRoutes() {
+    const routes = state.config.routes || {};
+    const models = routes.models || {};
+    const properties = routes.properties || {};
+    const payloadSize = routes.payloadSize || {};
+    const defaults = routes.defaults || {};
+
+    let html = '<h2>Routing Rules</h2>';
+
+    html += `<div class="card"><h3>Model aliases</h3>${renderRouteMap('models', models)}</div>`;
+    html += `<div class="card"><h3>Property-based rules</h3>${renderRouteMap('properties', properties)}<small style="color: #64748b; font-size: 0.8rem;">Match by request body property (e.g. <code>thinking</code> → <code>z.glm-5.1</code>).</small></div>`;
+    html += `<div class="card"><h3>Payload-size rules</h3>${renderRouteMap('payloadSize', payloadSize)}<small style="color: #64748b; font-size: 0.8rem;">Match by request size (e.g. <code>&gt;102400</code> → <code>my-mirror.claude-opus-4-6</code>).</small></div>`;
+
+    const fallbackArr = Array.isArray(defaults.fallback) ? defaults.fallback : [];
+    html += `
+        <div class="card">
+            <h3>Default fallback</h3>
+            <div class="form-group">
+                <label>Fallback target (provider.model). Used when no rule matches.</label>
+                <input type="text" value="${escapeAttr(fallbackArr[0] || '')}" onchange="updateConfig('routes.defaults.fallback', this.value ? [this.value] : [])">
+            </div>
+        </div>
+    `;
+
     content.innerHTML = html;
 }
+
+function renderRouteMap(section, map) {
+    const rows = Object.entries(map).map(([key, value]) => {
+        const display = typeof value === 'string' ? value : JSON.stringify(value);
+        return `
+            <div class="list-item">
+                <div>
+                    <strong>${escapeHtml(key)}</strong>
+                    <span class="tag">➔ ${escapeHtml(display)}</span>
+                </div>
+                <button class="secondary" onclick="deleteRouteEntry('${escapeAttr(section)}', '${escapeAttr(key)}')">Remove</button>
+            </div>
+        `;
+    }).join('');
+
+    return `
+        ${rows || '<p style="color: #64748b; font-size: 0.85rem; margin: 0.5rem 0;">No entries.</p>'}
+        <div style="display: flex; gap: 0.5rem; margin-top: 0.75rem;">
+            <input type="text" placeholder="key (e.g. *sonnet*, thinking, &gt;102400)" id="new-${section}-key" style="flex: 1;">
+            <input type="text" placeholder="target (provider.model or JSON)" id="new-${section}-val" style="flex: 1;">
+            <button onclick="addRouteEntry('${escapeAttr(section)}')">+ Add</button>
+        </div>
+    `;
+}
+
+function addRouteEntry(section) {
+    const key = $(`new-${section}-key`).value.trim();
+    const rawVal = $(`new-${section}-val`).value.trim();
+    if (!key || !rawVal) {
+        showToast('Both key and target are required', 'error');
+        return;
+    }
+    let value = rawVal;
+    if (rawVal.startsWith('{')) {
+        try { value = JSON.parse(rawVal); }
+        catch (e) {
+            showToast(`Invalid JSON for target: ${e.message}`, 'error');
+            return;
+        }
+    }
+    if (!state.config.routes) state.config.routes = {};
+    if (!state.config.routes[section]) state.config.routes[section] = {};
+    state.config.routes[section][key] = value;
+    render();
+}
+
+function deleteRouteEntry(section, key) {
+    if (!state.config.routes?.[section]?.[key]) return;
+    if (!confirm(`Remove ${section}.${key}?`)) return;
+    delete state.config.routes[section][key];
+    render();
+}
+
+// Legacy aliases preserved for back-compat with any external references
+function addRoute() { return addRouteEntry('models'); }
+function deleteRoute(alias) { return deleteRouteEntry('models', alias); }
+
+// ── Extensions ──────────────────────────────────────────────────────────
 
 function renderExtensions() {
     const extensions = state.config.extensions || {};
@@ -176,6 +310,39 @@ function renderInput(p, prop, value) {
     return `<input type="text" value="${escapeAttr(value)}" onchange="updateConfig('${p}', this.value)">`;
 }
 
+// ── Daemon Config ───────────────────────────────────────────────────────
+
+function renderDaemonConfig() {
+    const draft = state.daemonConfigDraft ?? JSON.stringify(state.daemonConfig ?? {}, null, 2);
+    const errorBlock = state.daemonConfigError
+        ? `<p style="color: var(--error); font-size: 0.85rem; margin: 0.5rem 0;">${escapeHtml(state.daemonConfigError)}</p>`
+        : '';
+    content.innerHTML = `
+        <h2>Daemon Config</h2>
+        <p style="color: #94a3b8;">Settings stored in <code>~/.claude/.ccb/config.json</code>. Validated before write; the daemon hot-reloads on save.</p>
+        <div class="card">
+            <div class="form-group">
+                <label>config.json</label>
+                <textarea id="daemon-config-editor" rows="24" style="font-family: ui-monospace, 'SF Mono', Consolas, monospace; font-size: 0.85rem;">${escapeHtml(draft)}</textarea>
+                ${errorBlock}
+            </div>
+            <p style="color: #64748b; font-size: 0.8rem;">Key fields: <code>port</code>, <code>daemon.healthCheckTimeoutMs</code>, <code>daemon.upstreamTimeoutMs</code>, <code>daemon.workerKeepaliveS</code>, <code>daemon.ipcTimeoutMs</code>, <code>logging.level</code>, <code>compression.recompressRequests</code>.</p>
+        </div>
+    `;
+    const editor = $('daemon-config-editor');
+    editor.addEventListener('input', () => {
+        state.daemonConfigDraft = editor.value;
+        try {
+            JSON.parse(editor.value);
+            state.daemonConfigError = '';
+        } catch (e) {
+            state.daemonConfigError = `JSON parse error: ${e.message}`;
+        }
+    });
+}
+
+// ── Status ──────────────────────────────────────────────────────────────
+
 async function renderStatus() {
     content.innerHTML = '<h2>Daemon Status</h2><p style="color: #94a3b8;">Loading...</p>';
     try {
@@ -213,6 +380,8 @@ function formatDuration(seconds) {
     if (m > 0) return `${m}m${sec}s`;
     return `${sec}s`;
 }
+
+// ── Provider/route shared helpers ──────────────────────────────────────
 
 function updateConfig(p, value) {
     const parts = p.split('.');
@@ -254,27 +423,10 @@ function deleteProvider(id) {
     render();
 }
 
-function addRoute() {
-    const key = $('new-route-key').value.trim();
-    const val = $('new-route-val').value.trim();
-    if (!key || !val) {
-        showToast('Both model name and target are required', 'error');
-        return;
-    }
-    if (!state.config.routes) state.config.routes = {};
-    if (!state.config.routes.models) state.config.routes.models = {};
-    state.config.routes.models[key] = val;
-    render();
-}
-
-function deleteRoute(alias) {
-    if (!state.config.routes?.models?.[alias]) return;
-    if (!confirm(`Remove route "${alias}"?`)) return;
-    delete state.config.routes.models[alias];
-    render();
-}
+// ── Save ────────────────────────────────────────────────────────────────
 
 async function save() {
+    let savedAny = false;
     try {
         const res = await fetch('/api/config', {
             method: 'POST',
@@ -282,20 +434,48 @@ async function save() {
             body: JSON.stringify(state.config)
         });
         if (!res.ok) {
-            showToast('Failed to save: ' + await res.text(), 'error');
+            showToast('Failed to save providers: ' + await res.text(), 'error');
             return;
         }
-        showToast('Configuration saved and hot-reloaded');
-        await load();
+        savedAny = true;
     } catch (e) {
-        showToast('Save error: ' + e.message, 'error');
+        showToast('Save error (providers): ' + e.message, 'error');
+        return;
     }
+
+    if (state.daemonConfigDraft && state.daemonConfigDraft !== JSON.stringify(state.daemonConfig, null, 2)) {
+        try {
+            const parsed = JSON.parse(state.daemonConfigDraft);
+            const res = await fetch('/api/daemon-config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(parsed)
+            });
+            if (!res.ok) {
+                showToast('Daemon config rejected: ' + await res.text(), 'error');
+                return;
+            }
+            savedAny = true;
+        } catch (e) {
+            showToast(`Daemon config error: ${e.message}`, 'error');
+            return;
+        }
+    }
+
+    if (savedAny) showToast('Configuration saved and hot-reloaded');
+    await load();
 }
 
+// Expose for inline onclick handlers
 window.addProvider = addProvider;
 window.deleteProvider = deleteProvider;
+window.addModel = addModel;
+window.deleteModel = deleteModel;
+window.updateToolTransforms = updateToolTransforms;
 window.addRoute = addRoute;
 window.deleteRoute = deleteRoute;
+window.addRouteEntry = addRouteEntry;
+window.deleteRouteEntry = deleteRouteEntry;
 window.updateConfig = updateConfig;
 
 document.querySelectorAll('#menu li').forEach(li => {
