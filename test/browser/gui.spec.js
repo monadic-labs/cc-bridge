@@ -38,11 +38,18 @@ test.beforeEach(async ({ page }) => {
   // Surface browser-side errors as test failures rather than letting them
   // accumulate silently. Filter known noise:
   //  - favicon.ico 404: the browser auto-requests it; we don't ship one.
+  //  - Generic "Failed to load resource: ... status of 4xx/5xx": the
+  //    Chrome console auto-emits these for every non-2xx response. They're
+  //    not JavaScript errors — real JS exceptions arrive via 'pageerror'
+  //    (covered separately). Several tests deliberately POST invalid
+  //    payloads and assert on the resulting error toast; their 4xx
+  //    responses would otherwise fail the test on noise.
   page.on('pageerror', (err) => { throw new Error(`pageerror: ${err.message}`); });
   page.on('console', (msg) => {
     if (msg.type() !== 'error') return;
     const text = msg.text();
     if (text.includes('favicon.ico')) return;
+    if (/Failed to load resource.*status of [45]\d\d/.test(text)) return;
     throw new Error(`console.error: ${text}`);
   });
 });
@@ -270,6 +277,168 @@ test('Tab navigation: switching tabs updates the active marker', async ({ page }
 
   await page.locator('nav li[data-tab="status"]').click();
   await expect(page.locator('nav li.active')).toHaveText('Status');
+});
+
+test('Providers tab: edit URL, save, verify on-disk + reload', async ({ page }) => {
+  await page.goto('/gui');
+  await appReady(page);
+
+  const newUrl = 'https://updated-zai.example.com/api/anthropic';
+  const zaiUrl = page.locator('main > .card').first().locator('input[type="text"]').nth(1);
+  await zaiUrl.fill(newUrl);
+  // dispatch onchange so updateConfig() in app.js fires
+  await zaiUrl.blur();
+
+  await page.locator('#save-btn').click();
+
+  const persisted = await pollDaemonReload(() => {
+    try {
+      const onDisk = JSON.parse(fs.readFileSync(PROVIDERS_PATH, 'utf8'));
+      return onDisk.providers?.zai?.url === newUrl;
+    } catch { return false; }
+  });
+  expect(persisted).toBe(true);
+});
+
+test('Providers tab: anthropicCompliant checkbox toggles and persists', async ({ page }) => {
+  await page.goto('/gui');
+  await appReady(page);
+
+  const zaiCard = page.locator('main > .card').first();
+  const checkbox = zaiCard.locator('input[type="checkbox"]');
+  await expect(checkbox).not.toBeChecked();  // fixture has zai as non-compliant
+  await checkbox.check();
+  await page.locator('#save-btn').click();
+
+  const persisted = await pollDaemonReload(() => {
+    try {
+      const onDisk = JSON.parse(fs.readFileSync(PROVIDERS_PATH, 'utf8'));
+      return onDisk.providers?.zai?.anthropicCompliant === true;
+    } catch { return false; }
+  });
+  expect(persisted).toBe(true);
+});
+
+test('Providers tab: add model alias to existing provider, save, persist', async ({ page }) => {
+  await page.goto('/gui');
+  await appReady(page);
+
+  // zai card already has glm-4.7. Add a new alias.
+  await page.locator('#new-model-alias-zai').fill('fast');
+  await page.locator('#new-model-real-zai').fill('glm-4.7-flash');
+  await page.locator('main > .card').first().getByRole('button', { name: '+ Add' }).click();
+
+  // The new row renders
+  await expect(page.locator('main > .card').first().locator('input[value="fast"]')).toBeVisible();
+
+  await page.locator('#save-btn').click();
+
+  const persisted = await pollDaemonReload(() => {
+    try {
+      const onDisk = JSON.parse(fs.readFileSync(PROVIDERS_PATH, 'utf8'));
+      return onDisk.providers?.zai?.models?.fast === 'glm-4.7-flash';
+    } catch { return false; }
+  });
+  expect(persisted).toBe(true);
+});
+
+test('Routes tab: remove a property rule, save, verify gone from disk', async ({ page }) => {
+  page.on('dialog', async (d) => { if (d.type() === 'confirm') await d.accept(); });
+  await page.goto('/gui');
+  await appReady(page);
+  await page.locator('nav li[data-tab="routes"]').click();
+
+  // The 'thinking' property rule is in the fixture
+  const row = page.locator('main .list-item strong', { hasText: 'thinking' });
+  await expect(row).toBeVisible();
+
+  await row.locator('xpath=ancestor::*[contains(@class,"list-item")]')
+    .getByRole('button', { name: 'Remove' }).click();
+  await expect(row).toHaveCount(0);
+
+  await page.locator('#save-btn').click();
+  const persisted = await pollDaemonReload(() => {
+    try {
+      const onDisk = JSON.parse(fs.readFileSync(PROVIDERS_PATH, 'utf8'));
+      return onDisk.routes?.properties?.thinking === undefined;
+    } catch { return false; }
+  });
+  expect(persisted).toBe(true);
+});
+
+test('Routes tab: add a payloadSize rule via UI', async ({ page }) => {
+  await page.goto('/gui');
+  await appReady(page);
+  await page.locator('nav li[data-tab="routes"]').click();
+
+  await page.locator('#new-payloadSize-key').fill('>500000');
+  await page.locator('#new-payloadSize-val').fill('mirror.claude-opus-4-6');
+  // The "Add" button inside the payloadSize section — there are three +Add
+  // buttons across the three route map sections; nth(2) is payloadSize.
+  await page.getByRole('button', { name: '+ Add' }).nth(2).click();
+
+  await expect(page.locator('main .list-item strong', { hasText: '>500000' })).toBeVisible();
+  await page.locator('#save-btn').click();
+
+  const persisted = await pollDaemonReload(() => {
+    try {
+      const onDisk = JSON.parse(fs.readFileSync(PROVIDERS_PATH, 'utf8'));
+      return onDisk.routes?.payloadSize?.['>500000'] === 'mirror.claude-opus-4-6';
+    } catch { return false; }
+  });
+  expect(persisted).toBe(true);
+});
+
+test('Extensions tab: declare a provider as OpenAI-format via map editor', async ({ page }) => {
+  await page.goto('/gui');
+  await appReady(page);
+  await page.locator('nav li[data-tab="extensions"]').click();
+
+  await page.locator('main input[id^="new-map-key-"]').fill('mirror');
+  await page.getByRole('button', { name: '+ Add' }).click();
+
+  // The new map entry renders inside the openai-format card as a nested card
+  // with a strong tag bearing the key — narrow by that to avoid matching the
+  // outer card that ALSO contains "mirror" via the new child.
+  await expect(page.locator('main strong', { hasText: 'mirror' })).toBeVisible();
+  await page.locator('#save-btn').click();
+
+  const persisted = await pollDaemonReload(() => {
+    try {
+      const onDisk = JSON.parse(fs.readFileSync(PROVIDERS_PATH, 'utf8'));
+      return typeof onDisk.extensions?.['openai-format']?.providers?.mirror === 'object';
+    } catch { return false; }
+  });
+  expect(persisted).toBe(true);
+});
+
+test('Daemon Config tab: save with a busted port shows a backend error toast', async ({ page }) => {
+  await page.goto('/gui');
+  await appReady(page);
+  await page.locator('nav li[data-tab="daemon"]').click();
+
+  const editor = page.locator('#daemon-config-editor');
+  const original = JSON.parse(await editor.inputValue());
+  original.port = -1;  // domain-invalid but JSON-valid
+  await editor.fill(JSON.stringify(original, null, 2));
+
+  await page.locator('#save-btn').click();
+
+  // Toast surfaces the daemon's ConfigError message
+  await expect(page.locator('#toast')).toContainText(/port|Port/);
+});
+
+test('Save button: success toast after a valid round-trip', async ({ page }) => {
+  await page.goto('/gui');
+  await appReady(page);
+
+  // Mutate URL of zai then save — the save flow must show the success toast.
+  const zaiUrl = page.locator('main > .card').first().locator('input[type="text"]').nth(1);
+  await zaiUrl.fill('https://api.z.ai/api/anthropic');
+  await zaiUrl.blur();
+
+  await page.locator('#save-btn').click();
+  await expect(page.locator('#toast')).toContainText(/saved/i);
 });
 
 // Suppress the unused-import warning for LOGS_DIR — kept for future log-tail

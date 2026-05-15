@@ -2290,8 +2290,18 @@ async function testModelSwitch() {
  * skip rather than fail on missing credentials.
  */
 async function assertTtyConcurrency() {
-  if (!process.env.ZAI_KEY) {
-    console.log('  SKIP: ZAI_KEY not set in env');
+  // Read ZAI_KEY from the test config dir's .env (setupTestConfig wrote
+  // it from one of: cached test .env, user's ~/.claude/.ccb/.env, WSL
+  // crossmount, or process.env). Match what the spawned ccb subprocess
+  // will actually see.
+  const testEnvPath = path.join(TEST_CONFIG_DIR, ENV_FILENAME);
+  let zaiKey = process.env.ZAI_KEY;
+  if (!zaiKey && fs.existsSync(testEnvPath)) {
+    const m = fs.readFileSync(testEnvPath, 'utf8').match(/^ZAI_KEY=(.+)$/m);
+    if (m && m[1].trim()) zaiKey = m[1].trim();
+  }
+  if (!zaiKey) {
+    console.log('  SKIP: ZAI_KEY not available');
     return true;
   }
 
