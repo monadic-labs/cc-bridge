@@ -1,4 +1,4 @@
-const VALID_WORKER_TYPES = Object.freeze(['ready', 'error']);
+const VALID_WORKER_TYPES = Object.freeze(['ready', 'error', 'restart-request']);
 const VALID_COMMANDS = Object.freeze(['restart', 'status', 'shutdown', 'keepalive', 'sessions']);
 
 export function serializeIpcMessage(obj) {
@@ -28,6 +28,10 @@ export function validateWorkerMessage(raw) {
   if (raw.type === 'error') {
     if (typeof raw.message !== 'string') return null;
     return Object.freeze({ type: 'error', message: raw.message });
+  }
+
+  if (raw.type === 'restart-request') {
+    return Object.freeze({ type: 'restart-request' });
   }
 
   return null;

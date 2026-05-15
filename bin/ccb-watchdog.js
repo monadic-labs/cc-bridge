@@ -116,6 +116,29 @@ function removeRuntimeFile() {
   }
 }
 
+async function triggerRestart(source) {
+  if (restartInProgress) {
+    log(`Restart requested via ${source} — ignored (already in progress)`);
+    return false;
+  }
+  restartInProgress = true;
+  log(`Restart requested via ${source}`);
+
+  if (activeWorker) {
+    const oldWorker = activeWorker;
+    const oldKeepalives = countKeepalivesFor(oldWorker);
+    drainingWorkers.set(oldWorker, {
+      keepaliveCount: oldKeepalives,
+      lastKeepaliveAt: Date.now(),
+      timer: null
+    });
+    log(`Moved active worker (PID ${oldWorker.pid}) to draining (${oldKeepalives} keepalives)`);
+  }
+  const fresh = await spawnWorker();
+  activeWorker = fresh;
+  return true;
+}
+
 async function spawnWorker() {
   log('Spawning new worker...');
   const config = getConfig();
@@ -182,6 +205,12 @@ async function spawnWorker() {
     if (workerMsg.type === 'error') {
       clearTimeout(initTimeout);
       log(`Worker error: ${workerMsg.message}`);
+    }
+
+    if (workerMsg.type === 'restart-request') {
+      triggerRestart('worker IPC').catch((e) => {
+        log(`Restart-request failed: ${e.message}`);
+      });
     }
   });
 
@@ -322,28 +351,9 @@ function handleControlConnection(socket) {
       }
 
       if (cmd.cmd === 'restart') {
-        if (restartInProgress) {
-          socket.write(serializeIpcMessage({ status: 'error', message: 'restart already in progress' }));
-          return;
-        }
-        restartInProgress = true;
-        log('Restart requested via IPC');
-
-        if (activeWorker) {
-          const oldWorker = activeWorker;
-          const oldKeepalives = countKeepalivesFor(oldWorker);
-          drainingWorkers.set(oldWorker, {
-            keepaliveCount: oldKeepalives,
-            lastKeepaliveAt: Date.now(),
-            timer: null
-          });
-          log(`Moved active worker (PID ${oldWorker.pid}) to draining (${oldKeepalives} keepalives)`);
-        }
-        spawnWorker().then((w) => {
-          activeWorker = w;
-          socket.write(serializeIpcMessage({ status: 'ok', cmd: 'restart' }));
+        triggerRestart('IPC').then((ok) => {
+          if (ok) socket.write(serializeIpcMessage({ status: 'ok', cmd: 'restart' }));
         }).catch((e) => {
-          log(`Restart failed: ${e.message}`);
           socket.write(serializeIpcMessage({ status: 'error', cmd: 'restart', message: e.message }));
         });
         return;

@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import http from 'http';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, URL } from 'url';
 import {
   CCB_VERSION,
   LOGS_DIR_NAME,
@@ -425,6 +425,36 @@ export function createProxyCore({ configDir, port }) {
             res.writeHead(400, { 'Content-Type': 'text/plain' });
             res.end(e?.message ?? 'Invalid daemon config');
           }
+        });
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/api/restart') {
+        if (!process.send) {
+          res.writeHead(503, { 'Content-Type': 'text/plain' });
+          res.end('Restart is only available when running under the watchdog.');
+          return;
+        }
+        process.send({ type: 'restart-request' });
+        res.writeHead(202, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'restarting' }));
+        return;
+      }
+
+      if (req.method === 'GET' && req.url.startsWith('/api/logs')) {
+        const url = new URL(req.url, 'http://localhost');
+        const lines = Math.min(Math.max(parseInt(url.searchParams.get('lines') || '200', 10), 1), 5000);
+        const logFile = path.join(logsDir, 'daemon.log');
+        fs.readFile(logFile, 'utf8', (err, data) => {
+          if (err) {
+            res.writeHead(500, { 'Content-Type': 'text/plain' });
+            res.end(`Cannot read ${logFile}: ${err.message}`);
+            return;
+          }
+          const all = data.split('\n');
+          const tail = all.slice(Math.max(0, all.length - lines)).join('\n');
+          res.writeHead(200, { 'Content-Type': 'text/plain' });
+          res.end(tail);
         });
         return;
       }
