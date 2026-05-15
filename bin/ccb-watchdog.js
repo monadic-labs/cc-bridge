@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 
+import fs from 'fs';
 import net from 'net';
 import http from 'http';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import os from 'os';
-import { CCB_DIR_NAME, CCB_VERSION as DEFAULT_VERSION } from '../src/core/constants.js';
+import { CCB_DIR_NAME, CCB_VERSION as DEFAULT_VERSION, RUNTIME_FILENAME } from '../src/core/constants.js';
 
 const CCB_VERSION = process.env.CCB_VERSION || DEFAULT_VERSION;
 import { getControlIpcPath } from '../src/core/daemon-constants.js';
@@ -13,11 +14,14 @@ import { parseIpcMessage, serializeIpcMessage, validateWorkerMessage, validateCo
 import { loadConfigFromFile } from '../src/core/config.js';
 import { spawnDaemon } from '../src/infra/process-manager.js';
 
+const PORT_FALLBACK_RANGE = 10;
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_SCRIPT = path.join(__dirname, '..', 'src', 'proxy.js');
 
 let activeWorker = null;
 let sharedServer = null;
+let activePort = null;
 let shuttingDown = false;
 let workerDraining = false;
 let shutdownTimer = null;
@@ -29,6 +33,10 @@ const MAX_CONSECUTIVE_CRASHES = 5;
 const CRASH_WINDOW_MS = 10000;
 
 const startTime = Date.now();
+const runtimeFilePath = path.join(
+  process.env.CCB_CONFIG_DIR || path.join(os.homedir(), '.claude', CCB_DIR_NAME),
+  RUNTIME_FILENAME
+);
 
 // Keepalive sockets — each is associated with the active worker at connect time
 const keepaliveConnections = new Set();
@@ -47,15 +55,79 @@ function getConfig() {
   return loadConfigFromFile(_configDir);
 }
 
-function spawnWorker() {
+function tryListen(server, port) {
+  return new Promise((resolve, reject) => {
+    const onError = (err) => {
+      server.removeListener('listening', onListening);
+      reject(err);
+    };
+    const onListening = () => {
+      server.removeListener('error', onError);
+      resolve();
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(port);
+  });
+}
+
+async function bindSharedServer(config) {
+  const candidates = [];
+  for (let i = 0; i < PORT_FALLBACK_RANGE; i++) candidates.push(config.port + i);
+  candidates.push(0); // OS-assigned port as last resort
+
+  for (const port of candidates) {
+    const server = http.createServer();
+    try {
+      await tryListen(server, port);
+      return server;
+    } catch (err) {
+      if (err.code !== 'EADDRINUSE') throw err;
+      const msg = port === config.port
+        ? `Configured port ${config.port} in use, searching for alternate...`
+        : `Port ${port} in use, trying next...`;
+      log(msg);
+    }
+  }
+  throw new Error('All candidate ports exhausted');
+}
+
+function writeRuntimeFile(port) {
+  const dir = path.dirname(runtimeFilePath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const payload = {
+    port,
+    watchdogPid: process.pid,
+    startedAt: new Date(startTime).toISOString(),
+    version: CCB_VERSION
+  };
+  const tmp = runtimeFilePath + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n', 'utf8');
+  fs.renameSync(tmp, runtimeFilePath);
+}
+
+function removeRuntimeFile() {
+  if (!fs.existsSync(runtimeFilePath)) return;
+  try {
+    const recorded = JSON.parse(fs.readFileSync(runtimeFilePath, 'utf8'));
+    if (recorded.watchdogPid === process.pid) fs.unlinkSync(runtimeFilePath);
+  } catch {
+    // Stale or unreadable — leave it; another watchdog may own it now.
+  }
+}
+
+async function spawnWorker() {
   log('Spawning new worker...');
   const config = getConfig();
 
   if (!sharedServer) {
-    sharedServer = http.createServer();
-    sharedServer.listen(config.port, () => {
-      log(`Watchdog listening on port ${config.port}`);
-    });
+    sharedServer = await bindSharedServer(config);
+    activePort = sharedServer.address().port;
+    const listenMsg = activePort === config.port
+      ? `Watchdog listening on port ${activePort}`
+      : `Watchdog listening on port ${activePort} (configured ${config.port} was unavailable)`;
+    log(listenMsg);
+    writeRuntimeFile(activePort);
     sharedServer.on('error', (err) => {
       log(`Shared server error: ${err.message}`);
       process.exit(1);
@@ -140,14 +212,17 @@ function spawnWorker() {
       }
 
       log(`Active worker died unexpectedly, respawning... (crash ${consecutiveCrashCount}/${MAX_CONSECUTIVE_CRASHES})`);
-      activeWorker = spawnWorker();
+      spawnWorker().then((w) => { activeWorker = w; }).catch((e) => {
+        log(`Failed to respawn worker: ${e.message}`);
+        process.exit(1);
+      });
     }
   });
 
   child._readyAt = null;
 
   const handle = sharedServer._handle;
-  child.send({ type: 'socket', port: config.port }, handle);
+  child.send({ type: 'socket', port: activePort }, handle);
 
   return child;
 }
@@ -264,8 +339,13 @@ function handleControlConnection(socket) {
           });
           log(`Moved active worker (PID ${oldWorker.pid}) to draining (${oldKeepalives} keepalives)`);
         }
-        activeWorker = spawnWorker();
-        socket.write(serializeIpcMessage({ status: 'ok', cmd: 'restart' }));
+        spawnWorker().then((w) => {
+          activeWorker = w;
+          socket.write(serializeIpcMessage({ status: 'ok', cmd: 'restart' }));
+        }).catch((e) => {
+          log(`Restart failed: ${e.message}`);
+          socket.write(serializeIpcMessage({ status: 'error', cmd: 'restart', message: e.message }));
+        });
         return;
       }
 
@@ -343,25 +423,31 @@ function handleControlConnection(socket) {
   });
 }
 
-activeWorker = spawnWorker();
+(async () => {
+  try {
+    activeWorker = await spawnWorker();
+  } catch (err) {
+    log(`Failed to start worker: ${err.message}`);
+    process.exit(1);
+  }
 
-const watchdogConfig = getConfig();
-const ipcPath = getControlIpcPath(watchdogConfig.port);
-const controlServer = net.createServer(handleControlConnection);
+  const ipcPath = getControlIpcPath(activePort);
+  const controlServer = net.createServer(handleControlConnection);
 
-controlServer.listen(ipcPath, () => {
-  log(`Control IPC listening on ${ipcPath}`);
-});
+  controlServer.listen(ipcPath, () => {
+    log(`Control IPC listening on ${ipcPath}`);
+  });
 
-controlServer.on('error', (err) => {
-  log(`Control IPC error: ${err.message}`);
-  process.exit(1);
-});
+  controlServer.on('error', (err) => {
+    log(`Control IPC error: ${err.message}`);
+    process.exit(1);
+  });
+})();
 
-process.on('SIGINT', () => {
+function gracefulShutdown(signal) {
   shuttingDown = true;
   workerDraining = true;
-  log('SIGINT received, shutting down');
+  log(`${signal} received, shutting down`);
   const config = getConfig();
   if (activeWorker) {
     activeWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
@@ -370,4 +456,8 @@ process.on('SIGINT', () => {
     worker.send({ type: 'drain', timeout: config.drainTimeoutMs });
   }
   setTimeout(() => process.exit(0), config.drainTimeoutMs + 1000);
-});
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('exit', removeRuntimeFile);

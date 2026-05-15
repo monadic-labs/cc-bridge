@@ -254,12 +254,16 @@ export function convertV1ToV2(v1Json) {
   const v1Providers = Array.isArray(v1Json.providers) ? v1Json.providers : [];
   const v1Policy = Array.isArray(v1Json.routingPolicy) ? v1Json.routingPolicy : [];
 
-  // Build providers object (strip models, id becomes the key)
+  // Build providers object (strip models from provider into routes.models, id becomes the key).
+  // models and toolTransforms emitted as {} so the V2 output satisfies ProviderConfig's strict
+  // validation when the daemon next loads it.
   const providers = {};
   for (const p of v1Providers) {
     providers[p.id] = {
       url: p.url,
-      anthropicCompliant: p.anthropicCompliant
+      models: {},
+      anthropicCompliant: p.anthropicCompliant,
+      toolTransforms: p.toolTransforms ?? {}
     };
     if (p.apiKey) providers[p.id].apiKey = p.apiKey;
   }

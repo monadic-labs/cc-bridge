@@ -5,6 +5,7 @@ export const CCB_DIR_NAME = '.ccb';
 export const CONFIG_FILENAME = 'config.json';
 export const PROVIDERS_FILENAME = 'providers.json';
 export const VERSIONS_FILENAME = 'versions.json';
+export const RUNTIME_FILENAME = 'runtime.json';
 export const ENV_FILENAME = '.env';
 export const LOGS_DIR_NAME = 'logs';
 export const WATCHDOG_SCRIPT_NAME = 'ccb-watchdog.js';

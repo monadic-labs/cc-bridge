@@ -25,6 +25,7 @@ import {
   PROVIDERS_FILENAME,
   CONFIG_FILENAME,
   VERSIONS_FILENAME,
+  RUNTIME_FILENAME,
   ENV_FILENAME,
   WATCHDOG_SCRIPT_NAME
 } from '../src/core/constants.js';
@@ -69,6 +70,22 @@ const USER_CONFIG_DIR = resolveUserConfigDir();
 const LOGS_DIR = path.join(USER_CONFIG_DIR, LOGS_DIR_NAME);
 const providersPath = path.join(USER_CONFIG_DIR, PROVIDERS_FILENAME);
 const VERSIONS_PATH = path.join(USER_CONFIG_DIR, VERSIONS_FILENAME);
+const RUNTIME_PATH = path.join(USER_CONFIG_DIR, RUNTIME_FILENAME);
+
+function readRuntimeState() {
+  try {
+    if (!fs.existsSync(RUNTIME_PATH)) return null;
+    return JSON.parse(fs.readFileSync(RUNTIME_PATH, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function readActivePort(config) {
+  const runtime = readRuntimeState();
+  if (runtime && typeof runtime.port === 'number') return runtime.port;
+  return config.port;
+}
 
 function loadVersions() {
   const versions = readJsonFile(VERSIONS_PATH) ?? { current: CCB_VERSION, versions: {} };
@@ -578,9 +595,10 @@ async function connectToControlIpc(port) {
 
 async function handleStatusCommand() {
   const config = loadConfigFromFile(USER_CONFIG_DIR);
-  const socket = await connectToControlIpc(config.port);
+  const port = readActivePort(config);
+  const socket = await connectToControlIpc(port);
   if (!socket) {
-    process.stderr.write(`ccb: No running proxy daemon found on port ${config.port}.\n`);
+    process.stderr.write(`ccb: No running proxy daemon found on port ${port}.\n`);
     process.exit(1);
   }
 
@@ -628,9 +646,17 @@ const CCB_CMDS = {
   },
   '--x-status': () => handleStatusCommand(),
   '--x-sessions': () => handleSessionsCommand(),
-  '--x-gui': () => {
+  '--x-gui': async () => {
     const config = loadDaemonConfig(USER_CONFIG_DIR);
-    const url = `http://localhost:${config.port}/gui`;
+    try {
+      await ensureDaemon(config, null);
+    } catch (e) {
+      process.stderr.write(`ccb: Failed to start the proxy daemon: ${e.message}\n`);
+      process.stderr.write(`See ${path.join(LOGS_DIR, 'daemon.err')} for details.\n`);
+      process.exit(1);
+    }
+    const port = readActivePort(config);
+    const url = `http://localhost:${port}/gui`;
     const platform = process.platform;
     let cmd = 'xdg-open';
     if (platform === 'darwin') cmd = 'open';
@@ -645,7 +671,9 @@ const CCB_CMDS = {
     process.exit(0);
   },
   '--x-restart': async () => {
-    const socket = await connectToControlIpc();
+    const config = loadDaemonConfig(USER_CONFIG_DIR);
+    const port = readActivePort(config);
+    const socket = await connectToControlIpc(port);
     if (!socket) {
       process.stderr.write('ccb: No proxy daemon running.\n');
       process.exit(1);
@@ -753,17 +781,19 @@ function displaySessionSummary(info) {
   }
 
   async function ensureDaemon(config, versionInfo) {
-  const isUp = await checkProxy(config.port, config.healthCheckTimeoutMs);
-  if (!isUp) {
-    startProxyDaemonProcess(versionInfo);
-    let attempts = 0;
-    while (attempts < config.pollMaxAttempts) {
-      await new Promise(r => setTimeout(r, config.pollIntervalMs));
-      if (await checkProxy(config.port, config.healthCheckTimeoutMs)) return;
-      attempts++;
-    }
-    throw new ReadinessTimeoutException('Proxy daemon failed to start within timeout limit');
+  // Existing daemon? readActivePort returns runtime.json port if recorded, else config.port.
+  if (await checkProxy(readActivePort(config), config.healthCheckTimeoutMs)) return;
+
+  startProxyDaemonProcess(versionInfo);
+
+  let attempts = 0;
+  while (attempts < config.pollMaxAttempts) {
+    await new Promise(r => setTimeout(r, config.pollIntervalMs));
+    // runtime.json may appear after the first few attempts; keep re-reading.
+    if (await checkProxy(readActivePort(config), config.healthCheckTimeoutMs)) return;
+    attempts++;
   }
+  throw new ReadinessTimeoutException('Proxy daemon failed to start within timeout limit');
 }
 
 
@@ -846,7 +876,8 @@ async function entry() {
   const config = loadConfigFromFile(USER_CONFIG_DIR);
   await ensureDaemon(config, targetVersionPath ? { name: targetVersionName, path: targetVersionPath } : null);
 
-  const ipcPath = getControlIpcPath(config.port);
+  const activePort = readActivePort(config);
+  const ipcPath = getControlIpcPath(activePort);
   const KEEPALIVE_INTERVAL_MS = 15000;
 
   let ipcSocket = null;
@@ -880,8 +911,8 @@ async function entry() {
   connectKeepalive();
 
   const args = process.argv.slice(2);
-  const baseUrl = `http://localhost:${config.port}`;
-  
+  const baseUrl = `http://localhost:${activePort}`;
+
   const claudeBin = resolveClaudeBin();
   const child = spawnCommand(claudeBin, args, {
     stdio: 'inherit',
@@ -891,7 +922,7 @@ async function entry() {
   child.on('exit', async (code) => {
     claudeAlive = false;
     if (keepaliveTimer) clearInterval(keepaliveTimer);
-    const sessionInfo = await fetchSessionInfo(config.port, config.healthCheckTimeoutMs);
+    const sessionInfo = await fetchSessionInfo(activePort, config.healthCheckTimeoutMs);
     displaySessionSummary(sessionInfo);
     if (ipcSocket) ipcSocket.destroy();
     process.exit(code ?? 0);
