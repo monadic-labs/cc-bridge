@@ -767,9 +767,7 @@ function fetchSessionInfo(port, timeoutMs) {
 function displaySessionSummary(info) {
   if (!info) return;
   process.stdout.write('\n── Session Summary ──\n');
-  if (info.claude_session_id) {
-    process.stdout.write(`  Claude Session: ${info.claude_session_id}\n`);
-  }
+  process.stdout.write(`  Claude Session: ${info.claude_session_id || '(none — no requests served)'}\n`);
   process.stdout.write(`  Requests: ${info.total_requests} | Tokens: ${info.total_input_tokens} in / ${info.total_output_tokens} out\n`);
   process.stdout.write(`  Uptime: ${info.uptime_sec}s | Worker PID: ${info.worker_pid}\n`);
   if (info.history && info.history.length > 0) {
