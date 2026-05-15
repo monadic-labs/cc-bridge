@@ -99,15 +99,10 @@ export async function startDaemon() {
   if (await checkReady()) return { port: PORT, configDir: CONFIG_DIR };
 
   writeFixtures();
-  // Use standalone proxy (not the watchdog) for browser tests. The watchdog
-  // shares a TCP socket handle with the worker; on this Linux box that
-  // sharing wedges some inbound connections (~1 in 5 requests times out).
-  // The standalone path runs the request handler in a single Node process
-  // with no socket sharing, which is what we need for a stable test surface.
-  const proxyPath = path.join(ROOT, 'src', 'proxy.js');
+  const watchdogPath = path.join(ROOT, 'bin', 'ccb-watchdog.js');
   const out = fs.openSync(path.join(LOGS_DIR, 'daemon.log'), 'a');
   const err = fs.openSync(path.join(LOGS_DIR, 'daemon.err'), 'a');
-  daemonChild = spawn(process.execPath, [proxyPath], {
+  daemonChild = spawn(process.execPath, [watchdogPath], {
     detached: true,
     stdio: ['ignore', out, err],
     env: { ...process.env, CCB_CONFIG_DIR: CONFIG_DIR }
@@ -122,13 +117,11 @@ export async function startDaemon() {
 }
 
 export async function stopDaemon() {
-  // We spawned the standalone proxy directly; kill its PID file content too.
   try {
-    const pidsFile = path.join(LOGS_DIR, 'proxy.pids');
-    if (fs.existsSync(pidsFile)) {
-      const pid = parseInt(fs.readFileSync(pidsFile, 'utf8').trim(), 10);
-      if (Number.isFinite(pid)) {
-        try { process.kill(pid, 'SIGTERM'); } catch { /* gone already */ }
+    if (fs.existsSync(RUNTIME_PATH)) {
+      const r = JSON.parse(fs.readFileSync(RUNTIME_PATH, 'utf8'));
+      if (r.watchdogPid) {
+        try { process.kill(r.watchdogPid, 'SIGTERM'); } catch { /* gone already */ }
       }
     }
   } catch { /* best effort */ }

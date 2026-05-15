@@ -22,7 +22,9 @@ export function validateWorkerMessage(raw) {
     if (typeof raw.pid !== 'number') return null;
     if (typeof raw.routes !== 'number') return null;
     if (typeof raw.extensions !== 'number') return null;
-    return Object.freeze({ type: 'ready', pid: raw.pid, routes: raw.routes, extensions: raw.extensions });
+    const payload = { type: 'ready', pid: raw.pid, routes: raw.routes, extensions: raw.extensions };
+    if (typeof raw.port === 'number') payload.port = raw.port;
+    return Object.freeze(payload);
   }
 
   if (raw.type === 'error') {
