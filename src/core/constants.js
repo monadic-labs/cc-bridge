@@ -1,6 +1,6 @@
 import path from 'path';
 
-export const CCB_VERSION = '1.8.0';
+export const CCB_VERSION = '2.0.0';
 export const CCB_DIR_NAME = '.ccb';
 export const CONFIG_FILENAME = 'config.json';
 export const PROVIDERS_FILENAME = 'providers.json';
