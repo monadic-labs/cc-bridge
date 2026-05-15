@@ -24,6 +24,7 @@ export function validateWorkerMessage(raw) {
     if (typeof raw.extensions !== 'number') return null;
     const payload = { type: 'ready', pid: raw.pid, routes: raw.routes, extensions: raw.extensions };
     if (typeof raw.port === 'number') payload.port = raw.port;
+    if (typeof raw.reusePort === 'boolean') payload.reusePort = raw.reusePort;
     return Object.freeze(payload);
   }
 

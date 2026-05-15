@@ -613,24 +613,56 @@ export function createProxyCore({ configDir, port }) {
 // multiple workers can bind the same kernel socket — the OS load-balances
 // new connections across them, which is the foundation for zero-downtime
 // restart without socket-handle sharing across processes.
+// reusePort isn't supported on Windows (Node bind throws ENOTSUP). The
+// worker falls back to a plain listen in that case; the watchdog then has
+// to do a sequential restart instead of a parallel one.
 const WORKER_PORT_FALLBACK_RANGE = 10;
+
+function listenOnce(server, opts) {
+  return new Promise((resolve, reject) => {
+    const onError = (err) => { server.removeListener('listening', onListening); reject(err); };
+    const onListening = () => { server.removeListener('error', onError); resolve(); };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(opts);
+  });
+}
 
 async function bindWorkerServer(server, basePort) {
   const candidates = [];
   for (let i = 0; i < WORKER_PORT_FALLBACK_RANGE; i++) candidates.push(basePort + i);
   candidates.push(0);
 
+  let useReusePort = true;
+  let reusePortDisabledNote = false;
+
   for (const port of candidates) {
     try {
-      await new Promise((resolve, reject) => {
-        const onError = (err) => { server.removeListener('listening', onListening); reject(err); };
-        const onListening = () => { server.removeListener('error', onError); resolve(); };
-        server.once('error', onError);
-        server.once('listening', onListening);
-        server.listen({ port, host: '0.0.0.0', reusePort: true });
-      });
-      return server.address().port;
+      const opts = useReusePort
+        ? { port, host: '0.0.0.0', reusePort: true }
+        : { port, host: '0.0.0.0' };
+      await listenOnce(server, opts);
+      return { port: server.address().port, reusePort: useReusePort };
     } catch (err) {
+      if (err.code === 'ENOTSUP' && useReusePort) {
+        // OS doesn't support SO_REUSEPORT (Windows, older kernels).
+        // Retry the SAME port without it. Restart will need to be
+        // sequential rather than parallel; watchdog handles that.
+        useReusePort = false;
+        if (!reusePortDisabledNote) {
+          process.stdout.write('[worker] SO_REUSEPORT unsupported on this OS; falling back to single-binder mode\n');
+          reusePortDisabledNote = true;
+        }
+        // Retry the same port immediately — don't skip past basePort.
+        try {
+          await listenOnce(server, { port, host: '0.0.0.0' });
+          return { port: server.address().port, reusePort: false };
+        } catch (retryErr) {
+          if (retryErr.code !== 'EADDRINUSE') throw retryErr;
+          if (port !== basePort) process.stdout.write(`[worker] Port ${port} unavailable, trying next...\n`);
+        }
+        continue;
+      }
       if (err.code !== 'EADDRINUSE') throw err;
       if (port !== basePort) process.stdout.write(`[worker] Port ${port} unavailable, trying next...\n`);
     }
@@ -662,9 +694,9 @@ export function runWorkerMode({ configDir, port }) {
 
   (async () => {
     server = http.createServer(core.createRequestHandler());
-    let actualPort;
+    let bindResult;
     try {
-      actualPort = await bindWorkerServer(server, basePort);
+      bindResult = await bindWorkerServer(server, basePort);
     } catch (e) {
       process.stderr.write(`[worker] Bind failed: ${e.message}\n`);
       if (process.send) process.send({ type: 'error', message: e.message });
@@ -672,14 +704,15 @@ export function runWorkerMode({ configDir, port }) {
     }
     bindCompleted = true;
     clearTimeout(startupTimeout);
-    process.stdout.write(`[worker] Listening on port ${actualPort}\n`);
+    process.stdout.write(`[worker] Listening on port ${bindResult.port}\n`);
 
     try {
       await core.initProviders();
       const readyMsg = {
         type: 'ready',
         pid: process.pid,
-        port: actualPort,
+        port: bindResult.port,
+        reusePort: bindResult.reusePort,
         routes: core.providerCount,
         extensions: core.extensions?.size ?? 0
       };

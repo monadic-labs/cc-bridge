@@ -18,6 +18,15 @@ export const DEFAULT_RAW_CONFIG = {
     drainTimeoutMs: 600000,
     workerKeepaliveS: -1,
     ipcTimeoutMs: 5000,
+    // Hard ceiling the CLI waits for the worker to start, reach the bound
+    // port, finish initProviders, and report 'ready'. Real-world cold starts
+    // include filesystem walks + dynamic imports of every extension, so
+    // 20s is a safe floor.
+    daemonStartTimeoutMs: 20000,
+    // Phase-aware "stuck" detector: if daemon.log goes silent for this long
+    // AND the daemon isn't responding, the CLI gives up early instead of
+    // waiting out the full ceiling. Each new chunk of log resets the timer.
+    daemonStartProgressGraceMs: 4000,
     retry: {
       maxAttempts: 2,
       baseDelayMs: 500,

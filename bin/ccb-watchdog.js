@@ -18,6 +18,11 @@ const WORKER_SCRIPT = path.join(__dirname, '..', 'src', 'proxy.js');
 
 let activeWorker = null;
 let activePort = null;
+// Whether the active worker bound with SO_REUSEPORT. When false (Windows /
+// older kernels), parallel restart isn't possible — the new worker can't
+// bind the same port while the old one still holds it. Triggers sequential
+// restart in triggerRestart().
+let activeReusePort = true;
 let shuttingDown = false;
 let workerDraining = false;
 let shutdownTimer = null;
@@ -83,6 +88,34 @@ async function triggerRestart(source) {
   restartInProgress = true;
   log(`Restart requested via ${source}`);
 
+  if (!activeReusePort) {
+    // Sequential restart: tell old worker to drain + wait for it to exit
+    // BEFORE spawning new. Without SO_REUSEPORT the kernel won't let two
+    // processes bind the same port simultaneously, so the new worker would
+    // fail with EADDRINUSE.
+    const oldWorker = activeWorker;
+    if (oldWorker) {
+      const oldPid = oldWorker.pid;
+      const config = getConfig();
+      log(`Sequential restart: draining old worker (PID ${oldPid}) before spawning new`);
+      oldWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
+      await new Promise((resolve) => {
+        const timeout = setTimeout(() => {
+          log(`Old worker (PID ${oldPid}) didn't exit in ${config.drainTimeoutMs}ms — killing`);
+          try { oldWorker.kill('SIGKILL'); } catch { /* already gone */ }
+          resolve();
+        }, config.drainTimeoutMs);
+        oldWorker.on('exit', () => { clearTimeout(timeout); resolve(); });
+      });
+      activeWorker = null;
+    }
+    const fresh = await spawnWorker();
+    activeWorker = fresh;
+    return true;
+  }
+
+  // Parallel restart: old worker keeps serving while the new one comes up.
+  // SO_REUSEPORT lets the kernel load-balance accepts between them.
   if (activeWorker) {
     const oldWorker = activeWorker;
     const oldKeepalives = countKeepalivesFor(oldWorker);
@@ -149,6 +182,12 @@ async function spawnWorker() {
             : ` (configured ${config.port} was unavailable)`;
           log(`Active port: ${activePort}${fallbackNote}`);
         }
+      }
+      if (typeof workerMsg.reusePort === 'boolean') {
+        if (activeReusePort && !workerMsg.reusePort) {
+          log('SO_REUSEPORT unsupported on this OS — restart will be sequential (brief connection-refused window).');
+        }
+        activeReusePort = workerMsg.reusePort;
       }
       log(`Worker ready (PID ${workerMsg.pid}, ${workerMsg.routes} routes, ${workerMsg.extensions} extensions)`);
       readyResolve({ child, port: activePort });
