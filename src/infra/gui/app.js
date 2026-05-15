@@ -282,16 +282,94 @@ function renderExtensions() {
 }
 
 function renderSchemaForm(p, schema, value) {
-    if (schema.type !== 'object' || !schema.properties) return '';
-    return Object.entries(schema.properties).map(([key, prop]) => {
+    if (schema.type !== 'object') return '';
+
+    if (schema.properties) {
+        return Object.entries(schema.properties).map(([key, prop]) => renderProperty(`${p}.${key}`, key, prop, value?.[key])).join('');
+    }
+
+    if (schema.additionalProperties) {
+        return renderAdditionalProperties(p, schema.additionalProperties, value || {});
+    }
+
+    return '';
+}
+
+function renderProperty(path, key, prop, value) {
+    const label = escapeHtml(prop.title || key);
+    const help = prop.description ? `<small style="color: #64748b; font-size: 0.8rem;">${escapeHtml(prop.description)}</small>` : '';
+
+    if (prop.type === 'object' && (prop.properties || prop.additionalProperties)) {
         return `
             <div class="form-group">
-                <label>${escapeHtml(prop.title || key)}</label>
-                ${renderInput(`${p}.${key}`, prop, value?.[key])}
-                ${prop.description ? `<small style="color: #64748b; font-size: 0.8rem;">${escapeHtml(prop.description)}</small>` : ''}
+                <label>${label}</label>
+                ${help}
+                <div style="border-left: 2px solid var(--border); padding-left: 1rem; margin-top: 0.5rem;">
+                    ${renderSchemaForm(path, prop, value)}
+                </div>
             </div>
         `;
-    }).join('');
+    }
+
+    return `
+        <div class="form-group">
+            <label>${label}</label>
+            ${renderInput(path, prop, value)}
+            ${help}
+        </div>
+    `;
+}
+
+function renderAdditionalProperties(p, valueSchema, current) {
+    const rows = Object.entries(current).map(([key, entry]) => `
+        <div class="card" style="background: rgba(15, 23, 42, 0.4); margin: 0.5rem 0; padding: 0.75rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                <strong>${escapeHtml(key)}</strong>
+                <button class="secondary" onclick="deleteMapEntry('${escapeAttr(p)}', '${escapeAttr(key)}')">Remove</button>
+            </div>
+            ${renderSchemaForm(`${p}.${key}`, valueSchema, entry)}
+        </div>
+    `).join('');
+
+    const inputId = `new-map-key-${p.replace(/\./g, '-')}`;
+    return `
+        ${rows || '<p style="color: #64748b; font-size: 0.85rem; margin: 0.5rem 0;">No entries.</p>'}
+        <div style="display: flex; gap: 0.5rem; margin-top: 0.5rem;">
+            <input type="text" placeholder="new key" id="${inputId}" style="flex: 1;">
+            <button onclick="addMapEntry('${escapeAttr(p)}', '${escapeAttr(inputId)}')">+ Add</button>
+        </div>
+    `;
+}
+
+function addMapEntry(p, inputId) {
+    const key = $(inputId).value.trim();
+    if (!key) {
+        showToast('Key is required', 'error');
+        return;
+    }
+    const parts = p.split('.');
+    let current = state.config;
+    for (const part of parts) {
+        if (!current[part]) current[part] = {};
+        current = current[part];
+    }
+    if (current[key]) {
+        showToast(`Entry "${key}" already exists`, 'error');
+        return;
+    }
+    current[key] = {};
+    render();
+}
+
+function deleteMapEntry(p, key) {
+    const parts = p.split('.');
+    let current = state.config;
+    for (const part of parts) {
+        if (!current[part]) return;
+        current = current[part];
+    }
+    delete current[key];
+    render();
 }
 
 function renderInput(p, prop, value) {
@@ -302,6 +380,9 @@ function renderInput(p, prop, value) {
                 ${prop.enum.map(v => `<option value="${escapeAttr(v)}" ${v === current ? 'selected' : ''}>${escapeHtml(v)}</option>`).join('')}
             </select>
         `;
+    }
+    if (prop.type === 'boolean') {
+        return `<input type="checkbox" ${value === true ? 'checked' : ''} onchange="updateConfig('${p}', this.checked)" style="width: auto;">`;
     }
     if (prop.type === 'array') {
         const lines = Array.isArray(value) ? value.join('\n') : '';
@@ -346,13 +427,22 @@ function renderDaemonConfig() {
 async function renderStatus() {
     content.innerHTML = '<h2>Daemon Status</h2><p style="color: #94a3b8;">Loading...</p>';
     try {
-        const res = await fetch('/__ccb_internal__/status');
-        if (!res.ok) {
-            content.innerHTML = `<h2>Daemon Status</h2><p style="color: var(--error);">Status endpoint returned ${res.status}.</p>`;
+        const [statusRes, sessionRes, logsRes] = await Promise.all([
+            fetch('/__ccb_internal__/status'),
+            fetch('/__ccb_internal__/session'),
+            fetch('/api/logs?lines=80')
+        ]);
+        if (!statusRes.ok) {
+            content.innerHTML = `<h2>Daemon Status</h2><p style="color: var(--error);">Status endpoint returned ${statusRes.status}.</p>`;
             return;
         }
-        const status = await res.json();
+        const status = await statusRes.json();
+        const session = sessionRes.ok ? await sessionRes.json() : null;
+        const logs = logsRes.ok ? await logsRes.text() : '';
         const uptime = formatDuration(status.uptime_sec);
+
+        const historyRows = (session?.history ?? []).map(line => `<code style="display: block; font-size: 0.8rem; color: #94a3b8;">${escapeHtml(line)}</code>`).join('') || '<p style="color: #64748b; font-size: 0.85rem;">No requests recorded yet.</p>';
+
         content.innerHTML = `
             <h2>Daemon Status</h2>
             <div class="card">
@@ -363,10 +453,46 @@ async function renderStatus() {
                 <div class="list-item"><div>Keepalives</div><div class="tag">${escapeHtml(status.keepalives)}</div></div>
                 <div class="list-item"><div>Logs</div><div class="tag">${escapeHtml(status.log_path)}</div></div>
                 <div class="list-item"><div>Config</div><div class="tag">${escapeHtml(status.config_path)}</div></div>
+                <div style="display: flex; gap: 0.5rem; margin-top: 1rem;">
+                    <button onclick="restartDaemon()">Restart Daemon</button>
+                    <button class="secondary" onclick="renderStatus()">Refresh</button>
+                </div>
+            </div>
+            ${session ? `
+                <div class="card">
+                    <h3>Session totals</h3>
+                    <div class="list-item"><div>Total requests</div><div class="tag">${escapeHtml(session.total_requests)}</div></div>
+                    <div class="list-item"><div>Total input tokens</div><div class="tag">${escapeHtml(session.total_input_tokens)}</div></div>
+                    <div class="list-item"><div>Total output tokens</div><div class="tag">${escapeHtml(session.total_output_tokens)}</div></div>
+                    <div class="list-item"><div>Last Claude session ID</div><div class="tag">${escapeHtml(session.claude_session_id || '(none)')}</div></div>
+                </div>
+                <div class="card">
+                    <h3>Recent requests</h3>
+                    ${historyRows}
+                </div>
+            ` : ''}
+            <div class="card">
+                <h3>Log tail</h3>
+                <pre style="background: #0f172a; padding: 1rem; border-radius: 0.4rem; max-height: 300px; overflow: auto; font-size: 0.8rem; color: #cbd5e1; margin: 0;">${escapeHtml(logs) || '<em>(empty)</em>'}</pre>
             </div>
         `;
     } catch (e) {
         content.innerHTML = `<h2>Daemon Status</h2><p style="color: var(--error);">Failed to load status: ${escapeHtml(e.message)}</p>`;
+    }
+}
+
+async function restartDaemon() {
+    if (!confirm('Restart the proxy daemon? In-flight requests will drain on the old worker.')) return;
+    try {
+        const res = await fetch('/api/restart', { method: 'POST' });
+        if (!res.ok) {
+            showToast('Restart failed: ' + await res.text(), 'error');
+            return;
+        }
+        showToast('Restart requested. Reloading status in 2s...');
+        setTimeout(() => renderStatus(), 2000);
+    } catch (e) {
+        showToast('Restart error: ' + e.message, 'error');
     }
 }
 
@@ -477,6 +603,10 @@ window.deleteRoute = deleteRoute;
 window.addRouteEntry = addRouteEntry;
 window.deleteRouteEntry = deleteRouteEntry;
 window.updateConfig = updateConfig;
+window.addMapEntry = addMapEntry;
+window.deleteMapEntry = deleteMapEntry;
+window.restartDaemon = restartDaemon;
+window.renderStatus = renderStatus;
 
 document.querySelectorAll('#menu li').forEach(li => {
     li.onclick = () => {
