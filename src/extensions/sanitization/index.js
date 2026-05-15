@@ -18,6 +18,13 @@ import {
   getSystem, getMessages,
 } from '../../core/api-adapter.js';
 
+export const EXTENSION_META = {
+  activation: 'always',
+  title: 'Sanitization',
+  description: 'Adapts Anthropic-specific block types for cross-provider routing. Compliant providers keep signed thinking/redacted_thinking blocks; non-compliant providers get those converted to text plus cache_control stripped from generic and tool_result blocks.',
+  configuredBy: 'providers[*].anthropicCompliant',
+};
+
 export function createSanitizationExtension() {
   return {
     name: 'sanitization',

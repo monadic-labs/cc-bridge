@@ -14,6 +14,13 @@ import { providerIdToEnvKey } from '../../core/providers.js';
 import { MAX_FALLBACK_DEPTH } from '../../core/routing-rules.js';
 import { tryParseBody, routeToProvider, applyAuthHeaders } from '../../core/routing.js';
 
+export const EXTENSION_META = {
+  activation: 'route-driven',
+  title: 'Fallback',
+  description: 'Re-routes to the routing rule\'s declared fallback provider when an upstream returns 4xx/5xx or the TCP connection fails. Configured per route, not globally.',
+  configuredBy: 'routes.models[*].fallback / routes.defaults.fallback',
+};
+
 export function createFallbackExtension() {
   return {
     name: 'fallback',

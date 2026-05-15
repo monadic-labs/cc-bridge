@@ -2,6 +2,7 @@ const state = {
     config: null,
     daemonConfig: null,
     schema: null,
+    extensions: null,
     activeTab: 'providers',
     daemonConfigDraft: null,
     daemonConfigError: ''
@@ -26,14 +27,16 @@ function escapeAttr(value) {
 
 async function load() {
     try {
-        const [configRes, schemaRes, daemonRes] = await Promise.all([
+        const [configRes, schemaRes, daemonRes, extensionsRes] = await Promise.all([
             fetch('/api/config'),
             fetch('/api/schema'),
-            fetch('/api/daemon-config')
+            fetch('/api/daemon-config'),
+            fetch('/api/extensions')
         ]);
         state.config = await configRes.json();
         state.schema = await schemaRes.json();
         state.daemonConfig = await daemonRes.json();
+        state.extensions = await extensionsRes.json();
         state.daemonConfigDraft = JSON.stringify(state.daemonConfig, null, 2);
         state.daemonConfigError = '';
         render();
@@ -257,23 +260,42 @@ function deleteRoute(alias) { return deleteRouteEntry('models', alias); }
 // ── Extensions ──────────────────────────────────────────────────────────
 
 function renderExtensions() {
-    const extensions = state.config.extensions || {};
-    const schemas = state.schema?.extensions || {};
-    let html = '<h2>Extension Settings</h2>';
+    const extensionConfigs = state.config.extensions || {};
+    const installed = Array.isArray(state.extensions) ? state.extensions : [];
+    let html = '<h2>Extensions</h2>';
+    html += '<p style="color: #94a3b8; font-size: 0.9rem;">Every extension currently loaded by the daemon. Some are user-tunable (schema form below); others activate automatically based on provider or route configuration.</p>';
 
-    if (Object.keys(schemas).length === 0) {
+    if (installed.length === 0) {
         html += '<p style="color: #94a3b8;">No extensions registered.</p>';
         content.innerHTML = html;
         return;
     }
 
-    Object.entries(schemas).forEach(([id, schema]) => {
-        const cfg = extensions[id] || {};
+    installed.forEach((ext) => {
+        const cfg = extensionConfigs[ext.name] || {};
+        const activationLabel = ({
+            'always': 'Always on',
+            'route-driven': 'Activates per-route',
+            'provider-driven': 'Activates per-provider',
+        })[ext.activation] || ext.activation;
+
+        const configuredByLine = ext.configuredBy
+            ? `<p style="color: #64748b; font-size: 0.75rem;">Configured by: <code>${escapeHtml(ext.configuredBy)}</code></p>`
+            : '';
+
+        const formOrPlaceholder = ext.schema
+            ? renderSchemaForm(`extensions.${ext.name}`, ext.schema, cfg)
+            : '<p style="color: #64748b; font-size: 0.85rem; font-style: italic;">No user-tunable settings — this extension activates automatically based on the configuration above.</p>';
+
         html += `
-            <div class="card">
-                <h3>${escapeHtml(schema.title || id)}</h3>
-                <p style="color: #94a3b8; font-size: 0.9rem;">${escapeHtml(schema.description || '')}</p>
-                ${renderSchemaForm(`extensions.${id}`, schema, cfg)}
+            <div class="card" data-extension="${escapeAttr(ext.name)}">
+                <div style="display: flex; justify-content: space-between; align-items: baseline; gap: 1rem;">
+                    <h3 style="margin: 0;">${escapeHtml(ext.title || ext.name)}</h3>
+                    <span class="tag" style="white-space: nowrap;">${escapeHtml(activationLabel)}</span>
+                </div>
+                <p style="color: #94a3b8; font-size: 0.9rem;">${escapeHtml(ext.description || '')}</p>
+                ${configuredByLine}
+                ${formOrPlaceholder}
             </div>
         `;
     });

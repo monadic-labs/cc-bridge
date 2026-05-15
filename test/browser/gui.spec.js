@@ -164,17 +164,68 @@ test('Routes tab: add and remove a model route', async ({ page }) => {
   await expect(newRow).toHaveCount(0);
 });
 
-test('Extensions tab: openai-format schema renders editable', async ({ page }) => {
+test('Extensions tab: every built-in extension is listed with metadata', async ({ page }) => {
   await page.goto('/gui');
   await appReady(page);
   await page.locator('nav li[data-tab="extensions"]').click();
 
-  await expect(page.locator('main h2')).toHaveText('Extension Settings');
-  await expect(page.locator('main .card h3')).toContainText(['OpenAI Format']);
+  await expect(page.locator('main h2')).toHaveText('Extensions');
 
-  // The schema declares an additionalProperties map for providers — the GUI
-  // exposes a "new key" input + Add button for it.
-  await expect(page.locator('main input[id^="new-map-key-"]')).toHaveCount(1);
+  // All seven built-ins must show. Web-search-zai only activates if a
+  // provider opts in via toolTransforms.web_search; the fixture's zai
+  // provider does, so it will be registered.
+  const expectedNames = [
+    'Fallback',
+    'Load Balancer',
+    'Non-Compliant Transform',
+    'OpenAI Format',
+    'Sanitization',
+    'Thinking SSE Transform',
+    'Web Search (z.ai)',
+  ];
+  for (const title of expectedNames) {
+    await expect(
+      page.locator('main .card h3', { hasText: title })
+    ).toBeVisible();
+  }
+
+  // Cards are tagged by extension name for selector reuse.
+  const cards = page.locator('main .card[data-extension]');
+  await expect(cards).toHaveCount(expectedNames.length);
+});
+
+test('Extensions tab: configurable extensions expose their form, non-configurable show placeholder', async ({ page }) => {
+  await page.goto('/gui');
+  await appReady(page);
+  await page.locator('nav li[data-tab="extensions"]').click();
+
+  // openai-format has a schema with additionalProperties (provider map) →
+  // shows a "new-map-key-..." input.
+  const openaiCard = page.locator('main .card[data-extension="openai-format"]');
+  await expect(openaiCard.locator('input[id^="new-map-key-"]')).toHaveCount(1);
+
+  // load-balancer also has a schema → shows a new-map-key input for pools.
+  const lbCard = page.locator('main .card[data-extension="load-balancer"]');
+  await expect(lbCard.locator('input[id^="new-map-key-"]')).toHaveCount(1);
+
+  // sanitization has no schema → shows the placeholder, no form.
+  const sanCard = page.locator('main .card[data-extension="sanitization"]');
+  await expect(sanCard.getByText(/No user-tunable settings/)).toBeVisible();
+  await expect(sanCard.locator('input[id^="new-map-key-"]')).toHaveCount(0);
+
+  // fallback has no schema either.
+  const fbCard = page.locator('main .card[data-extension="fallback"]');
+  await expect(fbCard.getByText(/No user-tunable settings/)).toBeVisible();
+});
+
+test('Extensions tab: activation tag rendered for each card', async ({ page }) => {
+  await page.goto('/gui');
+  await appReady(page);
+  await page.locator('nav li[data-tab="extensions"]').click();
+
+  await expect(page.locator('main .card[data-extension="openai-format"] .tag')).toContainText('Always on');
+  await expect(page.locator('main .card[data-extension="fallback"] .tag')).toContainText('Activates per-route');
+  await expect(page.locator('main .card[data-extension="web-search-zai"] .tag')).toContainText('Activates per-provider');
 });
 
 test('Daemon Config tab: JSON editor renders current config and accepts save', async ({ page }) => {
@@ -394,13 +445,15 @@ test('Extensions tab: declare a provider as OpenAI-format via map editor', async
   await appReady(page);
   await page.locator('nav li[data-tab="extensions"]').click();
 
-  await page.locator('main input[id^="new-map-key-"]').fill('mirror');
-  await page.getByRole('button', { name: '+ Add' }).click();
+  // Scope to the openai-format card — multiple extensions now expose map
+  // editors so a global `getByRole(... '+ Add')` would be ambiguous.
+  const openaiCard = page.locator('main .card[data-extension="openai-format"]');
+  await openaiCard.locator('input[id^="new-map-key-"]').fill('mirror');
+  await openaiCard.getByRole('button', { name: '+ Add' }).click();
 
   // The new map entry renders inside the openai-format card as a nested card
-  // with a strong tag bearing the key — narrow by that to avoid matching the
-  // outer card that ALSO contains "mirror" via the new child.
-  await expect(page.locator('main strong', { hasText: 'mirror' })).toBeVisible();
+  // with a strong tag bearing the key.
+  await expect(openaiCard.locator('strong', { hasText: 'mirror' })).toBeVisible();
   await page.locator('#save-btn').click();
 
   const persisted = await pollDaemonReload(() => {

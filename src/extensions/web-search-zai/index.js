@@ -9,6 +9,9 @@
 export const EXTENSION_META = {
   activation: 'provider-driven',
   providerTrigger: 'toolTransforms.web_search',
+  title: 'Web Search (z.ai)',
+  description: 'Translates Claude\'s native web_search tool calls into z.ai\'s web_search format and sanitizes z.ai\'s search history back into Anthropic shape. Fires only on providers that set toolTransforms.web_search.',
+  configuredBy: 'providers[*].toolTransforms.web_search',
 };
 
 const WEB_SEARCH_TOOL_RE = /^web_search(_\d{8})?$/;

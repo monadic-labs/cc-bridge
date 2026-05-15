@@ -71,7 +71,16 @@ export function applyAuthHeaders({ headers, match, apiKey = '', openaiProviders 
       updated['authorization'] = `Bearer ${apiKey}`;
     }
     if (!isOpenai) {
+      // Anthropic-protocol providers: send BOTH x-api-key and Authorization
+      // Bearer. Anthropic's official API reads x-api-key; z.ai's
+      // /api/anthropic endpoint (and most Anthropic mirrors) route by
+      // Authorization Bearer. Sending both lets ccb proxy to either
+      // without per-provider auth-header config. The empirically-observed
+      // case was z.ai's middleware choking on non-ASCII (em-dashes) only
+      // on the x-api-key code path; Bearer goes through a UTF-8-safe
+      // handler. Anthropic's API ignores the extra Bearer.
       updated['x-api-key'] = apiKey;
+      updated['authorization'] = `Bearer ${apiKey}`;
     }
   }
 

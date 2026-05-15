@@ -381,6 +381,13 @@ export function createProxyCore({ configDir, port }) {
         return;
       }
 
+      if (req.method === 'GET' && req.url === '/api/extensions') {
+        const list = shellState.extensions.getAll();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(list));
+        return;
+      }
+
       if (req.method === 'POST' && req.url === '/api/config') {
         let body = '';
         req.on('data', chunk => body += chunk);

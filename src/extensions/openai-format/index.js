@@ -27,6 +27,9 @@ import { resolveOpenaiModel } from './model-resolver.js';
 
 export const EXTENSION_META = {
   activation: 'always',
+  title: 'OpenAI Format',
+  description: 'Translates Anthropic-shape requests to OpenAI chat-completions for providers configured with format=openai, and the responses back. Declare which providers need conversion in the Provider Mappings below.',
+  configuredBy: 'extensions.openai-format',
   schema: {
     type: 'object',
     title: 'OpenAI Format',

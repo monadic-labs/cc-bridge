@@ -234,7 +234,7 @@ async function runUnitTests() {
 
   const matchGlm = pmap.resolve('glm');
   const headersMatch = applyAuthHeaders({ headers: { authorization: 'Bearer token', 'anthropic-beta': 'b1' }, match: matchGlm, apiKey: 'key-p1' });
-  assert(headersMatch.authorization === undefined, 'match strips authorization');
+  assert(headersMatch.authorization === 'Bearer key-p1', 'Anthropic-protocol match swaps authorization to provider key Bearer');
   assert(headersMatch['x-api-key'] === 'key-p1', 'match injects x-api-key from apiKey');
   assert(headersMatch['anthropic-beta'] === undefined, 'non-compliant strips anthropic-beta');
 
@@ -1332,6 +1332,31 @@ async function runUnitTests() {
   });
   const { registry: regWithWs } = buildRegistry(discovered, [providerWithWs]);
   assert(regWithWs.size === 7, `7 extensions with web_search provider (got ${regWithWs.size})`);
+
+  // getAll() exposes the full extension list including those without
+  // tunable schemas — this is what the GUI Extensions tab consumes.
+  const allExtensions = regWithWs.getAll();
+  assert(allExtensions.length === 7, `getAll returns 7 extensions (got ${allExtensions.length})`);
+  const byName = Object.fromEntries(allExtensions.map(e => [e.name, e]));
+
+  for (const name of ['fallback', 'load-balancer', 'non-compliant-transform', 'openai-format', 'sanitization', 'thinking-sse', 'web-search-zai']) {
+    assert(byName[name], `getAll includes ${name}`);
+    assert(typeof byName[name].title === 'string' && byName[name].title.length > 0, `${name} has non-empty title`);
+    assert(typeof byName[name].description === 'string' && byName[name].description.length > 0, `${name} has non-empty description`);
+    assert(typeof byName[name].activation === 'string', `${name} has activation`);
+  }
+
+  // Schema attached for the two extensions that declare one
+  assert(byName['openai-format'].schema, 'openai-format has schema');
+  assert(byName['load-balancer'].schema, 'load-balancer has schema');
+  assert(byName['fallback'].schema === null, 'fallback has no schema');
+  assert(byName['sanitization'].schema === null, 'sanitization has no schema');
+
+  // Activation classifications
+  assert(byName['fallback'].activation === 'route-driven', 'fallback is route-driven');
+  assert(byName['web-search-zai'].activation === 'provider-driven', 'web-search-zai is provider-driven');
+  assert(byName['web-search-zai'].providerTrigger === 'toolTransforms.web_search', 'web-search-zai trigger recorded');
+  assert(byName['sanitization'].activation === 'always', 'sanitization is always-on');
 
   // ── Load Balancer Extension ──
   console.log('\nload-balancer:');

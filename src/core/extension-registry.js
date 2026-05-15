@@ -274,6 +274,28 @@ export class ExtensionRegistry {
   }
 
   /**
+   * Get a description of every registered extension, including those without
+   * a user-tunable schema. Used by /api/extensions to power the GUI's
+   * Extensions tab — the tab needs to list everything that's loaded so the
+   * user can see what's actually doing work, not just what they can edit.
+   */
+  getAll() {
+    const out = [];
+    for (const [name, ext] of this.#extensions.entries()) {
+      out.push({
+        name,
+        title: ext.title ?? name,
+        description: ext.description ?? '',
+        activation: ext.activation ?? 'always',
+        configuredBy: ext.configuredBy ?? null,
+        providerTrigger: ext.providerTrigger ?? null,
+        schema: ext.schema ?? null,
+      });
+    }
+    return out;
+  }
+
+  /**
    * Notify all onRequestStart handlers.
    */
   emitRequestStart(ctx) {
