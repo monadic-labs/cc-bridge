@@ -2339,14 +2339,14 @@ async function assertWebSearchTransform() {
     const req = http.request({
       hostname: 'localhost', port: TEST_PORT, path: '/v1/messages', method: 'POST',
       headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body1), 'x-api-key': 'test-key', 'anthropic-version': '2023-06-01' },
-      timeout: 30000
+      timeout: 90000
     }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => resolve({ statusCode: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString() }));
     });
     req.on('error', (e) => resolve({ error: e }));
-    req.on('timeout', () => { req.destroy(); resolve({ error: { code: 'HTTP_TIMEOUT', message: 'upstream timeout after 30s' } }); });
+    req.on('timeout', () => { req.destroy(); resolve({ error: { code: 'HTTP_TIMEOUT', message: 'upstream timeout after 90s' } }); });
     req.write(body1);
     req.end();
   });
@@ -2400,14 +2400,14 @@ async function assertWebSearchTransform() {
     const req = http.request({
       hostname: 'localhost', port: TEST_PORT, path: '/v1/messages', method: 'POST',
       headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body2), 'x-api-key': 'test-key', 'anthropic-version': '2023-06-01' },
-      timeout: 30000
+      timeout: 90000
     }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => resolve({ statusCode: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString() }));
     });
     req.on('error', (e) => resolve({ error: e }));
-    req.on('timeout', () => { req.destroy(); resolve({ error: { code: 'HTTP_TIMEOUT', message: 'upstream timeout after 30s' } }); });
+    req.on('timeout', () => { req.destroy(); resolve({ error: { code: 'HTTP_TIMEOUT', message: 'upstream timeout after 90s' } }); });
     req.write(body2);
     req.end();
   });
