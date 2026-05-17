@@ -95,7 +95,14 @@ function sanitizeContent(content, isCompliant) {
       if (converted) conversions.push(originalType);
       return block;
     });
-    return { content: mergeAdjacentTextBlocks(safeBlocks), conversions };
+    // Only merge when sanitization actually converted something — that's the
+    // only case where adjacent text blocks can appear as a side-effect of
+    // this pass. Otherwise pass blocks through verbatim and respect the
+    // caller's block structure (especially per-block cache_control markers).
+    const finalBlocks = conversions.length > 0
+      ? mergeAdjacentTextBlocks(safeBlocks)
+      : safeBlocks;
+    return { content: finalBlocks, conversions };
   }
   if (typeof content === 'object' && content !== null) {
     const { block, converted, originalType } = sanitizeBlock(content, isCompliant);
@@ -161,11 +168,47 @@ function extractToolResultText(block) {
   return JSON.stringify(block);
 }
 
+/**
+ * Merge adjacent text blocks ONLY when they are structurally equivalent:
+ * same `cache_control` (deep-equal, including undefined-vs-absent) and no
+ * other distinguishing fields. The purpose of this pass is to coalesce
+ * back-to-back text blocks produced when sanitization converts thinking →
+ * text — NOT to collapse a system array that the caller deliberately split
+ * with per-block cache_control markers.
+ *
+ * Bug history: a blind merge dropped cache_control from later blocks and
+ * concatenated everything into a single text block, which tripped a
+ * non-UTF-8-safe parser on z.ai's Anthropic adapter for any non-ASCII
+ * content. Direct claude→z.ai sends the unmerged 3-block system and works;
+ * the merge was the divergence.
+ */
+/**
+ * Structural equality on cache_control objects. Enumerates every key on
+ * both sides so a future Anthropic field (priority, region, etc.) cannot
+ * silently treat differing values as equal and trigger a wrong merge.
+ * Fail-closed: any key mismatch in either direction prevents the merge.
+ * Exported for direct unit testing — private to the merge logic otherwise.
+ */
+export function isSameCacheControl(a, b) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+  if (keysA.length !== keysB.length) return false;
+  return keysA.every((k) => a[k] === b[k]);
+}
+
 function mergeAdjacentTextBlocks(blocks) {
   const merged = [];
   for (const block of blocks) {
     const last = merged[merged.length - 1];
-    if (last && last.type === 'text' && block.type === 'text') {
+    const canMerge = last
+      && last.type === 'text'
+      && block.type === 'text'
+      && isSameCacheControl(last.cache_control, block.cache_control)
+      && Object.keys(last).every(k => k === 'type' || k === 'text' || k === 'cache_control')
+      && Object.keys(block).every(k => k === 'type' || k === 'text' || k === 'cache_control');
+    if (canMerge) {
       last.text = (last.text || '') + '\n' + (block.text || '');
       continue;
     }
