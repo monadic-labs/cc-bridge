@@ -6,11 +6,12 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { URL } from 'url';
-import { spawn } from 'child_process';
+import { CCB_DIR_NAME, ENV_FILENAME } from '../src/core/constants.js';
+import { spawnCommand } from '../src/infra/process-manager.js';
 
 const DEFAULT_PORT = 9098;
-const DEFAULT_CAPTURE_DIR = path.join(os.homedir(), '.claude', '.ccb', 'capture');
-const DEFAULT_ENV_FILE = path.join(os.homedir(), '.claude', '.ccb', '.env');
+const DEFAULT_CAPTURE_DIR = path.join(os.homedir(), '.claude', CCB_DIR_NAME, 'capture');
+const DEFAULT_ENV_FILE = path.join(os.homedir(), '.claude', CCB_DIR_NAME, ENV_FILENAME);
 const DEFAULT_AUTH_ENV = 'ZAI_KEY';
 const DEFAULT_MODEL = 'glm-5.1';
 const DEFAULT_SMALL_FAST_MODEL = 'glm-4.5-air';
@@ -195,7 +196,7 @@ function handleRequest(req, res, upstreamParsed, captureDir) {
     upstreamRes.on('error', (err) => {
       fs.writeFileSync(`${stem}.res.error.txt`, String(err.stack || err));
       resBodyOut.end();
-      try { res.end(); } catch (_e) { /* already destroyed */ }
+      try { res.end(); } catch { /* already destroyed */ }
     });
     process.stdout.write(`[${id}] ← ${upstreamRes.statusCode} ${upstreamRes.statusMessage || ''}\n`);
   });
@@ -307,10 +308,9 @@ function main() {
 
     const env = buildClaudeEnv(flags, baseUrl, authToken);
     process.stdout.write('\nlaunching: claude (with ANTHROPIC_* env injected)\n\n');
-    const child = spawn('claude', [], {
+    const child = spawnCommand('claude', [], {
       env,
       stdio: 'inherit',
-      shell: process.platform === 'win32',
     });
     child.on('exit', (code) => {
       process.stdout.write(`\nclaude exited with code ${code}; shutting down capture proxy.\n`);
