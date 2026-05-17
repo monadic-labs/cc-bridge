@@ -302,6 +302,96 @@ async function runUnitTests() {
   assert(reportMixed.convertedTypes.includes('thinking'), 'mixed: thinking in types');
   assert(reportMixed.convertedTypes.includes('redacted_thinking'), 'mixed: redacted_thinking in types');
 
+  // ── Sanitization: passthrough when no conversions; conservative merge when they happen ──
+  // Regression: prior behavior merged adjacent text blocks blindly on every
+  // request, collapsing Claude Code's deliberately-split system array and
+  // dropping cache_control markers. That tripped a non-UTF-8-safe parser on
+  // z.ai's Anthropic adapter for any non-ASCII content. New rule: don't
+  // merge unless sanitization actually converted something this pass, and
+  // even then only merge blocks with identical cache_control.
+  console.log('\nSanitization: system block passthrough + conditional merge:');
+  function sanitizeSystem(system, isCompliant) {
+    const body = { system };
+    const provider = { anthropicCompliant: isCompliant };
+    return sanitizeReg.transformRequest({ body, provider }).system;
+  }
+  // Claude Code's canonical 3-block split — no thinking blocks, so no conversions, so verbatim passthrough.
+  const claudeShape = [
+    { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.143' },
+    { type: 'text', text: "You are Claude Code, Anthropic's official CLI.", cache_control: { type: 'ephemeral' } },
+    { type: 'text', text: 'long body — with em-dashes — preserved.',         cache_control: { type: 'ephemeral' } },
+  ];
+  const passthrough = sanitizeSystem(claudeShape, true);
+  assert(passthrough.length === 3, 'no-conversion compliant passes all 3 blocks through unchanged');
+  assert(passthrough[0].text.startsWith('x-anthropic-billing-header'), 'block 0 preserved');
+  assert(passthrough[0].cache_control === undefined, 'block 0 cache_control absent');
+  assert(passthrough[1].cache_control && passthrough[1].cache_control.type === 'ephemeral', 'block 1 cache_control preserved');
+  assert(passthrough[2].cache_control && passthrough[2].cache_control.type === 'ephemeral', 'block 2 cache_control preserved');
+  assert(passthrough[2].text.includes('em-dashes'), 'block 2 non-ASCII content preserved verbatim');
+
+  // Non-compliant path: same 3-block shape, no thinking blocks → still no conversions → passthrough.
+  // (Strip-betas + flatten-system live in the separate non-compliant-transform extension, not sanitization.)
+  const ncPassthrough = sanitizeSystem(claudeShape, false);
+  assert(ncPassthrough.length === 3, 'non-compliant without conversions also passes through verbatim');
+
+  // When conversions DO happen (orphan thinking in messages), the result should
+  // be conservative merge: same cache_control siblings collapse, differing ones stay separate.
+  function sanitizeMessageBlocks(blocks, isCompliant) {
+    const body = { messages: [{ role: 'user', content: blocks }] };
+    const provider = { anthropicCompliant: isCompliant };
+    return sanitizeReg.transformRequest({ body, provider }).messages[0].content;
+  }
+  // Orphan thinking (no signature) compliant: converted → adjacent text+text → merge fires
+  const orphanThinking = [
+    { type: 'thinking', thinking: 'orphan reasoning' },
+    { type: 'text', text: 'actual response' },
+  ];
+  const convertedAndMerged = sanitizeMessageBlocks(orphanThinking, true);
+  assert(convertedAndMerged.length === 1, 'orphan thinking + adjacent text merges after conversion');
+  assert(convertedAndMerged[0].type === 'text', 'merged block is text');
+  assert(convertedAndMerged[0].text.includes('orphan reasoning'), 'thinking content preserved as text');
+  assert(convertedAndMerged[0].text.includes('actual response'), 'adjacent text concatenated');
+
+  // Conversion happens AND adjacent blocks have differing cache_control → must NOT lose the marker.
+  const mixedCache = [
+    { type: 'thinking', thinking: 'orphan' },
+    { type: 'text', text: 'cached response', cache_control: { type: 'ephemeral' } },
+  ];
+  const mergedMixed = sanitizeMessageBlocks(mixedCache, true);
+  assert(mergedMixed.length === 2, 'differing cache_control prevents merge even after conversion');
+  assert(mergedMixed[1].cache_control && mergedMixed[1].cache_control.type === 'ephemeral', 'cache_control preserved on second block');
+
+  // ── isSameCacheControl direct ZOMBIES (panel-caught fragility) ──
+  // Direct unit tests on the exported helper so coverage is unambiguous and
+  // a future Anthropic-API field addition can't silently degrade the merge guard.
+  const { isSameCacheControl } = await import('../src/extensions/sanitization/index.js');
+  // 0 — both undefined → same
+  assert(isSameCacheControl(undefined, undefined) === true, 'isSameCacheControl: undef === undef');
+  // 1 — undefined vs defined → not same
+  assert(isSameCacheControl(undefined, { type: 'ephemeral' }) === false, 'isSameCacheControl: undef ≠ defined');
+  // 2 — defined vs undefined (symmetry) → not same
+  assert(isSameCacheControl({ type: 'ephemeral' }, undefined) === false, 'isSameCacheControl: defined ≠ undef');
+  // 3 — reference equality short-circuit
+  const shared = { type: 'ephemeral' };
+  assert(isSameCacheControl(shared, shared) === true, 'isSameCacheControl: reference equality');
+  // 4 — same single field, same value → same
+  assert(isSameCacheControl({ type: 'ephemeral' }, { type: 'ephemeral' }) === true, 'isSameCacheControl: same single field');
+  // 5 — same fields, same values → same
+  assert(isSameCacheControl({ type: 'ephemeral', ttl: '1h' }, { type: 'ephemeral', ttl: '1h' }) === true, 'isSameCacheControl: same two fields');
+  // 6 — same shape, differing values → not same
+  assert(isSameCacheControl({ type: 'ephemeral', ttl: '5m' }, { type: 'ephemeral', ttl: '1h' }) === false, 'isSameCacheControl: same shape, differing ttl');
+  // 7 — extra unknown field on one side → not same (fail-closed, future-proof)
+  assert(isSameCacheControl({ type: 'ephemeral' }, { type: 'ephemeral', priority: 1 }) === false, 'isSameCacheControl: extra unknown field on one side');
+  // 8 — extra unknown field on other side (symmetry) → not same
+  assert(isSameCacheControl({ type: 'ephemeral', region: 'us' }, { type: 'ephemeral' }) === false, 'isSameCacheControl: extra unknown field on first side');
+  // 9 — different first field → not same
+  assert(isSameCacheControl({ type: 'ephemeral' }, { type: 'persistent' }) === false, 'isSameCacheControl: differing type');
+  // 10 — both empty objects → same (no keys to mismatch)
+  assert(isSameCacheControl({}, {}) === true, 'isSameCacheControl: empty objects are same');
+  // 11 — null on one side → not same (treated as "no cache_control")
+  assert(isSameCacheControl(null, { type: 'ephemeral' }) === false, 'isSameCacheControl: null ≠ defined');
+  assert(isSameCacheControl({ type: 'ephemeral' }, null) === false, 'isSameCacheControl: defined ≠ null');
+
   // ── extractSessionId ──
   console.log('\nextractSessionId:');
   assert(extractSessionId({ metadata: { user_id: '{"session_id":"sess-123"}' } }) === 'sess-123', 'extracts from user_id JSON');
@@ -1123,6 +1213,28 @@ async function runUnitTests() {
   });
   assert(pcWithTransforms.toolTransforms.web_search.count === '5', 'ProviderConfig parses toolTransforms');
   assert(pcWithTransforms.toolTransforms.web_search.search_engine === 'search-prime', 'ProviderConfig toolTransforms preserves params');
+
+  // ── Non-Compliant Transform extension ──
+  console.log('\nNon-Compliant Transform extension:');
+  const { createNonCompliantTransformExtension } = await import('../src/extensions/non-compliant-transform/index.js');
+  const adapterExt = createNonCompliantTransformExtension();
+  const arraySystem = [
+    { type: 'text', text: 'You are Claude Code — Anthropic\'s CLI.' },
+    { type: 'text', text: 'Functional core — imperative shell.', cache_control: { type: 'ephemeral' } }
+  ];
+  const reqWithArraySystem = { model: 'm', system: arraySystem, betas: ['extended-cache-ttl'], messages: [{ role: 'user', content: 'hi' }] };
+
+  // anthropicCompliant=true → pass through unchanged (no betas strip, no system flatten)
+  const compliantPassthrough = new ProvCfg({ id: 'p', url: 'https://x.com', models: {}, anthropicCompliant: true, toolTransforms: {} });
+  const r1 = adapterExt.hooks.requestTransform.transform({ body: reqWithArraySystem, provider: compliantPassthrough });
+  assert(r1 === reqWithArraySystem, 'compliant provider returns body unchanged (reference equality)');
+
+  // anthropicCompliant=false → strip betas AND flatten system to string
+  const nonCompliant = new ProvCfg({ id: 'p', url: 'https://x.com', models: {}, anthropicCompliant: false, toolTransforms: {} });
+  const r2 = adapterExt.hooks.requestTransform.transform({ body: reqWithArraySystem, provider: nonCompliant });
+  assert(typeof r2.system === 'string', 'non-compliant flattens system to string');
+  assert(r2.system.includes('Claude Code — Anthropic') && r2.system.includes('Functional core — imperative'), 'flattened text joined and em-dashes preserved');
+  assert(r2.betas === undefined, 'non-compliant strips betas');
 
   // ── Web Search z.ai Extension ──
   console.log('\nWeb Search z.ai Extension:');
@@ -2429,7 +2541,7 @@ function checkThinkingInLogs() {
   if (hasSanitized) details.push('sanitization fired');
   if (details.length === 0) details.push('no thinking evidence found');
 
-  return { hasThinking: hasThinkingBlock || hasRedacted, details: details.join(', '), logFile: latest };
+  return { hasThinking: hasThinkingBlock || hasRedacted, details: details.join(', '), logFile: sessionLogs[0].path };
 }
 /**
  * Send a real request with web_search tool through the proxy to z.ai.
