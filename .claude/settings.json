@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "deny": [
+      "Read(./node_modules/**)",
+      "Edit(./node_modules/**)",
+      "Write(./node_modules/**)",
+
+      "Read(./.git/**)",
+      "Edit(./.git/**)",
+      "Write(./.git/**)",
+      "Read(./.git-rewrite/**)",
+      "Edit(./.git-rewrite/**)",
+      "Write(./.git-rewrite/**)",
+
+      "Read(./.test-config/**)",
+      "Edit(./.test-config/**)",
+      "Write(./.test-config/**)",
+      "Read(./test-results/**)",
+      "Edit(./test-results/**)",
+      "Write(./test-results/**)",
+      "Read(./playwright-report/**)",
+      "Edit(./playwright-report/**)",
+      "Write(./playwright-report/**)",
+
+      "Read(./**/*.log)",
+      "Read(./**/*.err)",
+      "Read(./**/logs/**)",
+      "Edit(./**/logs/**)",
+      "Write(./**/logs/**)",
+
+      "Read(./CODE_MAP.json)",
+      "Edit(./CODE_MAP.json)",
+      "Write(./CODE_MAP.json)",
+      "Read(./.crush/**)",
+      "Edit(./.crush/**)",
+      "Write(./.crush/**)",
+
+      "Read(./.vscode/**)",
+      "Edit(./.vscode/**)",
+      "Write(./.vscode/**)",
+      "Read(./.idea/**)",
+      "Edit(./.idea/**)",
+      "Write(./.idea/**)",
+
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Edit(./.env)",
+      "Edit(./.env.*)",
+      "Write(./.env)",
+      "Write(./.env.*)",
+
+      "Read(./config.json)",
+      "Edit(./config.json)",
+      "Write(./config.json)",
+      "Read(./providers.json)",
+      "Edit(./providers.json)",
+      "Write(./providers.json)",
+
+      "Read(./**/.ccb/.env)",
+      "Edit(./**/.ccb/.env)",
+      "Write(./**/.ccb/.env)",
+      "Read(./**/.ccb/config.json)",
+      "Edit(./**/.ccb/config.json)",
+      "Write(./**/.ccb/config.json)",
+      "Read(./**/.ccb/providers.json)",
+      "Edit(./**/.ccb/providers.json)",
+      "Write(./**/.ccb/providers.json)",
+      "Read(./**/.ccb/runtime.json)",
+      "Read(./**/.ccb/*.sock)",
+
+      "Read(./**/.ccb/capture/**)",
+      "Edit(./**/.ccb/capture/**)",
+      "Write(./**/.ccb/capture/**)",
+      "Read(./**/.ccb/logs/**)",
+      "Edit(./**/.ccb/logs/**)",
+      "Write(./**/.ccb/logs/**)",
+
+      "Read(./coverage/**)",
+      "Read(./.nyc_output/**)",
+      "Read(./**/*.cpuprofile)",
+      "Read(./**/*.heapprofile)",
+
+      "Read(./.eo.json)",
+      "Edit(./.eo.json)",
+      "Write(./.eo.json)",
+
+      "Read(./package-lock.json)",
+
+      "Bash(cat:*.env)",
+      "Bash(cat:.ccb/.env*)",
+      "Bash(cat:**/.env)",
+      "Bash(grep:*.env)"
+    ]
+  }
+}

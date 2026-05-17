@@ -1,0 +1,66 @@
+# .claudeignore — files Claude Code should not read when working in this repo.
+# Format: gitignore syntax. Reading these wastes context window or leaks secrets.
+
+# ── Dependencies (93 MB on disk) ──
+node_modules/
+package-lock.json
+
+# ── VCS internals ──
+.git/
+.git-rewrite/
+
+# ── Runtime / test artifacts (regenerated each run) ──
+.test-config/
+test-results/
+playwright-report/
+**/.test-output/
+
+# ── Logs and error reports ──
+*.log
+*.err
+logs/
+**/logs/
+
+# ── Generated / cached ──
+CODE_MAP.json
+.crush/
+
+# ── Editor and OS junk ──
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ── Tarballs and packaged artifacts ──
+*.tgz
+*.tar.gz
+
+# ── Secret / per-host config (never commit, never read) ──
+.env
+.env.*
+!.env.example
+config.json
+providers.json
+**/.ccb/.env
+**/.ccb/config.json
+**/.ccb/providers.json
+**/.ccb/runtime.json
+**/.ccb/*.sock
+
+# ── Diagnostic captures (capture proxy output is per-session, often huge) ──
+**/.ccb/capture/
+**/.ccb/logs/
+
+# ── Coverage / profiling ──
+coverage/
+.nyc_output/
+*.cpuprofile
+*.heapprofile
+
+# ── Editor swap files ──
+*.swp
+*.swo
+*~
+
+# ── Misc large local-only artifacts ──
+.eo.json
