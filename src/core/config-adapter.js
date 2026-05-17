@@ -272,12 +272,29 @@ export function convertV1ToV2(v1Json) {
   const properties = {};
   const payloadSize = {};
 
-  // Convert models maps from providers into routes.models (exact matches)
+  // Convert models maps from providers into routes.models (exact matches).
+  // For each provider model, register both the bare alias ("glm-5.1") AND the
+  // dot-prefixed alias ("z.glm-5.1"). The dot-prefixed form lets users select
+  // a specific provider's model via /model when multiple providers share the
+  // same alias, without requiring an explicit routingPolicy rule.
+  //
+  // Prefixed form is unambiguous-by-construction (provider IDs cannot contain
+  // dots), so it OVERWRITES any earlier claim on the same key — otherwise a
+  // pathological provider with a literal alias `b.foo` could shadow provider
+  // `b`'s own prefixed form for any alias `foo`. The bare alias keeps
+  // first-provider-wins semantics for convenience syntax.
   for (const p of v1Providers) {
     if (!p.models || typeof p.models !== 'object') continue;
     for (const [alias, realModel] of Object.entries(p.models)) {
-      if (models[alias] !== undefined) continue; // first provider wins
-      models[alias] = `${p.id}.${realModel}`;
+      const target = `${p.id}.${realModel}`;
+      if (models[alias] === undefined) models[alias] = target;
+      // Skip generating a dot-prefixed form when the alias already begins with
+      // its own providerId (e.g. alias "z.glm-5.1" under provider "z") — that
+      // would yield "z.z.glm-5.1", which is never a useful selector.
+      const alreadyPrefixed = alias.startsWith(`${p.id}.`);
+      if (!alreadyPrefixed) {
+        models[`${p.id}.${alias}`] = target;
+      }
     }
   }
 
