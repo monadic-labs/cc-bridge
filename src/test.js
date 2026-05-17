@@ -14,6 +14,21 @@ import {
 } from '../src/core/constants.js';
 import { ArgumentError } from '../src/core/exceptions.js';
 
+// Enforce: tests must be invoked via `npm test` (or `npm run test`) — never
+// directly with `node src/test.js`. `npm test` runs lint first and is the
+// only sanctioned entry point for this project. Direct invocation bypasses
+// lint, which has caused regressions to slip into the test record.
+// npm sets `npm_lifecycle_event` to the script name when running a script;
+// it is unset when this file is executed standalone.
+if (process.env.npm_lifecycle_event !== 'test') {
+  console.error(
+    `Refusing to run: tests must be invoked via 'npm test' (or 'npm run test').\n` +
+    `Detected npm_lifecycle_event='${process.env.npm_lifecycle_event ?? ''}'.\n` +
+    `Direct invocation (e.g. 'node src/test.js') is blocked because it skips lint.`
+  );
+  process.exit(2);
+}
+
 const PKG_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
 // ── Unit tests for pure functions ──
@@ -47,6 +62,23 @@ function assertThrows(fn, ErrorClass, label) {
 
 async function runUnitTests() {
   console.log('\n── Unit Tests ──');
+
+  // ── npm-only test runner guard (must fail when invoked outside `npm test`) ──
+  console.log('\nNpm-only test runner guard:');
+  {
+    const { runSync } = await import('../src/infra/process-manager.js');
+    const testScript = path.join(PKG_ROOT, 'src/test.js');
+    const env = { ...process.env };
+    // Strip every npm-set indicator so the child sees a non-npm environment.
+    for (const k of Object.keys(env)) { if (k.startsWith('npm_')) delete env[k]; }
+    const result = runSync('node', [testScript], { env, encoding: 'utf8', timeout: 10_000 });
+    assert(result.status === 2, 'direct node invocation exits with status 2');
+    assert((result.stderr || '').includes('Refusing to run'), 'stderr explains refusal');
+    assert((result.stderr || '').includes("npm test"), 'stderr suggests npm test as the entry point');
+    // And: invocation under a different npm script also refuses
+    const result2 = runSync('node', [testScript], { env: { ...env, npm_lifecycle_event: 'proxy' }, encoding: 'utf8', timeout: 10_000 });
+    assert(result2.status === 2, 'invocation under npm_lifecycle_event=proxy also refuses');
+  }
 
   const { applyRouting, applyAuthHeaders, extractSessionId } = await import('../src/core/routing.js');
   const { Result, Option, RequestInfo, RequestSummary, RoutingResult } = await import('../src/core/types.js');
