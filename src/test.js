@@ -650,6 +650,45 @@ async function runUnitTests() {
   assert(v2.routes.models['*haiku*'] !== undefined, 'convertV1ToV2 wildcard route');
   assert(v2.routes.properties['thinking'] === 'z.glm-5.1', 'convertV1ToV2 property route');
 
+  // ── Dot-prefixed provider.alias auto-routes (each provider model is reachable via "<id>.<alias>") ──
+  assert(v2.routes.models['z.glm-4.7'] === 'z.glm-4.7', 'convertV1ToV2 prefixed alias auto-route');
+  // multi-provider collision: bare alias goes to first provider, prefixed forms disambiguate per provider
+  const v1Multi = {
+    providers: [
+      { id: 'z', url: 'https://api.z.ai/api/anthropic', models: { 'sonnet': 'glm-4.7' }, anthropicCompliant: true },
+      { id: 'anthropic', url: 'https://api.anthropic.com', models: { 'sonnet': 'claude-sonnet-4-5' }, anthropicCompliant: true }
+    ]
+  };
+  const v2Multi = convertV1ToV2(v1Multi);
+  assert(v2Multi.routes.models['sonnet'] === 'z.glm-4.7', 'bare alias resolves to first provider');
+  assert(v2Multi.routes.models['z.sonnet'] === 'z.glm-4.7', 'z.<alias> reaches z provider');
+  assert(v2Multi.routes.models['anthropic.sonnet'] === 'anthropic.claude-sonnet-4-5', 'anthropic.<alias> reaches anthropic provider');
+  // edge: alias already contains its own provider prefix → no double-prefix
+  const v1Self = {
+    providers: [
+      { id: 'z', url: 'https://api.z.ai/api/anthropic', models: { 'z.glm-5.1': 'glm-5.1' }, anthropicCompliant: true }
+    ]
+  };
+  const v2Self = convertV1ToV2(v1Self);
+  assert(v2Self.routes.models['z.glm-5.1'] === 'z.glm-5.1', 'self-prefixed alias preserved');
+  assert(v2Self.routes.models['z.z.glm-5.1'] === undefined, 'no double-prefix when alias matches providerId.X');
+
+  // Cross-provider literal-prefix-alias collision (panel-caught regression):
+  // Provider A defines a bare alias 'b.foo' (literally looks like B's prefix);
+  // Provider B defines plain alias 'foo'. Without the fix, A claims 'b.foo'
+  // first and B's prefixed form silently loses → /model b.foo resolves to A.
+  // Fix: prefixed form is unambiguous-by-construction and must overwrite.
+  const v1Collision = {
+    providers: [
+      { id: 'a', url: 'https://a.example/v1', models: { 'b.foo': 'realA' }, anthropicCompliant: true },
+      { id: 'b', url: 'https://b.example/v1', models: { 'foo': 'realB' }, anthropicCompliant: true }
+    ]
+  };
+  const v2Col = convertV1ToV2(v1Collision);
+  assert(v2Col.routes.models['b.foo'] === 'b.realB', "prefixed form 'b.foo' resolves to provider B, not A's literal-prefix alias");
+  assert(v2Col.routes.models['foo'] === 'b.realB', "bare 'foo' still resolves to B (first-provider-wins for unique bare aliases)");
+  assert(v2Col.routes.models['a.b.foo'] === 'a.realA', "A's prefixed form for its literal alias 'b.foo' is reachable via 'a.b.foo'");
+
   // ── Model manager ──
   console.log('\nModel manager:');
   const { addRouteModel, removeRouteModel, listModels, listProviders, formatTree, findProviderKey, addProvider, removeProvider } = await import('../src/core/model-manager.js');
