@@ -11,3 +11,5 @@ providers.json
 test-results/
 playwright-report/
 **.**/
+!.claude/
+.claude/settings.local.json
