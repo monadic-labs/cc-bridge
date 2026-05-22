@@ -928,6 +928,37 @@ async function runUnitTests() {
   assert(typeof emptyProviders.providers === 'object', 'providers object initialized');
   assert(typeof emptyProviders.providers === 'object', 'empty input produces providers object');
 
+  // C2 — every per-provider entry is fleshed out so the ProviderConfig loader
+  // doesn't reject the migrator's own output. The DEFAULT_RAW_PROVIDERS template
+  // and ensureCompleteProviders both fill models + toolTransforms.
+  const { DEFAULT_RAW_PROVIDERS } = await import('../src/core/migrator.js');
+  for (const id of Object.keys(DEFAULT_RAW_PROVIDERS.providers)) {
+    const entry = DEFAULT_RAW_PROVIDERS.providers[id];
+    assert(typeof entry.models === 'object' && entry.models !== null, `DEFAULT_RAW_PROVIDERS["${id}"].models is an object`);
+    assert(typeof entry.toolTransforms === 'object' && entry.toolTransforms !== null, `DEFAULT_RAW_PROVIDERS["${id}"].toolTransforms is an object`);
+    assert(typeof entry.anthropicCompliant === 'boolean', `DEFAULT_RAW_PROVIDERS["${id}"].anthropicCompliant is bool`);
+  }
+  // Sparse user input (just url + anthropicCompliant) gets fleshed out per-provider
+  const sparseInput = { providers: { custom: { url: 'https://x', anthropicCompliant: false } } };
+  const fleshedOut = ensureCompleteProviders(sparseInput);
+  assert(typeof fleshedOut.providers.custom.models === 'object' && fleshedOut.providers.custom.models !== null, 'sparse provider gets models={}');
+  assert(typeof fleshedOut.providers.custom.toolTransforms === 'object' && fleshedOut.providers.custom.toolTransforms !== null, 'sparse provider gets toolTransforms={}');
+  // Existing fields preserved
+  const withModels = { providers: { p: { url: 'https://x', anthropicCompliant: true, models: { foo: 'bar' }, toolTransforms: { a: { b: 'c' } } } } };
+  const preserved = ensureCompleteProviders(withModels);
+  assert(preserved.providers.p.models.foo === 'bar', 'existing models preserved');
+  assert(preserved.providers.p.toolTransforms.a.b === 'c', 'existing toolTransforms preserved');
+  // Output round-trips through the strict ProviderConfig validator (audit item 11)
+  const { ProviderConfig: ValidatePC } = await import('../src/core/providers.js');
+  for (const id of Object.keys(fleshedOut.providers)) {
+    new ValidatePC({ id, ...fleshedOut.providers[id] }); // throws if shape is bad
+  }
+  // Same round-trip for the bare default
+  const defaultRoundtrip = ensureCompleteProviders({});
+  for (const id of Object.keys(defaultRoundtrip.providers)) {
+    new ValidatePC({ id, ...defaultRoundtrip.providers[id] }); // throws if shape is bad
+  }
+
   // ── Config adapter ──
   console.log('\nConfig adapter:');
   const { detectFormat, parseTarget, parseRouteKey, parsePayloadSizeKey, normalizeRouteValue, convertV2ToInternal, convertV1ToV2 } = await import('../src/core/config-adapter.js');
