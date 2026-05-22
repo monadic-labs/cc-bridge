@@ -11,6 +11,8 @@ const CCB_VERSION = process.env.CCB_VERSION || DEFAULT_VERSION;
 import { getControlIpcPath } from '../src/core/daemon-constants.js';
 import { parseIpcMessage, serializeIpcMessage, validateWorkerMessage, validateCommandMessage } from '../src/core/ipc-protocol.js';
 import { loadConfigFromFile } from '../src/core/config.js';
+import { CONFIG_FILENAME } from '../src/core/constants.js';
+import { ConfigCache } from '../src/core/config-cache.js';
 import { spawnDaemon } from '../src/infra/process-manager.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -52,8 +54,25 @@ function log(msg) {
   process.stdout.write(`[watchdog] ${msg}\n`);
 }
 
+// Eager-loaded snapshot — bad config at watchdog startup is fatal (manifesto
+// fail-loud). fs.watch invalidates via tryRefresh on file change; a failed
+// refresh keeps the previous good snapshot so a runtime edit can't kill
+// the watchdog. Eliminates the 9 redundant FS reads across spawn/restart
+// /keepalive/drain handlers.
+const _configCache = new ConfigCache(() => loadConfigFromFile(_configDir));
+try {
+  fs.watch(path.join(_configDir, CONFIG_FILENAME), () => {
+    const refresh = _configCache.tryRefresh();
+    if (!refresh.isSuccess) {
+      log(`config hot-reload failed: ${refresh.error.message}`);
+    }
+  });
+} catch (e) {
+  log(`config watcher setup failed: ${e.message}`);
+}
+
 function getConfig() {
-  return loadConfigFromFile(_configDir);
+  return _configCache.get();
 }
 
 function writeRuntimeFile(port) {
