@@ -54,11 +54,18 @@ export const DEFAULT_RAW_CONFIG = {
   }
 };
 
+// Every per-provider entry MUST carry `models` and `toolTransforms` so the
+// strict ProviderConfig validator (src/core/providers.js) doesn't reject
+// the migrator's own seed shape. ensureCompleteProviders also fills these
+// per provider so user-written providers.json files with sparse entries
+// load without error.
 export const DEFAULT_RAW_PROVIDERS = {
   providers: {
     "custom-gateway": {
       url: "https://api.example-gateway.internal/v1",
-      anthropicCompliant: false
+      anthropicCompliant: false,
+      models: {},
+      toolTransforms: {}
     }
   },
   routes: {
@@ -113,6 +120,16 @@ export function ensureCompleteProviders(existingRaw) {
   // v2 format: merge defaults into providers object
   if (!merged.providers || typeof merged.providers !== 'object' || Array.isArray(merged.providers)) {
     merged.providers = JSON.parse(JSON.stringify(DEFAULT_RAW_PROVIDERS.providers));
+  }
+
+  // Per-provider: fill mandatory fields the ProviderConfig validator demands.
+  // Users frequently write a sparse entry (just url + anthropicCompliant);
+  // without these defaults the loader would reject their config at startup.
+  for (const id of Object.keys(merged.providers)) {
+    const entry = merged.providers[id];
+    if (!entry || typeof entry !== 'object') continue;
+    if (!entry.models || typeof entry.models !== 'object') entry.models = {};
+    if (!entry.toolTransforms || typeof entry.toolTransforms !== 'object') entry.toolTransforms = {};
   }
 
   // Ensure routes section exists with all sub-sections

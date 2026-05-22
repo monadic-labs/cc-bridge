@@ -369,7 +369,7 @@ export function createProxyCore({ configDir, port }) {
     return registry;
   }
 
-  async function loadAndApplyProviders(data) {
+  async function loadAndApplyProviders(data, { throwOnFailure = false } = {}) {
     if (reloadInProgress) return;
     reloadInProgress = true;
     try {
@@ -377,6 +377,7 @@ export function createProxyCore({ configDir, port }) {
       if (!parsed.isSuccess) {
         process.stderr.write(`[providers] Parse failed: ${parsed.error.message}\n`);
         errorReporter.write(parsed.error, { operation: 'parsing providers.json' });
+        if (throwOnFailure) throw parsed.error;
         return;
       }
 
@@ -386,6 +387,7 @@ export function createProxyCore({ configDir, port }) {
       process.stdout.write(`[providers] Loaded: ${shellState.providers.size} rule(s), ${shellState.providers.allTargetModels.length} model(s), ${shellState.extensions.size} extension(s)\n`);
     } catch (e) {
       errorReporter.write(e, { operation: 'loading providers and extensions' });
+      if (throwOnFailure) throw e;
     } finally {
       reloadInProgress = false;
     }
@@ -402,9 +404,11 @@ export function createProxyCore({ configDir, port }) {
   }
 
   function initProviders() {
-    if (!fs.existsSync(providersPath)) return Promise.resolve();
+    if (!fs.existsSync(providersPath)) {
+      throw new ConfigError(`providers.json missing at ${providersPath}. Run 'ccb --x-init' to seed it.`, { context: { providersPath } });
+    }
     const data = fs.readFileSync(providersPath, 'utf8');
-    const loadPromise = loadAndApplyProviders(data);
+    const loadPromise = loadAndApplyProviders(data, { throwOnFailure: true });
 
     try {
       fs.watch(providersPath, () => { reloadProviders().catch((e) => errorReporter.write(e, { operation: 'providers reload callback' })); });
