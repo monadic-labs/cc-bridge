@@ -180,6 +180,189 @@ async function runUnitTests() {
   const { ResultAccessError, ArgumentError, ConfigError } = await import('../src/core/exceptions.js');
   const { parseSseMetadata } = await import('../src/core/sse-parser.js');
   const { ProxyConfig } = await import('../src/core/config.js');
+  const { resolveGuiPath } = await import('../src/core/gui-path.js');
+  const { redactProviderApiKeys, hasLiteralApiKey } = await import('../src/core/api-secrets.js');
+  const {
+    AuthSecret,
+    isLoopbackAddress,
+    isAuthorizedRequest,
+    buildSetCookieHeader,
+    parseAuthCookie
+  } = await import('../src/core/auth-gate.js');
+  const { AuthError } = await import('../src/core/exceptions.js');
+
+  // ── AuthSecret (Value Object) ──
+  console.log('\nAuthSecret:');
+  const sec = new AuthSecret('abcdef0123456789abcdef0123456789');
+  assert(sec.value === 'abcdef0123456789abcdef0123456789', 'AuthSecret exposes value');
+  assert(sec.equals(new AuthSecret('abcdef0123456789abcdef0123456789')) === true, 'equals same');
+  assert(sec.equals(new AuthSecret('other-secret-with-enough-length-here')) === false, 'equals diff');
+  assertThrows(() => new AuthSecret(''), ArgumentError, 'empty secret rejected');
+  assertThrows(() => new AuthSecret(null), ArgumentError, 'null secret rejected');
+  assertThrows(() => new AuthSecret(123), ArgumentError, 'non-string secret rejected');
+  assertThrows(() => new AuthSecret('short'), ArgumentError, 'too-short secret rejected (<16 chars)');
+
+  // ── isLoopbackAddress (ZOMBIES on every address shape) ──
+  console.log('\nisLoopbackAddress:');
+  // Happy — IPv4 loopback
+  assert(isLoopbackAddress('127.0.0.1') === true, '127.0.0.1 loopback');
+  assert(isLoopbackAddress('127.0.0.2') === true, '127.0.0.2 loopback (whole /8 is loopback)');
+  assert(isLoopbackAddress('127.255.255.254') === true, '127/8 upper-edge loopback');
+  // Happy — IPv6 loopback
+  assert(isLoopbackAddress('::1') === true, '::1 loopback');
+  assert(isLoopbackAddress('0:0:0:0:0:0:0:1') === true, 'expanded ::1 loopback');
+  // Happy — IPv4-mapped IPv6 (common in Node when binding both stacks)
+  assert(isLoopbackAddress('::ffff:127.0.0.1') === true, 'mapped IPv4 loopback');
+  assert(isLoopbackAddress('::ffff:7f00:1') === true, 'mapped IPv4 hex loopback');
+  // Exception — non-loopback IPv4
+  assert(isLoopbackAddress('192.168.1.1') === false, 'LAN IPv4 not loopback');
+  assert(isLoopbackAddress('10.0.0.1') === false, 'private IPv4 not loopback');
+  assert(isLoopbackAddress('0.0.0.0') === false, '0.0.0.0 not loopback');
+  assert(isLoopbackAddress('128.0.0.1') === false, '128.0.0.1 not loopback (off-by-one /8)');
+  assert(isLoopbackAddress('126.255.255.255') === false, '126/8 not loopback (off-by-one)');
+  // Exception — non-loopback IPv6
+  assert(isLoopbackAddress('fe80::1') === false, 'link-local IPv6 not loopback');
+  assert(isLoopbackAddress('2001:db8::1') === false, 'global IPv6 not loopback');
+  assert(isLoopbackAddress('::') === false, '::all-zeros not loopback');
+  // Exception — degenerate inputs
+  assert(isLoopbackAddress('') === false, 'empty string not loopback');
+  assert(isLoopbackAddress(null) === false, 'null not loopback');
+  assert(isLoopbackAddress(undefined) === false, 'undefined not loopback');
+  assert(isLoopbackAddress('not-an-ip') === false, 'gibberish not loopback');
+  assert(isLoopbackAddress('127.0.0.1.5') === false, 'malformed IPv4 not loopback');
+
+  // ── parseAuthCookie ──
+  console.log('\nparseAuthCookie:');
+  assert(parseAuthCookie('ccb-auth=tokenvalue') === 'tokenvalue', 'single cookie');
+  assert(parseAuthCookie('other=x; ccb-auth=tokenvalue; foo=bar') === 'tokenvalue', 'cookie among many');
+  assert(parseAuthCookie('ccb-auth=tokenvalue; other=x') === 'tokenvalue', 'cookie first');
+  assert(parseAuthCookie('other=x') === null, 'no auth cookie');
+  assert(parseAuthCookie('') === null, 'empty cookie header');
+  assert(parseAuthCookie(undefined) === null, 'undefined cookie header');
+  assert(parseAuthCookie(null) === null, 'null cookie header');
+  // Edge: cookies with spaces around '='
+  assert(parseAuthCookie('ccb-auth =tokenvalue') === null, 'whitespace before = rejected');
+  assert(parseAuthCookie('ccb-auth=token=with=equals') === 'token=with=equals', 'value with = preserved');
+
+  // ── isAuthorizedRequest (pure; takes a request-shaped object) ──
+  console.log('\nisAuthorizedRequest:');
+  const validSec = new AuthSecret('abcdef0123456789abcdef0123456789');
+  const fakeReq = (headers) => ({ headers });
+  // Happy — Authorization Bearer header
+  const ag1 = isAuthorizedRequest(fakeReq({ authorization: 'Bearer abcdef0123456789abcdef0123456789' }), validSec);
+  assert(ag1.isSuccess === true, 'Bearer auth accepted');
+  // Happy — capital-case Authorization (Node lowercases by default, but test both)
+  const ag1b = isAuthorizedRequest(fakeReq({ Authorization: 'Bearer abcdef0123456789abcdef0123456789' }), validSec);
+  assert(ag1b.isSuccess === true, 'capital Authorization also accepted');
+  // Happy — Cookie header
+  const ag2 = isAuthorizedRequest(fakeReq({ cookie: 'ccb-auth=abcdef0123456789abcdef0123456789' }), validSec);
+  assert(ag2.isSuccess === true, 'Cookie auth accepted');
+  // Exception — wrong secret
+  const ag3 = isAuthorizedRequest(fakeReq({ authorization: 'Bearer wrong-secret-value-here' }), validSec);
+  assert(ag3.isSuccess === false, 'wrong Bearer rejected');
+  assert(ag3.error instanceof AuthError, 'wrong secret → AuthError');
+  assert(ag3.error.reason === 'wrong_secret', 'wrong_secret reason code');
+  // Exception — missing entirely
+  const ag4 = isAuthorizedRequest(fakeReq({}), validSec);
+  assert(ag4.isSuccess === false, 'no auth headers → rejected');
+  assert(ag4.error.reason === 'missing_credentials', 'missing reason code');
+  // Exception — Bearer with wrong scheme
+  const ag5 = isAuthorizedRequest(fakeReq({ authorization: 'Basic abcdef0123456789abcdef0123456789' }), validSec);
+  assert(ag5.isSuccess === false, 'Basic scheme rejected');
+  assert(ag5.error.reason === 'unsupported_scheme', 'unsupported_scheme reason code');
+  // Exception — empty Bearer
+  const ag6 = isAuthorizedRequest(fakeReq({ authorization: 'Bearer ' }), validSec);
+  assert(ag6.isSuccess === false, 'empty Bearer rejected');
+  // Exception — both headers, both wrong → rejected
+  const ag7 = isAuthorizedRequest(fakeReq({ authorization: 'Bearer wrong', cookie: 'ccb-auth=alsowrong' }), validSec);
+  assert(ag7.isSuccess === false, 'both wrong rejected');
+  // Happy — both headers, cookie matches (Bearer takes precedence but fallback works)
+  const ag8 = isAuthorizedRequest(fakeReq({ authorization: 'Bearer wrong-secret-value-here', cookie: 'ccb-auth=abcdef0123456789abcdef0123456789' }), validSec);
+  assert(ag8.isSuccess === true, 'cookie fallback when Bearer wrong');
+  // Exception — invalid args
+  assertThrows(() => isAuthorizedRequest(null, validSec), ArgumentError, 'null req throws');
+  assertThrows(() => isAuthorizedRequest(fakeReq({}), null), ArgumentError, 'null secret throws');
+  assertThrows(() => isAuthorizedRequest(fakeReq({}), 'raw-string'), ArgumentError, 'non-AuthSecret throws');
+
+  // ── buildSetCookieHeader ──
+  console.log('\nbuildSetCookieHeader:');
+  const setCookie = buildSetCookieHeader(validSec);
+  assert(setCookie.includes('ccb-auth=abcdef0123456789abcdef0123456789'), 'Set-Cookie carries secret');
+  assert(setCookie.includes('HttpOnly'), 'Set-Cookie HttpOnly');
+  assert(setCookie.includes('SameSite=Strict'), 'Set-Cookie SameSite=Strict');
+  assert(setCookie.includes('Path=/'), 'Set-Cookie Path=/');
+  // Edge: ensure no Domain set (default to origin-only)
+  assert(!setCookie.includes('Domain='), 'Set-Cookie no Domain (origin-only)');
+  // Exception — invalid arg
+  assertThrows(() => buildSetCookieHeader('raw-string'), ArgumentError, 'non-AuthSecret throws');
+
+  // ── redactProviderApiKeys (security: never echo a literal apiKey on GET /api/config) ──
+  console.log('\nredactProviderApiKeys:');
+  // 0 — empty providers map → unchanged
+  const empty = { providers: {}, routes: {} };
+  const redactedEmpty = redactProviderApiKeys(empty);
+  assert(JSON.stringify(redactedEmpty) === JSON.stringify(empty), 'empty providers unchanged');
+  // 1 — provider with literal apiKey → field stripped
+  const oneLiteral = { providers: { zai: { url: 'https://zai.com', apiKey: 'sk-secret', anthropicCompliant: false, models: {}, toolTransforms: {} } }, routes: {} };
+  const redactedOne = redactProviderApiKeys(oneLiteral);
+  assert(!('apiKey' in redactedOne.providers.zai), 'literal apiKey stripped from response');
+  assert(redactedOne.providers.zai.url === 'https://zai.com', 'url preserved');
+  assert(redactedOne.providers.zai.anthropicCompliant === false, 'anthropicCompliant preserved');
+  // Input not mutated (immutability)
+  assert(oneLiteral.providers.zai.apiKey === 'sk-secret', 'input not mutated');
+  // 1 — provider with ENV: reference is also stripped (the reference itself is metadata; GUI rebuilds it)
+  const oneEnvRef = { providers: { zai: { url: 'https://zai.com', apiKey: 'ENV:ZAI_KEY', anthropicCompliant: false, models: {}, toolTransforms: {} } }, routes: {} };
+  const redactedEnv = redactProviderApiKeys(oneEnvRef);
+  assert(!('apiKey' in redactedEnv.providers.zai), 'ENV: reference also stripped');
+  // 1 — provider without apiKey → unchanged
+  const noKey = { providers: { zai: { url: 'https://zai.com', anthropicCompliant: false, models: {}, toolTransforms: {} } }, routes: {} };
+  const redactedNoKey = redactProviderApiKeys(noKey);
+  assert(JSON.stringify(redactedNoKey) === JSON.stringify(noKey), 'no apiKey → no change');
+  // N — every provider redacted, order preserved
+  const many = { providers: { a: { apiKey: 'k1', url: 'u1' }, b: { apiKey: 'k2', url: 'u2' }, c: { url: 'u3' } }, routes: {} };
+  const redactedMany = redactProviderApiKeys(many);
+  assert(!('apiKey' in redactedMany.providers.a), 'a stripped');
+  assert(!('apiKey' in redactedMany.providers.b), 'b stripped');
+  assert(redactedMany.providers.c.url === 'u3', 'c preserved');
+  // Exception — non-object input
+  assertThrows(() => redactProviderApiKeys(null), ArgumentError, 'null input throws');
+  assertThrows(() => redactProviderApiKeys('not-an-object'), ArgumentError, 'string input throws');
+  assertThrows(() => redactProviderApiKeys({}), ArgumentError, 'missing providers throws');
+
+  // ── hasLiteralApiKey (security: POST /api/config must refuse literal keys) ──
+  console.log('\nhasLiteralApiKey:');
+  assert(hasLiteralApiKey({ providers: { z: { apiKey: 'sk-secret' } }, routes: {} }) === true, 'literal key detected');
+  assert(hasLiteralApiKey({ providers: { z: { apiKey: 'ENV:Z_KEY' } }, routes: {} }) === false, 'ENV: reference allowed');
+  assert(hasLiteralApiKey({ providers: { z: { url: 'u' } }, routes: {} }) === false, 'no apiKey field → false');
+  assert(hasLiteralApiKey({ providers: {}, routes: {} }) === false, 'empty providers → false');
+  assert(hasLiteralApiKey({ providers: { z: { apiKey: '' } }, routes: {} }) === false, 'empty-string apiKey treated as absent');
+  // N — mixed: any literal → true
+  assert(hasLiteralApiKey({ providers: { a: { apiKey: 'ENV:OK' }, b: { apiKey: 'leaked' } }, routes: {} }) === true, 'any literal → true');
+
+  // ── resolveGuiPath (security boundary — must reject path traversal) ──
+  console.log('\nresolveGuiPath:');
+  const GUI_DIR = '/srv/ccb/gui';
+  // Happy paths
+  assert(resolveGuiPath(GUI_DIR, '/gui') === '/srv/ccb/gui/index.html', '/gui → index.html');
+  assert(resolveGuiPath(GUI_DIR, '/gui/') === '/srv/ccb/gui/index.html', '/gui/ → index.html');
+  assert(resolveGuiPath(GUI_DIR, '/gui/app.js') === '/srv/ccb/gui/app.js', '/gui/app.js inside');
+  assert(resolveGuiPath(GUI_DIR, '/gui/index.html') === '/srv/ccb/gui/index.html', '/gui/index.html inside');
+  // Query/fragment stripped
+  assert(resolveGuiPath(GUI_DIR, '/gui/app.js?v=1') === '/srv/ccb/gui/app.js', 'query stripped');
+  assert(resolveGuiPath(GUI_DIR, '/gui/app.js#frag') === '/srv/ccb/gui/app.js', 'fragment stripped');
+  // Exception paths — every traversal vector returns null
+  assert(resolveGuiPath(GUI_DIR, '/gui/../../etc/passwd') === null, 'literal .. rejected');
+  assert(resolveGuiPath(GUI_DIR, '/gui/../app.js') === null, 'sibling .. rejected');
+  assert(resolveGuiPath(GUI_DIR, '/gui/%2e%2e/%2e%2e/etc/passwd') === null, 'url-encoded .. rejected');
+  assert(resolveGuiPath(GUI_DIR, '/gui/%2E%2E/etc/passwd') === null, 'url-encoded .. uppercase rejected');
+  assert(resolveGuiPath(GUI_DIR, '/gui/foo%00.html') === null, 'null byte rejected');
+  assert(resolveGuiPath(GUI_DIR, '/gui/%FF%FE') === null, 'malformed percent-encoding rejected');
+  assert(resolveGuiPath(GUI_DIR, '/api/config') === null, 'non-/gui path rejected');
+  assert(resolveGuiPath(GUI_DIR, '/guix/app.js') === null, '/gui prefix without separator rejected');
+  // ZOMBIES boundary: absolute paths inside the request
+  assert(resolveGuiPath(GUI_DIR, '/gui//etc/passwd') === null, 'absolute-path injection rejected');
+  // Final-path containment: a path with .. that resolves back inside is allowed
+  assert(resolveGuiPath(GUI_DIR, '/gui/sub/../app.js') === '/srv/ccb/gui/app.js', '.. that resolves back inside allowed');
 
   // ── Result ──
   console.log('\nResult:');
@@ -483,35 +666,43 @@ async function runUnitTests() {
 
   // ── ProxyConfig ──
   console.log('\nProxyConfig:');
-  const validConfig = new ProxyConfig({
-    port: 9099,
-    anthropicBaseUrl: 'https://api.anthropic.com',
-    daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: -1, ipcTimeoutMs: 5000, daemonStartTimeoutMs: 60000, daemonStartProgressGraceMs: 15000 },
-    logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 },
-    compression: { recompressRequests: true }
-  });
+  const validDaemon = { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: -1, ipcTimeoutMs: 5000, daemonStartTimeoutMs: 60000, daemonStartProgressGraceMs: 15000, bindHost: '127.0.0.1' };
+  const validRoot = { port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } };
+  const validConfig = new ProxyConfig({ ...validRoot, daemon: validDaemon });
   assert(validConfig.port === 9099, 'port');
   assert(validConfig.anthropicBaseUrl === 'https://api.anthropic.com', 'anthropicBaseUrl');
   assert(validConfig.upstreamTimeoutMs === 600000, 'upstreamTimeoutMs');
   assert(validConfig.workerInitTimeoutMs === 20000, 'workerInitTimeoutMs');
   assert(validConfig.drainTimeoutMs === 600000, 'drainTimeoutMs');
   assert(validConfig.ipcTimeoutMs === 5000, 'ipcTimeoutMs');
+  assert(validConfig.bindHost === '127.0.0.1', 'bindHost loopback default exposed');
   assertThrows(() => new ProxyConfig({ port: 9099, logging: { enabled: true } }), ConfigError, 'incomplete logging throws');
 
   // Config validation: watchdog timeouts
-  assertThrows(() => new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 500, drainTimeoutMs: 600000, workerKeepaliveS: -1, ipcTimeoutMs: 5000, daemonStartTimeoutMs: 60000, daemonStartProgressGraceMs: 15000 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } }), ConfigError, 'workerInitTimeoutMs < 1000 throws');
-  assertThrows(() => new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 500, workerKeepaliveS: -1, ipcTimeoutMs: 5000, daemonStartTimeoutMs: 60000, daemonStartProgressGraceMs: 15000 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } }), ConfigError, 'drainTimeoutMs < 1000 throws');
-  assertThrows(() => new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: -2, ipcTimeoutMs: 5000, daemonStartTimeoutMs: 60000, daemonStartProgressGraceMs: 15000 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } }), ConfigError, 'workerKeepaliveS < -1 throws');
-  assertThrows(() => new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: -1, ipcTimeoutMs: 50, daemonStartTimeoutMs: 60000, daemonStartProgressGraceMs: 15000 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } }), ConfigError, 'ipcTimeoutMs < 100 throws');
+  assertThrows(() => new ProxyConfig({ ...validRoot, daemon: { ...validDaemon, workerInitTimeoutMs: 500 } }), ConfigError, 'workerInitTimeoutMs < 1000 throws');
+  assertThrows(() => new ProxyConfig({ ...validRoot, daemon: { ...validDaemon, drainTimeoutMs: 500 } }), ConfigError, 'drainTimeoutMs < 1000 throws');
+  assertThrows(() => new ProxyConfig({ ...validRoot, daemon: { ...validDaemon, workerKeepaliveS: -2 } }), ConfigError, 'workerKeepaliveS < -1 throws');
+  assertThrows(() => new ProxyConfig({ ...validRoot, daemon: { ...validDaemon, ipcTimeoutMs: 50 } }), ConfigError, 'ipcTimeoutMs < 100 throws');
   // Valid workerKeepaliveS values
-  const cfgIndefinite = new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: -1, ipcTimeoutMs: 5000, daemonStartTimeoutMs: 60000, daemonStartProgressGraceMs: 15000 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } });
+  const cfgIndefinite = new ProxyConfig({ ...validRoot, daemon: { ...validDaemon, workerKeepaliveS: -1 } });
   assert(cfgIndefinite.workerKeepaliveS === -1, 'workerKeepaliveS=-1 (indefinite) accepted');
-  const cfgZero = new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: 0, ipcTimeoutMs: 5000, daemonStartTimeoutMs: 60000, daemonStartProgressGraceMs: 15000 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } });
+  const cfgZero = new ProxyConfig({ ...validRoot, daemon: { ...validDaemon, workerKeepaliveS: 0 } });
   assert(cfgZero.workerKeepaliveS === 0, 'workerKeepaliveS=0 (last keepalive) accepted');
-  const cfgGrace = new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: 60, ipcTimeoutMs: 5000, daemonStartTimeoutMs: 60000, daemonStartProgressGraceMs: 15000 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } });
+  const cfgGrace = new ProxyConfig({ ...validRoot, daemon: { ...validDaemon, workerKeepaliveS: 60 } });
   assert(cfgGrace.workerKeepaliveS === 60, 'workerKeepaliveS=60 (grace period) accepted');
-  const cfgDecimal = new ProxyConfig({ port: 9099, anthropicBaseUrl: 'https://api.anthropic.com', daemon: { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: 0.5, ipcTimeoutMs: 5000, daemonStartTimeoutMs: 60000, daemonStartProgressGraceMs: 15000 }, logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000 }, compression: { recompressRequests: true } });
+  const cfgDecimal = new ProxyConfig({ ...validRoot, daemon: { ...validDaemon, workerKeepaliveS: 0.5 } });
   assert(cfgDecimal.workerKeepaliveS === 0.5, 'workerKeepaliveS=0.5 (decimal) accepted');
+
+  // bindHost contract — defaults to loopback; non-string / empty / undefined rejected; explicit override accepted.
+  // Why this is a security boundary: a missing or non-string bindHost previously meant '0.0.0.0' (LAN-exposed); fail-loud at config load.
+  const { bindHost: _omitBindHost, ...daemonNoBind } = validDaemon;
+  assertThrows(() => new ProxyConfig({ ...validRoot, daemon: daemonNoBind }), ConfigError, 'bindHost missing throws');
+  assertThrows(() => new ProxyConfig({ ...validRoot, daemon: { ...validDaemon, bindHost: 123 } }), ConfigError, 'bindHost non-string throws');
+  assertThrows(() => new ProxyConfig({ ...validRoot, daemon: { ...validDaemon, bindHost: '' } }), ConfigError, 'bindHost empty string throws');
+  const cfgIpv6 = new ProxyConfig({ ...validRoot, daemon: { ...validDaemon, bindHost: '::1' } });
+  assert(cfgIpv6.bindHost === '::1', 'bindHost ipv6 loopback accepted');
+  const cfgExplicitAny = new ProxyConfig({ ...validRoot, daemon: { ...validDaemon, bindHost: '0.0.0.0' } });
+  assert(cfgExplicitAny.bindHost === '0.0.0.0', 'bindHost 0.0.0.0 accepted (explicit LAN-exposure opt-in)');
 
   // ── ProxyState withConnectionBump validation ──
   console.log('\nProxyState:');
@@ -564,6 +755,7 @@ async function runUnitTests() {
   assert(completeConfig.daemon.workerInitTimeoutMs === 20000, 'workerInitTimeoutMs default');
   assert(completeConfig.daemon.drainTimeoutMs === 600000, 'drainTimeoutMs default');
   assert(completeConfig.daemon.workerKeepaliveS === -1, 'workerKeepaliveS default');
+  assert(completeConfig.daemon.bindHost === '127.0.0.1', 'bindHost default is loopback');
 
   const rawProviders = { providers: [{ id: 'zai', url: 'https://zai.com/api', anthropicCompliant: false }] };
   const completeProviders = ensureCompleteProviders(rawProviders);
@@ -2878,9 +3070,18 @@ async function runIntegrationTests() {
   // freshly-spawned daemons, and avoids the agent:false flake we saw with
   // fresh-socket-per-request.
   const apiAgent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  // Read proxy.secret once per suite — admin endpoints require Bearer auth
+  // since A4. The file is written by the worker on first boot.
+  const proxySecretPath = path.join(TEST_CONFIG_DIR, LOGS_DIR_NAME, 'proxy.secret');
+  const readProxySecret = () => {
+    try { return fs.readFileSync(proxySecretPath, 'utf8').trim(); }
+    catch { return ''; }
+  };
   const httpJsonOnce = (method, path_, body) => new Promise((resolve) => {
     const data = body ? JSON.stringify(body) : '';
     const headers = {};
+    const secret = readProxySecret();
+    if (secret) headers['authorization'] = `Bearer ${secret}`;
     if (body) {
       headers['content-type'] = 'application/json';
       headers['content-length'] = Buffer.byteLength(data);
@@ -3027,6 +3228,70 @@ async function runIntegrationTests() {
     console.log('  PASS: GET /gui/app.js served as text/javascript');
   }
 
+  // ── A4 auth gate regressions ──
+  const rawApiRequest = (rawHeaders, rawPath) => new Promise((resolve) => {
+    const req = http.request({ hostname: 'localhost', port: TEST_PORT, path: rawPath, method: 'GET', headers: rawHeaders, timeout: HTTP_TIMEOUT_MS, agent: apiAgent }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ statusCode: res.statusCode, body: Buffer.concat(chunks).toString() }));
+    });
+    req.on('error', (e) => resolve({ error: e }));
+    req.on('timeout', () => { req.destroy(); resolve({ error: { code: 'HTTP_TIMEOUT' } }); });
+    req.end();
+  });
+  const tryJsonAuth = (body) => {
+    try { return JSON.parse(body); } catch { return null; }
+  };
+
+  // GET /gui returns a Set-Cookie with the required attributes
+  const guiCookie = (Array.isArray(r6.headers['set-cookie']) ? r6.headers['set-cookie'][0] : r6.headers['set-cookie']) || '';
+  const cookieOk = guiCookie.includes('ccb-auth=') && guiCookie.includes('HttpOnly') && guiCookie.includes('SameSite=Strict') && guiCookie.includes('Path=/');
+  if (!cookieOk) {
+    console.error(`  FAIL: GET /gui Set-Cookie missing required attributes: ${guiCookie}`);
+    apiSuccess = false;
+  }
+  if (cookieOk) console.log('  PASS: GET /gui Set-Cookie has HttpOnly + SameSite=Strict + Path=/');
+
+  // GET /api/config WITHOUT auth → 401 missing_credentials
+  const noAuthRes = await rawApiRequest({}, '/api/config');
+  if (noAuthRes.statusCode !== 401) {
+    console.error(`  FAIL: unauth GET /api/config expected 401, got ${noAuthRes.statusCode}`);
+    apiSuccess = false;
+  }
+  const noAuthJson = tryJsonAuth(noAuthRes.body);
+  if (noAuthRes.statusCode === 401 && noAuthJson?.error?.code === 'missing_credentials') {
+    console.log('  PASS: unauth /api/config → 401 with structured missing_credentials');
+  }
+  if (noAuthRes.statusCode === 401 && noAuthJson?.error?.code !== 'missing_credentials') {
+    console.error(`  FAIL: 401 body missing structured missing_credentials code: ${noAuthRes.body}`);
+    apiSuccess = false;
+  }
+
+  // GET /api/config with WRONG bearer → 401 wrong_secret
+  const wrongAuthRes = await rawApiRequest({ authorization: 'Bearer wrong-secret-value-12345678' }, '/api/config');
+  if (wrongAuthRes.statusCode !== 401) {
+    console.error(`  FAIL: wrong-bearer GET /api/config expected 401, got ${wrongAuthRes.statusCode}`);
+    apiSuccess = false;
+  }
+  const wrongAuthJson = tryJsonAuth(wrongAuthRes.body);
+  if (wrongAuthRes.statusCode === 401 && wrongAuthJson?.error?.code === 'wrong_secret') {
+    console.log('  PASS: wrong-bearer /api/config → 401 with structured wrong_secret');
+  }
+  if (wrongAuthRes.statusCode === 401 && wrongAuthJson?.error?.code !== 'wrong_secret') {
+    console.error(`  FAIL: 401 body missing structured wrong_secret code: ${wrongAuthRes.body}`);
+    apiSuccess = false;
+  }
+
+  // GET /api/config with cookie from /gui → 200 (end-to-end browser bootstrap)
+  const cookieMatch = guiCookie.match(/ccb-auth=([^;]+)/);
+  const cookieValue = cookieMatch ? cookieMatch[1] : '';
+  const cookieAuthRes = await rawApiRequest({ cookie: `ccb-auth=${cookieValue}` }, '/api/config');
+  if (cookieAuthRes.statusCode !== 200) {
+    console.error(`  FAIL: cookie GET /api/config expected 200, got ${cookieAuthRes.statusCode}`);
+    apiSuccess = false;
+  }
+  if (cookieAuthRes.statusCode === 200) console.log('  PASS: /gui cookie authenticates /api/config (end-to-end bootstrap)');
+
   // POST /api/restart: 202 + watchdog spawns new worker
   const daemonLogPath = path.join(TEST_CONFIG_DIR, LOGS_DIR_NAME, 'daemon.log');
   const readLogSafely = () => {
@@ -3094,12 +3359,15 @@ async function runIntegrationTests() {
   // Independent connections per request (no shared agent). Each request gets
   // its own socket so we genuinely exercise concurrent kernel accept dispatch.
   const stressOne = (ep) => new Promise((resolve) => {
+    const stressSecret = readProxySecret();
+    const stressHeaders = { connection: 'close' };
+    if (stressSecret) stressHeaders.authorization = `Bearer ${stressSecret}`;
     const req = http.request({
       hostname: 'localhost',
       port: TEST_PORT,
       path: ep.path,
       method: ep.method,
-      headers: { connection: 'close' },
+      headers: stressHeaders,
       timeout: STRESS_TIMEOUT_MS,
       agent: false
     }, (res) => {

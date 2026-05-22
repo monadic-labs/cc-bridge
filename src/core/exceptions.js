@@ -54,6 +54,26 @@ export class ReadinessTimeoutException extends ProxyError {
   constructor(message, props) { super(message, { operation: 'process-manager', ...props }); }
 }
 
+export class AuthError extends ProxyError {
+  #reason;
+
+  constructor(message, opts = {}) {
+    const { reason, ...props } = opts;
+    super(message, { operation: 'auth', ...props });
+    this.#reason = reason ?? 'unauthorized';
+  }
+
+  get reason() { return this.#reason; }
+  get httpStatus() { return this.#reason === 'non_loopback_admin' ? 403 : 401; }
+
+  toResponsePayload() {
+    return JSON.stringify({
+      type: 'error',
+      error: { type: 'auth_error', code: this.#reason, message: this.message }
+    });
+  }
+}
+
 export class UpstreamError extends ProxyError {
   #statusCode;
   #responseBody;
