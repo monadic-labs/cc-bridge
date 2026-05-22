@@ -10,7 +10,7 @@
  */
 
 import { ProviderMatch } from '../../core/providers.js';
-import { providerIdToEnvKey } from '../../core/providers.js';
+import { requireProviderApiKey } from '../../core/api-key-resolver.js';
 import { MAX_FALLBACK_DEPTH } from '../../core/routing-rules.js';
 import { tryParseBody, routeToProvider, applyAuthHeaders } from '../../core/routing.js';
 
@@ -72,9 +72,9 @@ function buildFallbackRequest(originalBody, matchedRule, policy, routedHeaders, 
   const bodyWithFallbackModel = { ...body, model: fallbackMatch.realModel };
   const routing = routeToProvider(bodyWithFallbackModel, fallbackMatch, extensions);
 
-  const envVar = providerIdToEnvKey(fallbackMatch.provider.id);
-  const apiKey = process.env[envVar] ?? '';
-  const finalHeaders = applyAuthHeaders({ headers: routedHeaders, match: fallbackMatch, apiKey, openaiProviders });
+  const keyRes = requireProviderApiKey(fallbackMatch.provider.id);
+  if (!keyRes.isSuccess) throw keyRes.error;
+  const finalHeaders = applyAuthHeaders({ headers: routedHeaders, match: fallbackMatch, apiKey: keyRes.value, openaiProviders });
 
   return {
     forwardBody: routing.forwardBody,

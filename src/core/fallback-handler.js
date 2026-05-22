@@ -1,7 +1,7 @@
 import { Option } from './types.js';
 import { tryParseBody, routeToProvider, applyAuthHeaders } from './routing.js';
 import { ProviderMatch } from './providers.js';
-import { providerIdToEnvKey } from './providers.js';
+import { requireProviderApiKey } from './api-key-resolver.js';
 import { MAX_FALLBACK_DEPTH } from './routing-rules.js';
 
 /**
@@ -70,9 +70,9 @@ export function buildFallbackRequest(originalBody, fallbackMatch, routedHeaders,
   const bodyWithFallbackModel = { ...body, model: fallbackMatch.realModel };
   const routing = routeToProvider(bodyWithFallbackModel, fallbackMatch);
 
-  const envVar = providerIdToEnvKey(fallbackMatch.provider.id);
-  const apiKey = process.env[envVar] ?? '';
-  const finalHeaders = applyAuthHeaders({ headers: routedHeaders, match: fallbackMatch, apiKey, openaiProviders });
+  const keyRes = requireProviderApiKey(fallbackMatch.provider.id);
+  if (!keyRes.isSuccess) throw keyRes.error;
+  const finalHeaders = applyAuthHeaders({ headers: routedHeaders, match: fallbackMatch, apiKey: keyRes.value, openaiProviders });
 
   return {
     forwardBody: routing.forwardBody,

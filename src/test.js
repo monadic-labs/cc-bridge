@@ -95,6 +95,52 @@ async function runUnitTests() {
   assert(providerIdToEnvKey(null) === '', 'null returns empty');
   assert(providerIdToEnvKey(undefined) === '', 'undefined returns empty');
 
+  // ── requireProviderApiKey / tryProviderApiKey ──
+  // C3: a provider routed to but with no env-var-backed credential must
+  // surface a named domain error at the call site rather than collapse to
+  // an empty string and let the request reach upstream unauthenticated.
+  console.log('\nrequireProviderApiKey / tryProviderApiKey:');
+  const { requireProviderApiKey, tryProviderApiKey, ProviderApiKeyError } = await import('../src/core/api-key-resolver.js');
+
+  const env_present = { ZAI_KEY: 'sk-real-1' };
+  const env_absent = {};
+  const env_empty = { ZAI_KEY: '' };
+
+  const ak1 = requireProviderApiKey('zai', env_present);
+  assert(ak1.isSuccess === true, 'requireProviderApiKey ok when env set');
+  assert(ak1.value === 'sk-real-1', 'requireProviderApiKey returns the value');
+
+  const ak2 = requireProviderApiKey('zai', env_absent);
+  assert(ak2.isSuccess === false, 'requireProviderApiKey fails when env unset');
+  assert(ak2.error instanceof ProviderApiKeyError, 'error is ProviderApiKeyError instance');
+  assert(ak2.error.providerId === 'zai', 'error carries providerId');
+  assert(ak2.error.envVar === 'ZAI_KEY', 'error carries the expected envVar');
+  assert(ak2.error.message.includes('ZAI_KEY'), 'error message names the env var');
+  assert(ak2.error.message.includes('zai'), 'error message names the provider');
+
+  const ak3 = requireProviderApiKey('zai', env_empty);
+  assert(ak3.isSuccess === false, 'empty-string env value treated as missing');
+  assert(ak3.error.providerId === 'zai', 'empty-string error carries providerId');
+
+  const ak4 = requireProviderApiKey('', env_present);
+  assert(ak4.isSuccess === false, 'empty providerId fails');
+
+  const ak5 = requireProviderApiKey('my-provider', { MY_PROVIDER_KEY: 'k' });
+  assert(ak5.isSuccess === true, 'hyphenated providerId resolves');
+
+  const ak6 = tryProviderApiKey('zai', env_present);
+  assert(ak6.isSome === true, 'tryProviderApiKey some when env set');
+  assert(ak6.value === 'sk-real-1', 'tryProviderApiKey returns the value');
+
+  const ak7 = tryProviderApiKey('zai', env_absent);
+  assert(ak7.isNone === true, 'tryProviderApiKey none when env unset');
+
+  const ak8 = tryProviderApiKey('zai', env_empty);
+  assert(ak8.isNone === true, 'tryProviderApiKey none on empty-string env');
+
+  const ak9 = tryProviderApiKey('', env_present);
+  assert(ak9.isNone === true, 'tryProviderApiKey none on empty providerId');
+
   // ── daemon-constants ──
   console.log('\ndaemon-constants:');
   const { getControlIpcPath } = await import('../src/core/daemon-constants.js');
@@ -1547,6 +1593,10 @@ async function runUnitTests() {
   // ── proxy-routing (resolveRouting + processRequestBody) ──
   console.log('\nproxy-routing:');
   const { resolveRouting: resolveRoutingFn } = await import('../src/core/proxy-routing.js');
+  // Provider key required by the new requireProviderApiKey gate (C3); these
+  // tests cover routing logic, not the missing-key error path.
+  process.env.TEST_P_KEY = 'sk-test-p';
+  process.env.FB_P_KEY = 'sk-fb-p';
 
   // Build a simple policy for testing
   const testProvCfg = new ProviderConfig({ id: 'test-p', url: 'https://test.com/v1', models: { 't-model': 'real-model' }, anthropicCompliant: false, toolTransforms: {} });
@@ -1566,8 +1616,10 @@ async function runUnitTests() {
   assert(rr.reqModel === 't-model', 'resolveRouting reqModel');
   assert(rr.sessionId === 'sess-123', 'resolveRouting sessionId from urlSessionId');
   assert(rr.routing.targetBase === 'https://test.com/v1', 'resolveRouting routes to provider');
-  assert(rr.routedHeaders.authorization === undefined, 'resolveRouting strips auth');
-  assert(rr.routedHeaders['x-api-key'] !== undefined || true, 'resolveRouting resolves headers');
+  // With C3 the provider key is now resolved from TEST_P_KEY and applied
+  // as both x-api-key and Authorization Bearer (anthropic-compliant=false).
+  assert(rr.routedHeaders.authorization === 'Bearer sk-test-p', 'resolveRouting replaces auth with provider key');
+  assert(rr.routedHeaders['x-api-key'] === 'sk-test-p', 'resolveRouting sets x-api-key');
 
   const rrFallback = await resolveRoutingFn({
     policy: testPolicy,
@@ -1602,6 +1654,35 @@ async function runUnitTests() {
   assert(rrDefault.matchedRule.hasFallback === true, 'resolveRouting default matchedRule hasFallback');
   assert(rrDefault.matchedRule.fallbackProviderId === 'fb-p', 'resolveRouting default fallbackProviderId');
   assert(rrDefault.matchedRule.fallbackModel === 'safe-model', 'resolveRouting default fallbackModel');
+
+  // C3: routing to a provider whose env var is unset must throw a
+  // ProviderApiKeyError instead of silently sending an unauthenticated
+  // request upstream.
+  const missingKeyProvCfg = new ProviderConfig({ id: 'no-key-p', url: 'https://nokey.example.com/v1', models: { 'nk-model': 'real-nk' }, anthropicCompliant: false, toolTransforms: {} });
+  const missingKeyPolicy = buildRoutingPolicy({
+    rawPolicy: [],
+    providerConfigs: [missingKeyProvCfg],
+    legacyProvidersMap: new ProvidersMap([missingKeyProvCfg])
+  });
+  delete process.env.NO_KEY_P_KEY;
+  let missingKeyThrew = null;
+  try {
+    await resolveRoutingFn({
+      policy: missingKeyPolicy,
+      body: { model: 'nk-model', messages: [] },
+      urlSessionId: 'sess-nk',
+      routedHeaders: {},
+      anthropicBaseUrl: 'https://api.anthropic.com'
+    });
+  } catch (e) { missingKeyThrew = e; }
+  assert(missingKeyThrew !== null, 'resolveRouting throws when env var unset');
+  assert(missingKeyThrew.constructor.name === 'ProviderApiKeyError', 'throws ProviderApiKeyError type');
+  assert(missingKeyThrew.providerId === 'no-key-p', 'thrown error names the provider');
+  assert(missingKeyThrew.envVar === 'NO_KEY_P_KEY', 'thrown error names the env var');
+  assert(missingKeyThrew.httpStatus === 400, 'thrown error advertises 400 httpStatus');
+  const missingKeyPayload = JSON.parse(missingKeyThrew.toResponsePayload());
+  assert(missingKeyPayload.error.type === 'invalid_request_error', 'response payload is invalid_request_error');
+  assert(missingKeyPayload.error.message.includes('NO_KEY_P_KEY'), 'response payload names env var');
 
   // ── Extension Registry ──
   console.log('\nExtensionRegistry:');

@@ -10,6 +10,7 @@ import https from 'https';
 import http from 'http';
 import { URL } from 'url';
 import { UpstreamError } from '../../core/exceptions.js';
+import { tryProviderApiKey } from '../../core/api-key-resolver.js';
 
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const FETCH_TIMEOUT_MS = 5000;
@@ -93,8 +94,12 @@ export async function resolveOpenaiModel(modelName, providerFormats, providerCon
   const provider = providerConfigs.get(providerId);
   if (!provider) return null;
 
-  // Try /v1/models endpoint first
-  const apiKey = process.env[providerId.toUpperCase().replace(/[^A-Z0-9]/g, '_') + '_KEY'] ?? '';
+  // Side-channel probe to /v1/models — missing env var is non-fatal here:
+  // the probe just runs unauthenticated (open gateways still respond) and
+  // the unmatched-route forwarding path (proxy-routing.js) is where a
+  // missing key surfaces as a structured ProviderApiKeyError.
+  const keyOpt = tryProviderApiKey(providerId);
+  const apiKey = keyOpt.isSome ? keyOpt.value : '';
   const knownModels = await fetchModels(provider.url, apiKey);
   if (knownModels) {
     if (knownModels.has(model)) {
