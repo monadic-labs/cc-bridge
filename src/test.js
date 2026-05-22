@@ -191,6 +191,67 @@ async function runUnitTests() {
   } = await import('../src/core/auth-gate.js');
   const { AuthError } = await import('../src/core/exceptions.js');
   const { ConfigCache } = await import('../src/core/config-cache.js');
+  const { SessionMetrics, KeepaliveState } = await import('../src/proxy-core.js');
+
+  // ── SessionMetrics (immutable lifetime counters) ──
+  console.log('\nSessionMetrics:');
+  const sm0 = new SessionMetrics();
+  assert(sm0.totalRequests === 0, 'sm0 totalRequests');
+  assert(sm0.totalInputTokens === 0, 'sm0 totalInputTokens');
+  assert(sm0.totalOutputTokens === 0, 'sm0 totalOutputTokens');
+  assert(sm0.lastClaudeSessionId === '', 'sm0 lastClaudeSessionId');
+  // Happy — withSessionUpdate folds in a request
+  const sm1 = sm0.withSessionUpdate({ sessionId: 'sess-1', inputTokens: 100, outputTokens: 50 });
+  assert(sm1.totalRequests === 1, 'sm1 +1 req');
+  assert(sm1.totalInputTokens === 100, 'sm1 +100 in');
+  assert(sm1.totalOutputTokens === 50, 'sm1 +50 out');
+  assert(sm1.lastClaudeSessionId === 'sess-1', 'sm1 session id');
+  // Input not mutated (immutability)
+  assert(sm0.totalRequests === 0, 'sm0 still 0');
+  // Subsequent update accumulates and updates session id
+  const sm2 = sm1.withSessionUpdate({ sessionId: 'sess-2', inputTokens: 30, outputTokens: 20 });
+  assert(sm2.totalRequests === 2, 'sm2 +1 req');
+  assert(sm2.totalInputTokens === 130, 'sm2 cumulative in');
+  assert(sm2.totalOutputTokens === 70, 'sm2 cumulative out');
+  assert(sm2.lastClaudeSessionId === 'sess-2', 'sm2 latest session id');
+  // Edge — empty/missing sessionId preserves the previous one (don't clobber on token-only updates)
+  const sm3 = sm2.withSessionUpdate({ sessionId: '', inputTokens: 5, outputTokens: 5 });
+  assert(sm3.lastClaudeSessionId === 'sess-2', 'sm3 preserves prior session id');
+  assert(sm3.totalRequests === 3, 'sm3 +1 req');
+  // Exception — invalid arg types
+  assertThrows(() => sm0.withSessionUpdate({ sessionId: 'x', inputTokens: -1, outputTokens: 0 }), ArgumentError, 'negative inputTokens rejected');
+  assertThrows(() => sm0.withSessionUpdate({ sessionId: 'x', inputTokens: 0, outputTokens: -1 }), ArgumentError, 'negative outputTokens rejected');
+  assertThrows(() => sm0.withSessionUpdate({ sessionId: 0, inputTokens: 0, outputTokens: 0 }), ArgumentError, 'non-string sessionId rejected');
+  assertThrows(() => sm0.withSessionUpdate({ sessionId: 'x', inputTokens: 'abc', outputTokens: 0 }), ArgumentError, 'non-numeric inputTokens rejected');
+  assertThrows(() => sm0.withSessionUpdate(null), ArgumentError, 'null update rejected');
+
+  // ── KeepaliveState (lifecycle: count + sticky-received flag) ──
+  console.log('\nKeepaliveState:');
+  const ks0 = new KeepaliveState();
+  assert(ks0.activeKeepalives === 0, 'ks0 zero');
+  assert(ks0.hasReceivedKeepalive === false, 'ks0 never received');
+  assert(ks0.shouldShutDown === false, 'ks0 do not shutdown — no keepalive ever');
+  // After first connect — hasReceived flips, count=1
+  const ks1 = ks0.withConnect();
+  assert(ks1.activeKeepalives === 1, 'ks1 count=1');
+  assert(ks1.hasReceivedKeepalive === true, 'ks1 received flag');
+  assert(ks1.shouldShutDown === false, 'ks1 still serving');
+  // Multiple connects
+  const ks2 = ks1.withConnect().withConnect();
+  assert(ks2.activeKeepalives === 3, 'ks2 count=3');
+  // Disconnects step down
+  const ks2a = ks2.withDisconnect();
+  assert(ks2a.activeKeepalives === 2, 'ks2a -1');
+  // Drain to zero — shouldShutDown flips because hasReceived is true
+  const ks3 = ks1.withDisconnect();
+  assert(ks3.activeKeepalives === 0, 'ks3 drained');
+  assert(ks3.hasReceivedKeepalive === true, 'ks3 still remembers received');
+  assert(ks3.shouldShutDown === true, 'ks3 should shut down');
+  // Input not mutated
+  assert(ks1.activeKeepalives === 1, 'ks1 unchanged after derived states');
+  // Exception — withDisconnect when count is zero would underflow → rejects
+  assertThrows(() => ks0.withDisconnect(), ArgumentError, 'underflow disconnect rejected');
+  assertThrows(() => ks3.withDisconnect(), ArgumentError, 'underflow from drained rejected');
 
   // ── ConfigCache (caches ProxyConfig; tryRefresh is best-effort) ──
   console.log('\nConfigCache:');

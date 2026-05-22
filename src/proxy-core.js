@@ -38,7 +38,85 @@ import {
 } from './core/auth-gate.js';
 import { ConfigCache } from './core/config-cache.js';
 export { runKill };
-export { loadEnv, ProxyState };
+export { loadEnv, ProxyState, SessionMetrics, KeepaliveState };
+
+// Lifetime metrics for the worker. Immutable; one slot in the orchestrator
+// closure swaps to the next instance on each request via withSessionUpdate.
+// sessionId is sticky: a token-only update preserves the previous value so
+// /__ccb_internal__/session can show the most recent Claude session id even
+// when an in-flight request hasn't carried a session header.
+class SessionMetrics {
+  #totalRequests;
+  #totalInputTokens;
+  #totalOutputTokens;
+  #lastClaudeSessionId;
+
+  constructor(totalRequests = 0, totalInputTokens = 0, totalOutputTokens = 0, lastClaudeSessionId = '') {
+    this.#totalRequests = totalRequests;
+    this.#totalInputTokens = totalInputTokens;
+    this.#totalOutputTokens = totalOutputTokens;
+    this.#lastClaudeSessionId = lastClaudeSessionId;
+    Object.freeze(this);
+  }
+
+  get totalRequests() { return this.#totalRequests; }
+  get totalInputTokens() { return this.#totalInputTokens; }
+  get totalOutputTokens() { return this.#totalOutputTokens; }
+  get lastClaudeSessionId() { return this.#lastClaudeSessionId; }
+
+  withSessionUpdate(update) {
+    if (!update || typeof update !== 'object') {
+      throw new ArgumentError('SessionMetrics.withSessionUpdate: update must be an object');
+    }
+    const { sessionId, inputTokens, outputTokens } = update;
+    if (typeof sessionId !== 'string') {
+      throw new ArgumentError('SessionMetrics.withSessionUpdate: sessionId must be a string (empty string preserves prior id)');
+    }
+    if (typeof inputTokens !== 'number' || !Number.isFinite(inputTokens) || inputTokens < 0) {
+      throw new ArgumentError('SessionMetrics.withSessionUpdate: inputTokens must be a non-negative finite number');
+    }
+    if (typeof outputTokens !== 'number' || !Number.isFinite(outputTokens) || outputTokens < 0) {
+      throw new ArgumentError('SessionMetrics.withSessionUpdate: outputTokens must be a non-negative finite number');
+    }
+    const nextSessionId = sessionId.length > 0 ? sessionId : this.#lastClaudeSessionId;
+    return new SessionMetrics(
+      this.#totalRequests + 1,
+      this.#totalInputTokens + inputTokens,
+      this.#totalOutputTokens + outputTokens,
+      nextSessionId
+    );
+  }
+}
+
+// Keepalive lifecycle. Two fields, one concept (the keepalive connection's
+// presence over time). hasReceivedKeepalive is a sticky one-way flip:
+// distinguishes "CLI never connected" from "CLI was here and all closed",
+// which is the trigger for graceful daemon exit.
+class KeepaliveState {
+  #activeKeepalives;
+  #hasReceivedKeepalive;
+
+  constructor(activeKeepalives = 0, hasReceivedKeepalive = false) {
+    this.#activeKeepalives = activeKeepalives;
+    this.#hasReceivedKeepalive = hasReceivedKeepalive;
+    Object.freeze(this);
+  }
+
+  get activeKeepalives() { return this.#activeKeepalives; }
+  get hasReceivedKeepalive() { return this.#hasReceivedKeepalive; }
+  get shouldShutDown() { return this.#hasReceivedKeepalive && this.#activeKeepalives === 0; }
+
+  withConnect() {
+    return new KeepaliveState(this.#activeKeepalives + 1, true);
+  }
+
+  withDisconnect() {
+    if (this.#activeKeepalives <= 0) {
+      throw new ArgumentError(`KeepaliveState.withDisconnect: cannot decrement below zero (current: ${this.#activeKeepalives})`);
+    }
+    return new KeepaliveState(this.#activeKeepalives - 1, this.#hasReceivedKeepalive);
+  }
+}
 
 class ProxyState {
   #reqCount;
@@ -175,13 +253,9 @@ export function createProxyCore({ configDir, port }) {
   const debugLogger = new DebugLogger({ logsDir, level: cachedConfig.loggingLevel });
 
   let shellState = new ProxyState(0, buildRoutingPolicy({ rawPolicy: [], providerConfigs: [], legacyProvidersMap: new ProvidersMap([]) }), new ExtensionRegistry());
-  let activeKeepalives = 0;
-  let hasReceivedKeepalive = false;
+  let keepaliveState = new KeepaliveState();
+  let sessionMetrics = new SessionMetrics();
   const proxyStartTime = Date.now();
-  let lastClaudeSessionId = '';
-  let totalInputTokens = 0;
-  let totalOutputTokens = 0;
-  let totalRequests = 0;
 
   // Always generate a secret. CCB_KEEPALIVE_SECRET overrides for watchdog-coordinated
   // restarts (so child workers share the same secret across rolling reload); otherwise
@@ -232,10 +306,11 @@ export function createProxyCore({ configDir, port }) {
   }
 
   function recordSessionUpdate({ sessionId, inputTokens, outputTokens }) {
-    if (sessionId) lastClaudeSessionId = sessionId;
-    totalInputTokens += inputTokens;
-    totalOutputTokens += outputTokens;
-    totalRequests++;
+    sessionMetrics = sessionMetrics.withSessionUpdate({
+      sessionId: sessionId ?? '',
+      inputTokens: inputTokens ?? 0,
+      outputTokens: outputTokens ?? 0
+    });
   }
 
   // ── Response handler bound with deps ──
@@ -581,12 +656,11 @@ export function createProxyCore({ configDir, port }) {
           res.end('Unauthorized');
           return;
         }
-        hasReceivedKeepalive = true;
-        activeKeepalives++;
+        keepaliveState = keepaliveState.withConnect();
 
         const cleanup = () => {
-          activeKeepalives--;
-          if (activeKeepalives === 0 && hasReceivedKeepalive) {
+          keepaliveState = keepaliveState.withDisconnect();
+          if (keepaliveState.shouldShutDown) {
             emit('All keepalives closed, shutting down proxy daemon.').then(() => {
               process.exit(0);
             });
@@ -605,7 +679,7 @@ export function createProxyCore({ configDir, port }) {
           log_path: logsDir,
           config_path: configDir,
           active_connections: shellState.activeConnections,
-          keepalives: activeKeepalives
+          keepalives: keepaliveState.activeKeepalives
         };
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify(status));
@@ -618,10 +692,10 @@ export function createProxyCore({ configDir, port }) {
           ccb_version: CCB_VERSION,
           worker_pid: process.pid,
           uptime_sec: Math.round((Date.now() - proxyStartTime) / 1000),
-          claude_session_id: lastClaudeSessionId,
-          total_requests: totalRequests,
-          total_input_tokens: totalInputTokens,
-          total_output_tokens: totalOutputTokens,
+          claude_session_id: sessionMetrics.lastClaudeSessionId,
+          total_requests: sessionMetrics.totalRequests,
+          total_input_tokens: sessionMetrics.totalInputTokens,
+          total_output_tokens: sessionMetrics.totalOutputTokens,
           log_path: logsDir,
           active_connections: shellState.activeConnections,
           history: history.map(s => s.toLogLine())
@@ -687,7 +761,7 @@ export function createProxyCore({ configDir, port }) {
               log_path: logsDir,
               config_path: configDir,
               active_connections: shellState.activeConnections,
-              keepalives: activeKeepalives
+              keepalives: keepaliveState.activeKeepalives
             }
           }
         });
