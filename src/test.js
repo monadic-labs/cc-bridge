@@ -784,6 +784,45 @@ async function runUnitTests() {
   assert(transformedSse.includes('"type":"text_delta","text":"\\n```\\n"'), 'content_block_stop injected closing ```');
   assert(transformedSse.includes('"type":"text","text":"hello"'), 'regular text block unchanged');
 
+  // ── SseResponseTransformer in-flight metadata accumulator (B4) ──
+  // Audit item 9: track inputTokens/outputTokens during the streaming pass
+  // so the post-stream re-parse of the full body can be dropped.
+  console.log('\nSseResponseTransformer metadata accumulator:');
+  // 0 — no events processed → tokens at zero
+  const meta0 = new SseResponseTransformer();
+  assert(meta0.inputTokens === 0, 'meta0 inputTokens 0');
+  assert(meta0.outputTokens === 0, 'meta0 outputTokens 0');
+  assert(meta0.model === '', 'meta0 model empty');
+  // 1 — message_start fed in → inputTokens + model captured
+  const meta1 = new SseResponseTransformer();
+  meta1.transformChunk('data: {"type":"message_start","message":{"model":"claude-opus","usage":{"input_tokens":42}}}\n\n');
+  assert(meta1.inputTokens === 42, 'meta1 inputTokens captured');
+  assert(meta1.model === 'claude-opus', 'meta1 model captured');
+  assert(meta1.outputTokens === 0, 'meta1 outputTokens still 0');
+  // 1 — message_delta fed in → outputTokens captured
+  const meta2 = new SseResponseTransformer();
+  meta2.transformChunk('data: {"type":"message_start","message":{"model":"glm-4.7","usage":{"input_tokens":15}}}\n\n');
+  meta2.transformChunk('data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}\n\n');
+  assert(meta2.inputTokens === 15, 'meta2 inputTokens kept');
+  assert(meta2.outputTokens === 7, 'meta2 outputTokens captured');
+  // Cross-chunk split — partial event mid-event boundary
+  const meta3 = new SseResponseTransformer();
+  meta3.transformChunk('data: {"type":"message_start","mes');
+  meta3.transformChunk('sage":{"model":"split","usage":{"input_tokens":99}}}\n\n');
+  assert(meta3.inputTokens === 99, 'meta3 cross-chunk inputTokens');
+  assert(meta3.model === 'split', 'meta3 cross-chunk model');
+  // Malformed data line — handler skips, accumulator untouched
+  const meta4 = new SseResponseTransformer();
+  meta4.transformChunk('data: not-json\n\n');
+  meta4.transformChunk('data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}\n\n');
+  assert(meta4.inputTokens === 3, 'meta4 malformed line skipped, valid line counted');
+  // Events without metadata payloads — accumulator untouched
+  const meta5 = new SseResponseTransformer();
+  meta5.transformChunk('data: {"type":"ping"}\n\n');
+  meta5.transformChunk('data: {"type":"content_block_start","content_block":{"type":"text"}}\n\n');
+  assert(meta5.inputTokens === 0, 'meta5 non-metadata events leave accumulator alone');
+  assert(meta5.outputTokens === 0, 'meta5 outputTokens still 0');
+
   // ── ProxyConfig ──
   console.log('\nProxyConfig:');
   const validDaemon = { healthCheckTimeoutMs: 500, pollIntervalMs: 300, pollMaxAttempts: 10, upstreamTimeoutMs: 600000, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: -1, ipcTimeoutMs: 5000, daemonStartTimeoutMs: 60000, daemonStartProgressGraceMs: 15000, bindHost: '127.0.0.1' };

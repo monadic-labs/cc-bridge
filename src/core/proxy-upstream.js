@@ -267,10 +267,10 @@ function handleProxyResponse({ reqCtx, proxyRes, headers, handleResponseEnd, err
       return;
     }
 
-    handleNormalResponse(reqCtx, proxyRes, chunks, handleResponseEnd, headers, extensions);
+    handleNormalResponse(reqCtx, proxyRes, chunks, handleResponseEnd, headers, extensions, transformer);
   });
 }
-function handleNormalResponse(reqCtx, proxyRes, chunks, handleResponseEnd, headers, _extensions) {
+function handleNormalResponse(reqCtx, proxyRes, chunks, handleResponseEnd, headers, _extensions, transformer) {
   if (reqCtx.clientAborted) return;
 
   const resCtx = new ProxyResponseContext({
@@ -288,7 +288,14 @@ function handleNormalResponse(reqCtx, proxyRes, chunks, handleResponseEnd, heade
     forwardBody: reqCtx.forwardBody,
     sanitizationReport: reqCtx.sanitizationReport
   });
-  handleResponseEnd({ resCtx, resChunks: chunks });
+  // For SSE success, the transformer has already tracked input/output tokens
+  // in-flight. Pass them through so handleResponseEnd skips the full-body
+  // re-parse. extractedMeta is null for non-SSE — extractTokensIfSse handles
+  // that path by returning zeros.
+  const extractedMeta = transformer
+    ? { inputTokens: transformer.inputTokens, outputTokens: transformer.outputTokens }
+    : null;
+  handleResponseEnd({ resCtx, resChunks: chunks, extractedMeta });
 }
 function streamBufferedError(reqCtx, proxyRes, chunks, _handleResponseEnd, _headers, errorReporter) {
   if (reqCtx.clientAborted) return;
