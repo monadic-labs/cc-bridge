@@ -8,6 +8,14 @@
     "ccb": "bin/ccb.js",
     "cc-bridge": "bin/ccb.js"
   },
+  "files": [
+    "bin/",
+    "src/",
+    "scripts/setup-user-dir.js",
+    "providers.example.json",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "proxy": "node src/proxy.js",
     "lint": "eslint src/ bin/",
