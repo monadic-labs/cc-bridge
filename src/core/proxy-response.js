@@ -39,7 +39,7 @@ export function extractTokensIfSse(raw, contentType) {
  * @param {function} params.deps.emit - Emit function for logging
  * @param {function} params.deps.getConfig - Config accessor
  */
-export async function handleResponseEnd({ resCtx, resChunks, deps }) {
+export async function handleResponseEnd({ resCtx, resChunks, extractedMeta, deps }) {
   const { logger, errorReporter, debugLogger, emit, getConfig, onSessionUpdate } = deps;
 
   const status = resCtx.proxyRes.statusCode;
@@ -76,7 +76,12 @@ export async function handleResponseEnd({ resCtx, resChunks, deps }) {
     });
   }
 
-  const { inputTokens, outputTokens } = extractTokensIfSse(raw, resCtx.proxyRes.headers['content-type']);
+  // If the streaming transformer already tracked tokens in-flight (SSE success
+  // path), use those values directly. Otherwise fall back to a one-shot
+  // parse of the buffered body (non-SSE or pre-A4 callers).
+  const { inputTokens, outputTokens } = extractedMeta
+    ? extractedMeta
+    : extractTokensIfSse(raw, resCtx.proxyRes.headers['content-type']);
 
   logger.addSummary(new RequestSummary({ id: resCtx.id, route: resCtx.routeLabel, model: resCtx.reqModel, status, duration, inputTokens, outputTokens }));
 
