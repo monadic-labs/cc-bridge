@@ -1,4 +1,12 @@
+---
+status: complete
+completed_at: 2026-05-22
+note: Goal achieved via SO_REUSEPORT self-binding (commit 7115f25), not via the socket-handoff design this plan describes. Plan retained as historical context — see bin/ccb-watchdog.js and src/proxy-core.js:625-748 for shipped implementation.
+---
+
 # Graceful Daemon Restart Implementation Plan
+
+> **Historical:** The shipped architecture diverged from this plan. Workers self-bind via SO_REUSEPORT instead of receiving a socket handle from the watchdog. The handle-handoff IPC path is now a no-op (`src/proxy-core.js:747-748`). Read for context only.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

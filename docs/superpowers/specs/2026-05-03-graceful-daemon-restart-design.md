@@ -1,7 +1,13 @@
+---
+status: superseded
+superseded_at: 2026-05-22
+note: Shipped implementation uses SO_REUSEPORT self-binding (commit 7115f25), not the socket-handoff approach this spec describes.
+---
+
 # Graceful Daemon Restart via Socket Handoff
 
 **Date:** 2026-05-03
-**Status:** Draft
+**Status:** Superseded by SO_REUSEPORT redesign (see commit 7115f25)
 
 ## Problem
 
