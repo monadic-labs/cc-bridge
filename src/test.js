@@ -2554,11 +2554,22 @@ async function runUnitTests() {
     'scripts/setup-user-dir.js',
     'providers.example.json',
     'README.md',
-    'LICENSE'
+    'LICENSE',
+    'CHANGELOG.md'
   ];
   for (const entry of requiredEntries) {
     assert(filesList.includes(entry), `files whitelist includes "${entry}"`);
   }
+
+  // P3-15: CHANGELOG.md exists and matches Keep a Changelog 1.1 anchors.
+  const changelogPath = path.join(PKG_ROOT, 'CHANGELOG.md');
+  assert(fs.existsSync(changelogPath), 'CHANGELOG.md exists at repo root');
+  const changelogText = fs.readFileSync(changelogPath, 'utf8');
+  assert(changelogText.includes('# Changelog'), 'CHANGELOG declares a Changelog heading');
+  assert(changelogText.includes('Keep a Changelog'), 'CHANGELOG references Keep a Changelog format');
+  assert(changelogText.includes('Semantic Versioning'), 'CHANGELOG references SemVer');
+  assert(changelogText.includes('## [Unreleased]'), 'CHANGELOG has an Unreleased section');
+  assert(changelogText.includes('## [2.0.0]'), 'CHANGELOG documents the 2.0.0 release');
   // Must NOT include workspace/dev artifacts (these would inflate the tarball
   // and leak local state to consumers).
   const forbiddenEntries = [

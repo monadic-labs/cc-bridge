@@ -14,7 +14,8 @@
     "scripts/setup-user-dir.js",
     "providers.example.json",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "proxy": "node src/proxy.js",
