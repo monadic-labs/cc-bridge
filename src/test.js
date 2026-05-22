@@ -3731,6 +3731,14 @@ async function runIntegrationTests() {
   assertCli(runCcb(['--x-help']), 0, 'CCB (Claude Code Bridge) Management Commands', null, '--x-help');
   assertCli(runCcb(['--x-help']), 0, '--x-clearlogs', null, '--x-help includes --x-clearlogs');
   assertCli(runCcb(['--x-help']), 0, '--x-sessions', null, '--x-help includes --x-sessions');
+  assertCli(runCcb(['--x-help']), 0, '--x-use-version', null, '--x-help documents --x-use-version replacement');
+
+  // P3-14: --version is POSIX-compliant: prints package name + version, exits 0.
+  // The previous --version <v> semantic (select daemon version for passthrough)
+  // moved to --x-use-version <v>.
+  console.log('  Testing --version (POSIX) ...');
+  assertCli(runCcb(['--version']), 0, '@monadic-labs/ccb', null, '--version prints package name');
+  assertCli(runCcb(['--version']), 0, '2.0.0', null, '--version prints semver');
 
   // Test --x-init
   console.log('  Testing --x-init...');

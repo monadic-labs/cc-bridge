@@ -695,10 +695,16 @@ const CCB_CMDS = {
   '--x-route': () => handleRouteCommand(),
   '--x-key': () => handleKeyCommand(),
   '--x-version': () => handleVersionsCommand(),
+  '--version': () => {
+    process.stdout.write(`@monadic-labs/ccb ${CCB_VERSION}\n`);
+    process.exit(0);
+  },
   '--x-help': () => {
     process.stdout.write(`
   CCB (Claude Code Bridge) Management Commands:
-  --x-version [add|remove|list|set]  Manage or list versions
+  --version                          Print package name + version, then exit
+  --x-version [add|remove|list|set]  Manage or list installed daemon versions
+  --x-use-version <v>                Use a specific installed daemon version for this invocation
   --x-init                           Initialize the config directory (~/.claude/.ccb)
   --x-status                         Show current daemon and worker status
   --x-sessions                       List all active sessions across workers
@@ -711,7 +717,7 @@ const CCB_CMDS = {
   --x-key ...                        Manage API keys (.env)
 
   Usage for Passthrough:
-  ccb [--version <v>] [claude args]
+  ccb [--x-use-version <v>] [claude args]
   `);
     process.exit(0);
   }
@@ -928,12 +934,14 @@ async function entry() {
     }
   }
 
-  // Handle version flag for passthrough
+  // Handle daemon-version-selection flag for passthrough. Renamed from
+  // --version to --x-use-version so the bare --version flag honors the
+  // POSIX convention of printing the version string and exiting (handled
+  // via CCB_CMDS above).
   let requestedVersion = null;
-  const versionIdx = process.argv.indexOf('--version');
+  const versionIdx = process.argv.indexOf('--x-use-version');
   if (versionIdx !== -1 && process.argv.length > versionIdx + 1) {
     requestedVersion = process.argv[versionIdx + 1];
-    // Remove --version <v> from args so they don't go to Claude
     process.argv.splice(versionIdx, 2);
   }
 
