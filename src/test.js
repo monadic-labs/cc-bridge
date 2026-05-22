@@ -2539,6 +2539,47 @@ async function runUnitTests() {
   assert(vwm({ type: 'error', message: 'oops' })?.message === 'oops', 'error type still works');
   assert(vwm({ type: 'ready', pid: 1, routes: 2, extensions: 3 })?.routes === 2, 'ready type still works');
 
+  // ── package.json files whitelist (P3-13) ──
+  // Guards against accidentally shipping workspace state (.claude/, .eo.json,
+  // docs/superpowers/, eslint config, browser tests) to npm consumers.
+  console.log('\npackage.json files whitelist:');
+  const pkgJsonText = fs.readFileSync(path.join(PKG_ROOT, 'package.json'), 'utf8');
+  const pkgJson = JSON.parse(pkgJsonText);
+  assert(Array.isArray(pkgJson.files), 'package.json declares a files array');
+  const filesList = pkgJson.files;
+  // Whitelist must include the runtime + postinstall + ccb --x-init template.
+  const requiredEntries = [
+    'bin/',
+    'src/',
+    'scripts/setup-user-dir.js',
+    'providers.example.json',
+    'README.md',
+    'LICENSE'
+  ];
+  for (const entry of requiredEntries) {
+    assert(filesList.includes(entry), `files whitelist includes "${entry}"`);
+  }
+  // Must NOT include workspace/dev artifacts (these would inflate the tarball
+  // and leak local state to consumers).
+  const forbiddenEntries = [
+    '.claude/',
+    '.claudeignore',
+    '.eo.json',
+    '.test-config/',
+    'CODE_MAP.json',
+    'docs/',
+    'docs/superpowers/',
+    'eslint.config.js',
+    'scripts/eslint-rules/',
+    'src/test.js-tail',
+    'test-results/',
+    'test/',
+    'test/browser/'
+  ];
+  for (const entry of forbiddenEntries) {
+    assert(!filesList.includes(entry), `files whitelist does not include "${entry}"`);
+  }
+
 }
 
 // ── Integration test (isolated daemon) ──
