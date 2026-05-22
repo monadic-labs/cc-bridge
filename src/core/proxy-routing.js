@@ -1,7 +1,8 @@
 import { RequestInfo, Option } from './types.js';
 import { redactHeaders } from './headers.js';
 import { applyRoutingWithMatch, applyAuthHeaders, extractSessionId } from './routing.js';
-import { providerIdToEnvKey, ProviderMatch } from './providers.js';
+import { ProviderMatch } from './providers.js';
+import { requireProviderApiKey } from './api-key-resolver.js';
 import { SessionInfoError, RoutingError } from './exceptions.js';
 
 /**
@@ -41,9 +42,9 @@ export async function resolveRouting({ policy, body, urlSessionId, routedHeaders
 
         const _routing = applyRoutingWithMatch(body, Option.some(_match), anthropicBaseUrl, extensions);
 
-        const envVar = providerIdToEnvKey(_match.provider.id);
-        const apiKey = process.env[envVar] ?? '';
-        const _finalHeaders = applyAuthHeaders({ headers: routedHeaders, match: _match, apiKey, openaiProviders });
+        const _keyRes = requireProviderApiKey(_match.provider.id);
+        if (!_keyRes.isSuccess) throw _keyRes.error;
+        const _finalHeaders = applyAuthHeaders({ headers: routedHeaders, match: _match, apiKey: _keyRes.value, openaiProviders });
         return { reqModel, sessionId, routing: _routing, routedHeaders: _finalHeaders, match: _match, matchedRule: null };
       }
     }
@@ -80,8 +81,9 @@ export async function resolveRouting({ policy, body, urlSessionId, routedHeaders
 
   let apiKey = '';
   if (match) {
-    const envVar = providerIdToEnvKey(match.provider.id);
-    apiKey = process.env[envVar] ?? '';
+    const keyRes = requireProviderApiKey(match.provider.id);
+    if (!keyRes.isSuccess) throw keyRes.error;
+    apiKey = keyRes.value;
   }
 
   const finalHeaders = applyAuthHeaders({ headers: routedHeaders, match, apiKey, openaiProviders });
