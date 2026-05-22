@@ -36,6 +36,7 @@ import {
   isAuthorizedRequest,
   buildSetCookieHeader
 } from './core/auth-gate.js';
+import { ConfigCache } from './core/config-cache.js';
 export { runKill };
 export { loadEnv, ProxyState };
 
@@ -196,13 +197,32 @@ export function createProxyCore({ configDir, port }) {
     }
   } catch { /* best effort */ }
 
-  function getConfig() {
+  // Eager initial load — fail loud at startup on a bad config. Subsequent
+  // hot-reloads via fs.watch are best-effort: a malformed user edit logs
+  // via errorReporter but doesn't disturb the running daemon's snapshot.
+  // Eliminates the per-request sync FS read previously paid 4-6 times per
+  // request across proxy-request, proxy-response, and proxy-upstream.
+  const configCache = (() => {
     try {
-      return loadConfigFromFile(configDir);
+      return new ConfigCache(() => loadConfigFromFile(configDir));
     } catch (e) {
       errorReporter.write(e, { operation: 'parsing config.json' });
       throw e;
     }
+  })();
+
+  function getConfig() { return configCache.get(); }
+
+  try {
+    const configPath = path.join(configDir, CONFIG_FILENAME);
+    fs.watch(configPath, () => {
+      const refreshResult = configCache.tryRefresh();
+      if (!refreshResult.isSuccess) {
+        errorReporter.write(refreshResult.error, { operation: 'config hot-reload' });
+      }
+    });
+  } catch (e) {
+    errorReporter.write(e, { operation: 'setting up config.json watcher' });
   }
 
   const currentPort = port ?? getConfig().port;

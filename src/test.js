@@ -190,6 +190,65 @@ async function runUnitTests() {
     parseAuthCookie
   } = await import('../src/core/auth-gate.js');
   const { AuthError } = await import('../src/core/exceptions.js');
+  const { ConfigCache } = await import('../src/core/config-cache.js');
+
+  // ── ConfigCache (caches ProxyConfig; tryRefresh is best-effort) ──
+  console.log('\nConfigCache:');
+  // 0 — constructor invokes loader once for the initial cache
+  let loaderCount = 0;
+  const stubConfig = (id) => ({ id, frozen: true });
+  const stableLoader = () => { loaderCount++; return stubConfig('initial'); };
+  const cache0 = new ConfigCache(stableLoader);
+  assert(loaderCount === 1, 'constructor loads once');
+  assert(cache0.get().id === 'initial', 'get returns initial');
+  // 1, N — repeated get() never re-invokes loader
+  cache0.get(); cache0.get(); cache0.get();
+  assert(loaderCount === 1, 'get N times stays at one load');
+  // tryRefresh success — cache swaps to new value
+  let nextValue = 'second';
+  const rotatingLoader = () => { loaderCount++; return stubConfig(nextValue); };
+  const cache1 = new ConfigCache(rotatingLoader);
+  assert(cache1.get().id === 'second', 'cache1 initial');
+  loaderCount = 0;
+  nextValue = 'third';
+  const refresh1 = cache1.tryRefresh();
+  assert(refresh1.isSuccess === true, 'tryRefresh success');
+  assert(loaderCount === 1, 'tryRefresh loads exactly once');
+  assert(cache1.get().id === 'third', 'cache reflects refresh');
+  // tryRefresh failure — cache unchanged
+  const failingLoader = () => { throw new ConfigError('bad config'); };
+  const stableConfig = stubConfig('stable');
+  let firstLoad = true;
+  const sometimesFailing = () => {
+    if (firstLoad) { firstLoad = false; return stableConfig; }
+    throw new ConfigError('bad on refresh');
+  };
+  const cache2 = new ConfigCache(sometimesFailing);
+  assert(cache2.get() === stableConfig, 'cache2 initial good');
+  const refresh2 = cache2.tryRefresh();
+  assert(refresh2.isSuccess === false, 'tryRefresh failure surfaced');
+  assert(refresh2.error instanceof ConfigError, 'error is ConfigError');
+  assert(cache2.get() === stableConfig, 'cache unchanged after failed refresh');
+  // N tryRefresh calls — only successful ones mutate
+  let toggle = 0;
+  const togglingLoader = () => {
+    toggle++;
+    if (toggle === 1) return stubConfig('v1');
+    if (toggle % 2 === 0) throw new ConfigError(`bad-${toggle}`);
+    return stubConfig(`v${toggle}`);
+  };
+  const cache3 = new ConfigCache(togglingLoader);
+  assert(cache3.get().id === 'v1', 'cache3 v1');
+  assert(cache3.tryRefresh().isSuccess === false, 'refresh2 fails');
+  assert(cache3.get().id === 'v1', 'still v1');
+  assert(cache3.tryRefresh().isSuccess === true, 'refresh3 succeeds');
+  assert(cache3.get().id === 'v3', 'cache3 v3');
+  // Exception — constructor with non-function loader
+  assertThrows(() => new ConfigCache(null), ArgumentError, 'null loader rejected');
+  assertThrows(() => new ConfigCache('not-a-fn'), ArgumentError, 'string loader rejected');
+  assertThrows(() => new ConfigCache({}), ArgumentError, 'object loader rejected');
+  // Exception — constructor with loader that throws → bubble (fail-loud at startup)
+  assertThrows(() => new ConfigCache(failingLoader), ConfigError, 'initial load failure bubbles');
 
   // ── AuthSecret (Value Object) ──
   console.log('\nAuthSecret:');
