@@ -749,9 +749,19 @@ const CCB_CMDS = {
   });
 }
 
+function readProxySecret() {
+  try {
+    return fs.readFileSync(path.join(LOGS_DIR, 'proxy.secret'), 'utf8').trim();
+  } catch {
+    return null;
+  }
+}
+
 function fetchSessionInfo(port, timeoutMs) {
   return new Promise((resolve) => {
-    const req = http.get(`http://localhost:${port}/__ccb_internal__/session`, { timeout: timeoutMs }, (res) => {
+    const secret = readProxySecret();
+    const headers = secret ? { 'Authorization': `Bearer ${secret}` } : {};
+    const req = http.get(`http://localhost:${port}/__ccb_internal__/session`, { timeout: timeoutMs, headers }, (res) => {
       let data = '';
       res.on('data', (chunk) => { data += chunk; });
       res.on('end', () => {

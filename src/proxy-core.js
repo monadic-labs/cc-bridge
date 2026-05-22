@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import http from 'http';
+import crypto from 'crypto';
 import { fileURLToPath, URL } from 'url';
 import {
   CCB_VERSION,
@@ -27,6 +28,14 @@ import { runKill } from './infra/process-manager.js';
 import { detectFormat, convertV2ToInternal, convertV1ToV2 } from './core/config-adapter.js';
 import { ExtensionRegistry } from './core/extension-registry.js';
 import { discoverExtensions, buildRegistry, watchExtensions } from './core/extension-loader.js';
+import { resolveGuiPath } from './core/gui-path.js';
+import { redactProviderApiKeys, hasLiteralApiKey } from './core/api-secrets.js';
+import {
+  AuthSecret,
+  isLoopbackAddress,
+  isAuthorizedRequest,
+  buildSetCookieHeader
+} from './core/auth-gate.js';
 export { runKill };
 export { loadEnv, ProxyState };
 
@@ -173,16 +182,19 @@ export function createProxyCore({ configDir, port }) {
   let totalOutputTokens = 0;
   let totalRequests = 0;
 
-  const keepaliveSecret = process.env.CCB_KEEPALIVE_SECRET ?? '';
-  if (keepaliveSecret) {
-    try {
-      fs.mkdirSync(logsDir, { recursive: true });
-      fs.writeFileSync(path.join(logsDir, 'proxy.secret'), keepaliveSecret, 'utf8');
-      if (process.platform !== 'win32') {
-        try { fs.chmodSync(path.join(logsDir, 'proxy.secret'), 0o600); } catch { /* best effort */ }
-      }
-    } catch { /* best effort */ }
-  }
+  // Always generate a secret. CCB_KEEPALIVE_SECRET overrides for watchdog-coordinated
+  // restarts (so child workers share the same secret across rolling reload); otherwise
+  // we mint a fresh 32-byte hex value on every worker start. The same secret gates
+  // every admin endpoint and is what the CLI sends as Authorization: Bearer.
+  const keepaliveSecret = process.env.CCB_KEEPALIVE_SECRET || crypto.randomBytes(32).toString('hex');
+  const authSecret = new AuthSecret(keepaliveSecret);
+  try {
+    fs.mkdirSync(logsDir, { recursive: true });
+    fs.writeFileSync(path.join(logsDir, 'proxy.secret'), keepaliveSecret, 'utf8');
+    if (process.platform !== 'win32') {
+      try { fs.chmodSync(path.join(logsDir, 'proxy.secret'), 0o600); } catch { /* best effort */ }
+    }
+  } catch { /* best effort */ }
 
   function getConfig() {
     try {
@@ -233,7 +245,9 @@ export function createProxyCore({ configDir, port }) {
 
   // ── Provider lifecycle ──
 
-  const BUILTIN_EXTENSIONS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'extensions');
+  const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+  const BUILTIN_EXTENSIONS_DIR = path.join(MODULE_DIR, 'extensions');
+  const GUI_DIR = path.join(MODULE_DIR, 'infra', 'gui');
 
   let reloadInProgress = false;
 
@@ -319,6 +333,31 @@ export function createProxyCore({ configDir, port }) {
 
   const lastCtxPerSocket = new WeakMap();
 
+  // URLs that require BOTH loopback + auth (admin surface). The GUI is a
+  // separate, loopback-only-but-not-auth-gated bootstrap path so the browser
+  // can receive its Set-Cookie before issuing /api/* fetches.
+  function urlClassification(rawUrl) {
+    const urlPath = rawUrl.split('?')[0].split('#')[0];
+    if (urlPath.startsWith('/gui')) return 'gui';
+    if (urlPath.startsWith('/api/')) return 'admin_authed';
+    if (urlPath === '/__ccb_internal__/status') return 'admin_authed';
+    if (urlPath === '/__ccb_internal__/session') return 'admin_authed';
+    // Keepalive uses its own x-ccb-keepalive-secret header (kept for backwards
+    // compatibility with the existing CLI client) but is still loopback-only.
+    if (urlPath === '/__ccb_internal__/keepalive') return 'admin_loopback';
+    return 'public';
+  }
+
+  function rejectNonLoopback(res) {
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { type: 'auth_error', code: 'non_loopback_admin', message: 'Admin endpoints accept loopback connections only. The proxy service (model routing) is on the LAN per bindHost; admin remains workstation-only.' } }));
+  }
+
+  function rejectUnauthorized(res, authError) {
+    res.writeHead(authError.httpStatus, { 'content-type': 'application/json' });
+    res.end(authError.toResponsePayload());
+  }
+
   function createRequestHandler() {
     return (req, res) => {
       // Browsers auto-request /favicon.ico. We don't ship one — return a
@@ -330,12 +369,30 @@ export function createProxyCore({ configDir, port }) {
         return;
       }
 
+      // ── Admin gate ── (runs before all admin handlers; service endpoints pass through)
+      const classification = urlClassification(req.url);
+      if (classification === 'gui' || classification === 'admin_authed' || classification === 'admin_loopback') {
+        if (!isLoopbackAddress(req.socket?.remoteAddress)) {
+          rejectNonLoopback(res);
+          return;
+        }
+      }
+      if (classification === 'admin_authed') {
+        const authResult = isAuthorizedRequest(req, authSecret);
+        if (!authResult.isSuccess) {
+          rejectUnauthorized(res, authResult.error);
+          return;
+        }
+      }
+
       // ── GUI Static Files ──
       if (req.method === 'GET' && req.url.startsWith('/gui')) {
-        let filePath = req.url === '/gui' || req.url === '/gui/'
-          ? path.join(BUILTIN_EXTENSIONS_DIR, '..', 'infra', 'gui', 'index.html')
-          : path.join(BUILTIN_EXTENSIONS_DIR, '..', 'infra', 'gui', req.url.replace('/gui/', ''));
-
+        const filePath = resolveGuiPath(GUI_DIR, req.url);
+        if (filePath === null) {
+          res.writeHead(404);
+          res.end('Not Found');
+          return;
+        }
         fs.readFile(filePath, (err, data) => {
           if (err) {
             res.writeHead(404);
@@ -344,7 +401,10 @@ export function createProxyCore({ configDir, port }) {
           }
           const ext = path.extname(filePath);
           const contentType = ext === '.html' ? 'text/html' : ext === '.js' ? 'text/javascript' : 'text/plain';
-          res.writeHead(200, { 'Content-Type': contentType });
+          res.writeHead(200, {
+            'Content-Type': contentType,
+            'Set-Cookie': buildSetCookieHeader(authSecret)
+          });
           res.end(data);
         });
         return;
@@ -362,7 +422,7 @@ export function createProxyCore({ configDir, port }) {
           try {
             const raw = JSON.parse(stripBom(data));
             const normalized = detectFormat(raw) === 'v1' ? convertV1ToV2(raw) : raw;
-            payload = JSON.stringify(normalized);
+            payload = JSON.stringify(redactProviderApiKeys(normalized));
           } catch {
             // Pass raw through; the GUI will surface the parse error.
           }
@@ -398,15 +458,22 @@ export function createProxyCore({ configDir, port }) {
         let body = '';
         req.on('data', chunk => body += chunk);
         req.on('end', () => {
+          let parsed;
           try {
-            JSON.parse(body); // Validate JSON
-            fs.writeFileSync(providersPath, body, 'utf8');
-            res.writeHead(200);
-            res.end('OK');
+            parsed = JSON.parse(body);
           } catch {
             res.writeHead(400);
             res.end('Invalid JSON');
+            return;
           }
+          if (hasLiteralApiKey(parsed)) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: { type: 'literal_api_key_refused', message: 'Refusing to persist a literal apiKey. Use "ENV:<VAR_NAME>" to reference an env var, or set the key via `ccb --x-key set <provider>` and omit apiKey from the config.' } }));
+            return;
+          }
+          fs.writeFileSync(providersPath, body, 'utf8');
+          res.writeHead(200);
+          res.end('OK');
         });
         return;
       }
@@ -641,7 +708,7 @@ function listenOnce(server, opts) {
   });
 }
 
-async function bindWorkerServer(server, basePort) {
+async function bindWorkerServer(server, basePort, bindHost) {
   const candidates = [];
   for (let i = 0; i < WORKER_PORT_FALLBACK_RANGE; i++) candidates.push(basePort + i);
   candidates.push(0);
@@ -652,8 +719,8 @@ async function bindWorkerServer(server, basePort) {
   for (const port of candidates) {
     try {
       const opts = useReusePort
-        ? { port, host: '0.0.0.0', reusePort: true }
-        : { port, host: '0.0.0.0' };
+        ? { port, host: bindHost, reusePort: true }
+        : { port, host: bindHost };
       await listenOnce(server, opts);
       return { port: server.address().port, reusePort: useReusePort };
     } catch (err) {
@@ -668,7 +735,7 @@ async function bindWorkerServer(server, basePort) {
         }
         // Retry the same port immediately — don't skip past basePort.
         try {
-          await listenOnce(server, { port, host: '0.0.0.0' });
+          await listenOnce(server, { port, host: bindHost });
           return { port: server.address().port, reusePort: false };
         } catch (retryErr) {
           if (retryErr.code !== 'EADDRINUSE') throw retryErr;
@@ -709,7 +776,7 @@ export function runWorkerMode({ configDir, port }) {
     server = http.createServer(core.createRequestHandler());
     let bindResult;
     try {
-      bindResult = await bindWorkerServer(server, basePort);
+      bindResult = await bindWorkerServer(server, basePort, config.bindHost);
     } catch (e) {
       process.stderr.write(`[worker] Bind failed: ${e.message}\n`);
       if (process.send) process.send({ type: 'error', message: e.message });

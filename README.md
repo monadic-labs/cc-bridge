@@ -185,6 +185,7 @@ Port, daemon timing, and logging settings. Created automatically by `--x-init`. 
 | :--- | :--- | :--- |
 | `port` | 9099 | Port the proxy daemon listens on |
 | `anthropicBaseUrl` | `"https://api.anthropic.com"` | Base URL for unmatched (Anthropic) requests. Override for enterprise gateways or VPC endpoints. |
+| `daemon.bindHost` | `"127.0.0.1"` | Interface the HTTP listener binds to. Defaults to loopback. Setting to `"0.0.0.0"` is an explicit opt-in to LAN exposure of the proxy and its management endpoints — pair with the auth gate before doing so. |
 | `daemon.healthCheckTimeoutMs` | 500 | Socket timeout (ms) for health-check probes during startup |
 | `daemon.pollIntervalMs` | 300 | Interval (ms) between startup health-check retries |
 | `daemon.pollMaxAttempts` | 10 | Maximum number of startup health-check retries |

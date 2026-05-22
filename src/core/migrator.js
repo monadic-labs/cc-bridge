@@ -18,6 +18,10 @@ export const DEFAULT_RAW_CONFIG = {
     drainTimeoutMs: 600000,
     workerKeepaliveS: -1,
     ipcTimeoutMs: 5000,
+    // Interface the HTTP listener binds to. Loopback by default; setting to
+    // '0.0.0.0' is an explicit opt-in to LAN exposure of the proxy and its
+    // management endpoints — combine with the auth gate on /api/* before doing so.
+    bindHost: '127.0.0.1',
     // Hard ceiling the CLI waits for the worker to start, reach the bound
     // port, finish initProviders, and report 'ready'. Real-world cold starts
     // include filesystem walks + dynamic imports of every extension; 60s
