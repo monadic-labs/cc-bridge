@@ -13,25 +13,21 @@ import { parseIpcMessage, serializeIpcMessage, validateWorkerMessage, validateCo
 import { loadConfigFromFile } from '../src/core/config.js';
 import { CONFIG_FILENAME } from '../src/core/constants.js';
 import { ConfigCache } from '../src/core/config-cache.js';
+import { WatchdogState } from '../src/core/watchdog-state.js';
 import { spawnDaemon } from '../src/infra/process-manager.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_SCRIPT = path.join(__dirname, '..', 'src', 'proxy.js');
 
-let activeWorker = null;
-let activePort = null;
-// Whether the active worker bound with SO_REUSEPORT. When false (Windows /
-// older kernels), parallel restart isn't possible — the new worker can't
-// bind the same port while the old one still holds it. Triggers sequential
-// restart in triggerRestart().
-let activeReusePort = true;
-let shuttingDown = false;
-let workerDraining = false;
-let shutdownTimer = null;
-let keepaliveGraceTimer = null;
+// All daemon-lifecycle state lives in this single instance — the watchdog's
+// state machine. Module scope holds the instance, not the fields. See
+// src/core/watchdog-state.js for the cohesion-exception rationale.
+// SO_REUSEPORT support is recorded in state.activeReusePort; when false
+// (Windows / older kernels), parallel restart can't happen — the new worker
+// can't bind the same port while the old one still holds it. Triggers
+// sequential restart in triggerRestart().
+const state = new WatchdogState();
 const KEEPALIVE_GRACE_MS = 5000;
-let restartInProgress = false;
-let consecutiveCrashCount = 0;
 const MAX_CONSECUTIVE_CRASHES = 5;
 const CRASH_WINDOW_MS = 10000;
 
@@ -100,19 +96,18 @@ function removeRuntimeFile() {
 }
 
 async function triggerRestart(source) {
-  if (restartInProgress) {
+  if (!state.beginRestart()) {
     log(`Restart requested via ${source} — ignored (already in progress)`);
     return false;
   }
-  restartInProgress = true;
   log(`Restart requested via ${source}`);
 
-  if (!activeReusePort) {
+  if (!state.activeReusePort) {
     // Sequential restart: tell old worker to drain + wait for it to exit
     // BEFORE spawning new. Without SO_REUSEPORT the kernel won't let two
     // processes bind the same port simultaneously, so the new worker would
     // fail with EADDRINUSE.
-    const oldWorker = activeWorker;
+    const oldWorker = state.activeWorker;
     if (oldWorker) {
       const oldPid = oldWorker.pid;
       const config = getConfig();
@@ -126,17 +121,17 @@ async function triggerRestart(source) {
         }, config.drainTimeoutMs);
         oldWorker.on('exit', () => { clearTimeout(timeout); resolve(); });
       });
-      activeWorker = null;
+      state.unbindWorker();
     }
     const fresh = await spawnWorker();
-    activeWorker = fresh;
+    state.bindWorker(fresh);
     return true;
   }
 
   // Parallel restart: old worker keeps serving while the new one comes up.
   // SO_REUSEPORT lets the kernel load-balance accepts between them.
-  if (activeWorker) {
-    const oldWorker = activeWorker;
+  if (state.activeWorker) {
+    const oldWorker = state.activeWorker;
     const oldKeepalives = countKeepalivesFor(oldWorker);
     drainingWorkers.set(oldWorker, {
       keepaliveCount: oldKeepalives,
@@ -146,7 +141,7 @@ async function triggerRestart(source) {
     log(`Moved active worker (PID ${oldWorker.pid}) to draining (${oldKeepalives} keepalives)`);
   }
   const fresh = await spawnWorker();
-  activeWorker = fresh;
+  state.bindWorker(fresh);
   return true;
 }
 
@@ -159,7 +154,7 @@ async function spawnWorker() {
   // workers reuse that port through env CCB_DAEMON_PORT so we don't walk
   // the fallback range every time.
   const env = { ...process.env, CCB_DAEMON_WORKER: '1' };
-  if (activePort) env.CCB_DAEMON_PORT = String(activePort);
+  if (state.activePort) env.CCB_DAEMON_PORT = String(state.activePort);
 
   const child = spawnDaemon(WORKER_SCRIPT, [], {
     stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
@@ -187,29 +182,27 @@ async function spawnWorker() {
 
     if (workerMsg.type === 'ready') {
       clearTimeout(initTimeout);
-      restartInProgress = false;
-      consecutiveCrashCount = 0;
+      state.endRestart();
       child._readyAt = Date.now();
       // First-ready: record the worker's chosen port and write runtime.json.
-      if (typeof workerMsg.port === 'number' && (!activePort || activePort !== workerMsg.port)) {
-        const previous = activePort;
-        activePort = workerMsg.port;
-        writeRuntimeFile(activePort);
+      if (typeof workerMsg.port === 'number' && (!state.activePort || state.activePort !== workerMsg.port)) {
+        const previous = state.recordPort(workerMsg.port);
+        writeRuntimeFile(state.activePort);
         if (!previous) {
-          const fallbackNote = activePort === config.port
+          const fallbackNote = state.activePort === config.port
             ? ''
             : ` (configured ${config.port} was unavailable)`;
-          log(`Active port: ${activePort}${fallbackNote}`);
+          log(`Active port: ${state.activePort}${fallbackNote}`);
         }
       }
       if (typeof workerMsg.reusePort === 'boolean') {
-        if (activeReusePort && !workerMsg.reusePort) {
+        const previousReusePort = state.recordReusePort(workerMsg.reusePort);
+        if (previousReusePort && !workerMsg.reusePort) {
           log('SO_REUSEPORT unsupported on this OS — restart will be sequential (brief connection-refused window).');
         }
-        activeReusePort = workerMsg.reusePort;
       }
       log(`Worker ready (PID ${workerMsg.pid}, ${workerMsg.routes} routes, ${workerMsg.extensions} extensions)`);
-      readyResolve({ child, port: activePort });
+      readyResolve({ child, port: state.activePort });
 
       // Drain old workers only after new worker is confirmed ready
       if (drainingWorkers.size > 0) {
@@ -259,22 +252,22 @@ async function spawnWorker() {
       return;
     }
 
-    if (child === activeWorker && !shuttingDown && !workerDraining) {
+    if (state.isActiveWorker(child) && !state.isShuttingDown && !state.isWorkerDraining) {
       const now = Date.now();
       if (code !== 0 || !child._readyAt || (now - child._readyAt) < CRASH_WINDOW_MS) {
-        consecutiveCrashCount++;
+        state.incrementCrashCount();
       }
       if (code === 0 && child._readyAt && (now - child._readyAt) >= CRASH_WINDOW_MS) {
-        consecutiveCrashCount = 0;
+        state.resetCrashCount();
       }
 
-      if (consecutiveCrashCount >= MAX_CONSECUTIVE_CRASHES) {
+      if (state.consecutiveCrashCount >= MAX_CONSECUTIVE_CRASHES) {
         log(`${MAX_CONSECUTIVE_CRASHES} consecutive worker crashes, giving up. Check daemon.err for details.`);
         process.exit(1);
       }
 
-      log(`Active worker died unexpectedly, respawning... (crash ${consecutiveCrashCount}/${MAX_CONSECUTIVE_CRASHES})`);
-      spawnWorker().then((w) => { activeWorker = w; }).catch((e) => {
+      log(`Active worker died unexpectedly, respawning... (crash ${state.consecutiveCrashCount}/${MAX_CONSECUTIVE_CRASHES})`);
+      spawnWorker().then((w) => { state.bindWorker(w); }).catch((e) => {
         log(`Failed to respawn worker: ${e.message}`);
         process.exit(1);
       });
@@ -320,19 +313,16 @@ function handleControlConnection(socket) {
 
       if (cmd.cmd === 'keepalive') {
         keepaliveConnections.add(socket);
-        if (activeWorker) {
-          socketWorkerMap.set(socket, activeWorker);
+        if (state.activeWorker) {
+          socketWorkerMap.set(socket, state.activeWorker);
         }
-        if (keepaliveGraceTimer) {
-          clearTimeout(keepaliveGraceTimer);
-          keepaliveGraceTimer = null;
+        if (state.hasKeepaliveGraceTimer) {
+          state.clearKeepaliveGraceTimer();
           log('Keepalive grace cancelled by reconnect');
         }
-        if (shutdownTimer) {
-          clearTimeout(shutdownTimer);
-          shutdownTimer = null;
-          shuttingDown = false;
-          workerDraining = false;
+        if (state.hasShutdownTimer) {
+          state.clearShutdownTimer();
+          state.cancelShutdown();
           log('Shutdown cancelled by new keepalive');
         }
         socket.write(serializeIpcMessage({ status: 'ok', cmd: 'keepalive' }));
@@ -342,7 +332,7 @@ function handleControlConnection(socket) {
       if (cmd.cmd === 'status') {
         socket.write(serializeIpcMessage({
           status: 'ok',
-          workerPid: activeWorker ? activeWorker.pid : null,
+          workerPid: state.activeWorker ? state.activeWorker.pid : null,
           uptimeMs: Date.now() - startTime,
           keepalives: keepaliveConnections.size,
           drainingWorkers: drainingWorkers.size
@@ -353,12 +343,12 @@ function handleControlConnection(socket) {
       if (cmd.cmd === 'sessions') {
         const workers = [];
         const config = getConfig();
-        if (activeWorker) {
+        if (state.activeWorker) {
           workers.push({
-            pid: activeWorker.pid,
+            pid: state.activeWorker.pid,
             version: CCB_VERSION,
             uptimeMs: Date.now() - startTime,
-            keepalives: countKeepalivesFor(activeWorker),
+            keepalives: countKeepalivesFor(state.activeWorker),
             status: 'active'
           });
         }
@@ -391,10 +381,10 @@ function handleControlConnection(socket) {
 
       if (cmd.cmd === 'shutdown') {
         log('Shutdown requested via IPC');
-        shuttingDown = true;
+        state.beginShutdown();
         const config = getConfig();
-        if (activeWorker) {
-          activeWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
+        if (state.activeWorker) {
+          state.activeWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
         }
         for (const [worker] of drainingWorkers) {
           worker.send({ type: 'drain', timeout: config.drainTimeoutMs });
@@ -431,28 +421,27 @@ function handleControlConnection(socket) {
     }
 
     // Newest worker: shut down when last keepalive closes (with grace period)
-    if (assignedWorker === activeWorker && keepaliveConnections.size === 0 && !shuttingDown) {
-      const activeKeepalives = countKeepalivesFor(activeWorker);
+    if (state.isActiveWorker(assignedWorker) && keepaliveConnections.size === 0 && !state.isShuttingDown) {
+      const activeKeepalives = countKeepalivesFor(state.activeWorker);
       if (activeKeepalives === 0) {
         log(`Last keepalive closed, starting ${KEEPALIVE_GRACE_MS}ms grace before shutdown`);
-        keepaliveGraceTimer = setTimeout(() => {
-          keepaliveGraceTimer = null;
+        state.setKeepaliveGraceTimer(setTimeout(() => {
+          state.setKeepaliveGraceTimer(null);
           if (keepaliveConnections.size > 0) {
             log('Grace period ended but new keepalive arrived, cancelling shutdown');
             return;
           }
-          shuttingDown = true;
-          workerDraining = true;
+          state.beginShutdown({ draining: true });
           log('Grace period expired, shutting down');
           const config = getConfig();
-          if (activeWorker) {
-            activeWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
+          if (state.activeWorker) {
+            state.activeWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
           }
-          shutdownTimer = setTimeout(() => {
-            shutdownTimer = null;
+          state.setShutdownTimer(setTimeout(() => {
+            state.setShutdownTimer(null);
             process.exit(0);
-          }, config.drainTimeoutMs + 1000);
-        }, KEEPALIVE_GRACE_MS);
+          }, config.drainTimeoutMs + 1000));
+        }, KEEPALIVE_GRACE_MS));
       }
     }
   });
@@ -465,14 +454,15 @@ function handleControlConnection(socket) {
 
 (async () => {
   try {
-    activeWorker = await spawnWorker();
-    await activeWorker._readyPromise; // populates activePort
+    const worker = await spawnWorker();
+    state.bindWorker(worker);
+    await worker._readyPromise; // populates state.activePort
   } catch (err) {
     log(`Failed to start worker: ${err.message}`);
     process.exit(1);
   }
 
-  const ipcPath = getControlIpcPath(activePort);
+  const ipcPath = getControlIpcPath(state.activePort);
   const controlServer = net.createServer(handleControlConnection);
 
   controlServer.listen(ipcPath, () => {
@@ -486,12 +476,11 @@ function handleControlConnection(socket) {
 })();
 
 function gracefulShutdown(signal) {
-  shuttingDown = true;
-  workerDraining = true;
+  state.beginShutdown({ draining: true });
   log(`${signal} received, shutting down`);
   const config = getConfig();
-  if (activeWorker) {
-    activeWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
+  if (state.activeWorker) {
+    state.activeWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
   }
   for (const [worker] of drainingWorkers) {
     worker.send({ type: 'drain', timeout: config.drainTimeoutMs });
