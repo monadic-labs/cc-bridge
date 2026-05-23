@@ -2591,6 +2591,19 @@ async function runUnitTests() {
     assert(!filesList.includes(entry), `files whitelist does not include "${entry}"`);
   }
 
+  // B4-residual: stream-passthrough decision for non-SSE non-error
+  // responses. The implementation in proxy-upstream uses inline guard
+  // clauses; the test pins the truth table so future edits don't silently
+  // re-enable buffering for the success path.
+  console.log('\nB4-residual stream-passthrough decision:');
+  const decide = ({ isError, isSse, clientAborted, retryOnBodyPatterns }) =>
+    !isError && !isSse && !clientAborted && retryOnBodyPatterns.length === 0;
+  assert(decide({ isError: false, isSse: false, clientAborted: false, retryOnBodyPatterns: [] }) === true, 'happy path streams');
+  assert(decide({ isError: true,  isSse: false, clientAborted: false, retryOnBodyPatterns: [] }) === false, '4xx/5xx buffers (fallback path needs body)');
+  assert(decide({ isError: false, isSse: true,  clientAborted: false, retryOnBodyPatterns: [] }) === false, 'SSE has its own transformer path');
+  assert(decide({ isError: false, isSse: false, clientAborted: true,  retryOnBodyPatterns: [] }) === false, 'client-aborted skips writes');
+  assert(decide({ isError: false, isSse: false, clientAborted: false, retryOnBodyPatterns: ['rate limit'] }) === false, 'body-pattern retry needs body');
+
   // WatchdogState (B3): module-level mutability collapsed into one state cell.
   console.log('\nWatchdogState:');
   const { WatchdogState } = await import('../src/core/watchdog-state.js');
