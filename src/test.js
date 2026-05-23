@@ -2591,6 +2591,86 @@ async function runUnitTests() {
     assert(!filesList.includes(entry), `files whitelist does not include "${entry}"`);
   }
 
+  // WatchdogState (B3): module-level mutability collapsed into one state cell.
+  console.log('\nWatchdogState:');
+  const { WatchdogState } = await import('../src/core/watchdog-state.js');
+  const ws1 = new WatchdogState();
+  // Initial state
+  assert(ws1.activeWorker === null, 'initial activeWorker null');
+  assert(ws1.activePort === null, 'initial activePort null');
+  assert(ws1.activeReusePort === true, 'initial activeReusePort true');
+  assert(ws1.consecutiveCrashCount === 0, 'initial crash count 0');
+  assert(ws1.isShuttingDown === false, 'not shutting down initially');
+  assert(ws1.isWorkerDraining === false, 'not draining initially');
+  assert(ws1.isRestartInProgress === false, 'no restart in progress initially');
+  assert(ws1.hasShutdownTimer === false, 'no shutdown timer initially');
+  assert(ws1.hasKeepaliveGraceTimer === false, 'no keepalive grace timer initially');
+
+  // Restart transitions
+  assert(ws1.beginRestart() === true, 'first beginRestart returns true');
+  assert(ws1.isRestartInProgress === true, 'restart in progress after beginRestart');
+  assert(ws1.beginRestart() === false, 'second beginRestart returns false (guard)');
+  ws1.endRestart();
+  assert(ws1.isRestartInProgress === false, 'endRestart clears flag');
+  assert(ws1.consecutiveCrashCount === 0, 'endRestart resets crash count');
+
+  // Crash count
+  assert(ws1.incrementCrashCount() === 1, 'incrementCrashCount returns new count');
+  ws1.incrementCrashCount();
+  assert(ws1.consecutiveCrashCount === 2, 'crash count accumulates');
+  ws1.resetCrashCount();
+  assert(ws1.consecutiveCrashCount === 0, 'resetCrashCount clears');
+
+  // Worker binding
+  const fakeChild = { pid: 1234, send: () => {} };
+  ws1.bindWorker(fakeChild);
+  assert(ws1.activeWorker === fakeChild, 'bindWorker stores child');
+  assert(ws1.isActiveWorker(fakeChild) === true, 'isActiveWorker positive');
+  const otherChild = { pid: 5678 };
+  assert(ws1.isActiveWorker(otherChild) === false, 'isActiveWorker negative');
+  ws1.unbindWorker();
+  assert(ws1.activeWorker === null, 'unbindWorker clears handle');
+
+  // Port + reusePort
+  assert(ws1.recordPort(9100) === null, 'recordPort returns previous (was null)');
+  assert(ws1.activePort === 9100, 'activePort recorded');
+  assert(ws1.recordPort(9101) === 9100, 'recordPort returns previous value');
+  assert(ws1.recordReusePort(false) === true, 'recordReusePort returns previous (was true)');
+  assert(ws1.activeReusePort === false, 'activeReusePort updated');
+
+  // Shutdown phase
+  ws1.beginShutdown();
+  assert(ws1.isShuttingDown === true, 'beginShutdown sets shutting down');
+  assert(ws1.isWorkerDraining === false, 'beginShutdown without draining');
+  ws1.cancelShutdown();
+  assert(ws1.isShuttingDown === false, 'cancelShutdown clears both flags');
+  assert(ws1.isWorkerDraining === false, 'cancelShutdown clears draining');
+  ws1.beginShutdown({ draining: true });
+  assert(ws1.isWorkerDraining === true, 'beginShutdown with draining sets draining');
+
+  // Shutdown timer — pass a sentinel; clearTimeout tolerates non-Timer args.
+  const ws2 = new WatchdogState();
+  const fakeShutdownTimer = { _testSentinel: 'shutdown' };
+  ws2.setShutdownTimer(fakeShutdownTimer);
+  assert(ws2.hasShutdownTimer === true, 'shutdown timer set');
+  ws2.clearShutdownTimer();
+  assert(ws2.hasShutdownTimer === false, 'shutdown timer cleared');
+
+  // Keepalive grace timer
+  const ws3 = new WatchdogState();
+  const fakeGraceTimer = { _testSentinel: 'grace' };
+  ws3.setKeepaliveGraceTimer(fakeGraceTimer);
+  assert(ws3.hasKeepaliveGraceTimer === true, 'keepalive grace timer set');
+  ws3.clearKeepaliveGraceTimer();
+  assert(ws3.hasKeepaliveGraceTimer === false, 'keepalive grace timer cleared');
+
+  // Private fields: no leakage via Object.keys or property access
+  const ws4 = new WatchdogState();
+  ws4.bindWorker({ pid: 99 });
+  const exposedKeys = Object.keys(ws4);
+  assert(exposedKeys.length === 0, 'WatchdogState exposes no enumerable instance fields');
+  assert(ws4['#activeWorker'] === undefined, 'private fields are not accessible by string');
+
   // Test-rebuild items 16/17: log-based fallback oracle parses the proxy's
   // session.log format. The oracle is the safety net when the Claude CLI's
   // TUI render races against the assertion clock.
