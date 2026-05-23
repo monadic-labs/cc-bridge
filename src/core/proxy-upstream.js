@@ -203,6 +203,20 @@ function handleProxyResponse({ reqCtx, proxyRes, headers, handleResponseEnd, err
     transformer = new SseResponseTransformer(extensions, provider);
   }
 
+  // B4-residual: when the response is non-SSE, non-error, and not subject
+  // to body-pattern retry, we can pass chunks through to the client as
+  // they arrive instead of buffering until proxyRes 'end'. The accumulator
+  // still feeds the logger; the client just sees first-byte latency
+  // dominated by upstream TTFB rather than upstream-completion time.
+  const retryConfig = getConfig().retry;
+  const canStreamPassthrough = !isError && !isSse
+    && !reqCtx.clientAborted
+    && retryConfig.retryOnBodyPatterns.length === 0;
+  if (canStreamPassthrough) {
+    const passthroughHeaders = filterResponseHeaders(proxyRes.headers);
+    reqCtx.res.writeHead(proxyRes.statusCode, passthroughHeaders);
+  }
+
   proxyRes.on('data', (chunk) => {
     if (reqCtx.clientAborted) return;
     chunks.push(chunk);
@@ -210,7 +224,9 @@ function handleProxyResponse({ reqCtx, proxyRes, headers, handleResponseEnd, err
     if (transformer) {
       const transformed = transformer.transformChunk(chunk.toString());
       if (transformed) reqCtx.res.write(transformed);
+      return;
     }
+    if (canStreamPassthrough) reqCtx.res.write(chunk);
   });
 
   proxyRes.on('end', () => {
