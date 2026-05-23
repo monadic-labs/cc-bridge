@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and exits 0.
 - `daemon.bindHost` config option (default `127.0.0.1`).
 - `SessionMetrics` and `KeepaliveState` value objects.
+- `WatchdogState` value object encapsulating the daemon supervisor's
+  nine lifecycle fields behind named transition methods (no more
+  module-level mutable bindings in `bin/ccb-watchdog.js`).
 - `ConfigCache` with eager initial load (fail-loud at startup) and
   best-effort `tryRefresh()` for hot-reload.
 - SSE metadata accumulator threaded through `SseResponseTransformer` so
@@ -37,6 +40,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DEFAULT_RAW_PROVIDERS` ships complete `models` + `toolTransforms`
   entries, and `ensureCompleteProviders` fills these per-provider for
   sparse user input.
+- Non-SSE non-error responses now stream chunks to the client as they
+  arrive instead of buffering until the upstream completes — TTFB
+  improves from upstream-completion time to upstream-TTFB time. The
+  fallback / retry / SSE / error paths still buffer (they need the full
+  body to decide what to do next).
+- Integration tests inspect the proxy's session log when the TUI-based
+  oracle times out. When the Claude CLI input-buffer race prevents the
+  test from sending its prompt at all, the assertion resolves to
+  `INCONCLUSIVE` (warning, suite stays green) instead of `FAIL`.
 
 ### Removed
 - Workspace artifacts (`.claude/`, `.eo.json`, `CODE_MAP.json`,
@@ -44,7 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test-results/`, `test/browser/`, `src/test.js-tail`) no longer ship
   in the published npm tarball. Explicit `files` whitelist:
   `bin/`, `src/`, `scripts/setup-user-dir.js`, `providers.example.json`,
-  `README.md`, `LICENSE`.
+  `README.md`, `LICENSE`, `CHANGELOG.md`.
 
 ## [2.0.0] - Unreleased
 
