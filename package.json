@@ -1,6 +1,6 @@
 {
   "name": "@monadic-labs/ccb",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "type": "module",
   "description": "A local HTTP proxy for Claude Code to route requests to multiple providers.",
   "main": "src/proxy-core.js",

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-06-11
+
+### Fixed
+- Upstream requests strip `accept-encoding` on every path, not only
+  custom-provider routes. The proxy re-emits SSE responses as text, so a
+  compressed body on the Anthropic OAuth-passthrough path was corrupted
+  and surfaced a `ZlibError` on the client; the passthrough path now
+  matches the custom-provider behaviour.
+- Per-request input-token counts read from `message_delta` when a provider
+  reports them there. z.ai sends `input_tokens: 0` in `message_start` and
+  the real count in `message_delta`, which previously showed `in:0` in the
+  session summary. Guarded so a correct `message_start` value is never
+  overwritten by a zero or absent delta.
+
 ### Security
 - Admin surface hardening: HTTP listener now binds to `127.0.0.1` by default
   (opt-in LAN exposure via `daemon.bindHost: '0.0.0.0'`); `/api/*`, `/gui`,
@@ -65,5 +79,6 @@ proxy for the Claude Code CLI with v2 provider/route config schema,
 loopback-only admin surface, multi-provider OAuth-preserving routing,
 and per-session log subdirectories.
 
-[Unreleased]: https://github.com/monadic-labs/cc-bridge/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/monadic-labs/cc-bridge/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/monadic-labs/cc-bridge/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/monadic-labs/cc-bridge/releases/tag/v2.0.0
