@@ -118,7 +118,11 @@ function singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, getConfig
   const isOpenaiFormat = !!(openaiProviders && providerId && openaiProviders[providerId]?.format === 'openai');
   const target = resolveUpstreamUrl(ctx.targetBase, ctx.req.url, ctx.isCustom, isOpenaiFormat);
   const finalHeaders = { ...ctx.routedHeaders, host: target.host, 'content-length': String(ctx.forwardBody.length) };
-  if (ctx.isCustom) delete finalHeaders['accept-encoding'];
+  // A transforming proxy must never receive a compressed body it re-emits as
+  // plain text / SSE chunks — the client would get garbled output or a
+  // ZlibError. Strip accept-encoding unconditionally; the upstream must always
+  // return an uncompressed body regardless of path (isCustom or Anthropic OAuth).
+  delete finalHeaders['accept-encoding'];
 
   const transport = target.protocol === 'https:' ? https : http;
   const defaultPort = target.protocol === 'https:' ? 443 : 80;

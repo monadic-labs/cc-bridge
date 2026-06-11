@@ -55,6 +55,7 @@ export const getMessageStartInputTokens = evt => evt?.message?.usage?.[schema.me
 // ─── message_delta event ─────────────────────────────────────────────────────
 
 export const getMessageDeltaOutputTokens = evt => evt?.usage?.[schema.messageDeltaEvent.outputTokens] ?? 0;
+export const getMessageDeltaInputTokens  = evt => evt?.usage?.[schema.messageDeltaEvent.inputTokens]  ?? 0;
 
 // ─── Signature heuristic ─────────────────────────────────────────────────────
 //

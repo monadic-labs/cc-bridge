@@ -4,7 +4,7 @@ import {
   getMessageStartModel, getMessageStartInputTokens,
   getSseContentBlock, getSseDelta, getSseError,
   getBlockType, getBlockName, getBlockSignature,
-  getDeltaStopReason, getMessageDeltaOutputTokens,
+  getDeltaStopReason, getMessageDeltaOutputTokens, getMessageDeltaInputTokens,
 } from './api-adapter.js';
 
 function parseSseLine(line) {
@@ -41,6 +41,12 @@ const SSE_HANDLERS = Object.freeze({
   message_delta(evt, acc) {
     acc.stopReason = getDeltaStopReason(getSseDelta(evt));
     acc.outputTokens = getMessageDeltaOutputTokens(evt);
+    // Some providers (e.g. z.ai) report the real input_tokens in message_delta
+    // rather than message_start (where they send 0). Only adopt the delta value
+    // when it is finite and > 0 so a correct message_start count is never
+    // clobbered by a missing or zero delta field.
+    const deltaIn = getMessageDeltaInputTokens(evt);
+    if (Number.isFinite(deltaIn) && deltaIn > 0) acc.inputTokens = deltaIn;
   },
   error(evt, acc) {
     acc.error = getSseError(evt);

@@ -2714,6 +2714,157 @@ async function runUnitTests() {
   assert(oracleRouteMatch[1] === 'https://test-provider.example.com/v1/messages', 'oracle extracts route URL');
   fs.rmSync(logSampleDir, { recursive: true, force: true });
 
+  // ── FIX 1: forwardToUpstream strips accept-encoding on all paths ──
+  // A transforming proxy must never receive a compressed body it re-emits as
+  // text/chunks. Strip accept-encoding from every upstream request regardless
+  // of isCustom, so the upstream always returns a plaintext/chunked body.
+  console.log('\nforwardToUpstream strips accept-encoding:');
+  {
+    const { forwardToUpstream } = await import('../src/core/proxy-upstream.js');
+    const { ProxyRequestContext } = await import('../src/core/types.js');
+
+    // Fake upstream: records headers from the first request it receives.
+    async function spawnFakeUpstream() {
+      let resolve;
+      const headersPromise = new Promise((r) => { resolve = r; });
+      const server = http.createServer((req, res) => {
+        resolve(req.headers);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{}');
+      });
+      await new Promise((r) => server.listen(0, '127.0.0.1', r));
+      const port = server.address().port;
+      return { server, port, headersPromise };
+    }
+
+    const { EventEmitter } = await import('events');
+
+    // Build a minimal ProxyRequestContext wired to a fake req/res pair.
+    function makeCtx(fakeServer, isCustom) {
+      const fakeReq = Object.assign(
+        new EventEmitter(),
+        { aborted: false, socket: null, method: 'POST', url: '/v1/messages', headers: {} }
+      );
+      const fakeRes = Object.assign(
+        new EventEmitter(),
+        { destroyed: false, headersSent: false, writeHead() {}, write() {}, end() {}, writableEnded: false }
+      );
+      const base = new ProxyRequestContext({ req: fakeReq, res: fakeRes, id: 1, startTime: Date.now(), urlSessionId: '' });
+      return base.withRouting({
+        routeLabel: 'test',
+        reqModel: 'test-model',
+        sessionId: '',
+        routedHeaders: { 'accept-encoding': 'gzip, br, zstd', 'content-type': 'application/json' },
+        forwardBody: Buffer.from('{}'),
+        targetBase: `http://127.0.0.1:${fakeServer.port}`,
+        isCustom,
+      });
+    }
+
+    const fakeGetConfig = () => ({ retry: { maxAttempts: 0, retryOnTcpErrors: [], retryOnStatusCodes: [], retryOnBodyPatterns: [] } });
+    const fakePolicy = { getProvider: () => ({ unwrapOr: () => null }) };
+    const fakeErrorReporter = { write: () => null };
+    const fakeEmit = () => {};
+
+    // Test isCustom: false (Anthropic / OAuth-passthrough path)
+    const fake1 = await spawnFakeUpstream();
+    try {
+      const ctx1 = await makeCtx(fake1, false);
+      await new Promise((resolve) => {
+        forwardToUpstream({
+          ctx: ctx1,
+          handleResponseEnd: () => resolve(),
+          errorReporter: fakeErrorReporter,
+          getConfig: fakeGetConfig,
+          policy: fakePolicy,
+          extensions: null,
+          emit: fakeEmit,
+          openaiProviders: null,
+        });
+      });
+      const headers1 = await fake1.headersPromise;
+      assert(!('accept-encoding' in headers1), 'isCustom:false — accept-encoding stripped from upstream request');
+    } finally {
+      await new Promise((r) => fake1.server.close(r));
+    }
+
+    // Test isCustom: true (custom provider path — already worked before)
+    const fake2 = await spawnFakeUpstream();
+    try {
+      const ctx2 = await makeCtx(fake2, true);
+      await new Promise((resolve) => {
+        forwardToUpstream({
+          ctx: ctx2,
+          handleResponseEnd: () => resolve(),
+          errorReporter: fakeErrorReporter,
+          getConfig: fakeGetConfig,
+          policy: fakePolicy,
+          extensions: null,
+          emit: fakeEmit,
+          openaiProviders: null,
+        });
+      });
+      const headers2 = await fake2.headersPromise;
+      assert(!('accept-encoding' in headers2), 'isCustom:true — accept-encoding stripped from upstream request');
+    } finally {
+      await new Promise((r) => fake2.server.close(r));
+    }
+  }
+
+  // ── FIX 2a: parseSseMetadata reads input_tokens from message_delta (z.ai style) ──
+  console.log('\nparseSseMetadata z.ai / message_delta inputTokens:');
+  {
+    // z.ai style: message_start has input_tokens:0; real count in message_delta
+    const zaiSse = [
+      'data: {"type":"message_start","message":{"model":"zai-model","usage":{"input_tokens":0}}}',
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":2}}',
+    ].join('\n');
+    const zaiMeta = parseSseMetadata(zaiSse);
+    assert(zaiMeta.inputTokens === 10, 'z.ai style: inputTokens from message_delta');
+    assert(zaiMeta.outputTokens === 2, 'z.ai style: outputTokens from message_delta');
+
+    // Anthropic style: message_start has real count; message_delta has no input_tokens (or 0) → must not clobber
+    const anthropicSse = [
+      'data: {"type":"message_start","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100}}}',
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}',
+    ].join('\n');
+    const anthropicMeta = parseSseMetadata(anthropicSse);
+    assert(anthropicMeta.inputTokens === 100, 'Anthropic style: inputTokens from message_start not clobbered by delta');
+    assert(anthropicMeta.outputTokens === 5, 'Anthropic style: outputTokens from message_delta');
+
+    // Anthropic style with explicit delta input_tokens:0 → must not clobber
+    const anthropicZeroDelta = [
+      'data: {"type":"message_start","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100}}}',
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"output_tokens":5}}',
+    ].join('\n');
+    const zeroMeta = parseSseMetadata(anthropicZeroDelta);
+    assert(zeroMeta.inputTokens === 100, 'delta input_tokens:0 does not clobber message_start value');
+  }
+
+  // ── FIX 2b: SseResponseTransformer accumulator reads input_tokens from message_delta ──
+  console.log('\nSseResponseTransformer metadata accumulator z.ai / message_delta inputTokens:');
+  {
+    // z.ai style: message_start has input_tokens:0; real count in message_delta
+    const zaiTr = new SseResponseTransformer();
+    zaiTr.transformChunk('data: {"type":"message_start","message":{"model":"zai-model","usage":{"input_tokens":0}}}\n\n');
+    zaiTr.transformChunk('data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":2}}\n\n');
+    assert(zaiTr.inputTokens === 10, 'transformer z.ai style: inputTokens from message_delta');
+    assert(zaiTr.outputTokens === 2, 'transformer z.ai style: outputTokens from message_delta');
+
+    // Anthropic style: real count in message_start; no input_tokens in delta → must not clobber
+    const anthropicTr = new SseResponseTransformer();
+    anthropicTr.transformChunk('data: {"type":"message_start","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100}}}\n\n');
+    anthropicTr.transformChunk('data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\n');
+    assert(anthropicTr.inputTokens === 100, 'transformer Anthropic style: inputTokens not clobbered by delta without input_tokens');
+    assert(anthropicTr.outputTokens === 5, 'transformer Anthropic style: outputTokens from message_delta');
+
+    // Anthropic style with explicit delta input_tokens:0 → must not clobber
+    const anthropicZeroTr = new SseResponseTransformer();
+    anthropicZeroTr.transformChunk('data: {"type":"message_start","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100}}}\n\n');
+    anthropicZeroTr.transformChunk('data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"output_tokens":5}}\n\n');
+    assert(anthropicZeroTr.inputTokens === 100, 'transformer: delta input_tokens:0 does not clobber message_start value');
+  }
+
 }
 
 // ── Integration test (isolated daemon) ──
