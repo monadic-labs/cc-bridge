@@ -13,3 +13,4 @@ playwright-report/
 **.**/
 !.claude/
 .claude/settings.local.json
+_tracker/
