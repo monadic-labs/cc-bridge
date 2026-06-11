@@ -1,7 +1,7 @@
 import {
   getSseEventType,
   getMessageStartModel, getMessageStartInputTokens,
-  getMessageDeltaOutputTokens,
+  getMessageDeltaOutputTokens, getMessageDeltaInputTokens,
 } from './api-adapter.js';
 
 /**
@@ -72,6 +72,12 @@ export class SseResponseTransformer {
       if (evtType === 'message_delta') {
         const outTok = getMessageDeltaOutputTokens(evt);
         if (typeof outTok === 'number' && Number.isFinite(outTok)) this.#outputTokens = outTok;
+        // Some providers (e.g. z.ai) report the real input_tokens in
+        // message_delta rather than message_start (where they send 0). Only
+        // adopt the delta value when it is finite and > 0 so a correct
+        // message_start count is never clobbered by a missing or zero delta.
+        const deltaIn = getMessageDeltaInputTokens(evt);
+        if (Number.isFinite(deltaIn) && deltaIn > 0) this.#inputTokens = deltaIn;
       }
     }
   }

@@ -46,6 +46,7 @@
   },
 
   "messageDeltaEvent": {
-    "outputTokens": "output_tokens"
+    "outputTokens": "output_tokens",
+    "inputTokens": "input_tokens"
   }
 }
