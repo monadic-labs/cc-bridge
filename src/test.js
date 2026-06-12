@@ -4280,6 +4280,315 @@ async function runIntegrationTests() {
   return [cliSuccess, apiSuccess, modelSuccess];
 }
 
+// ── Live routing tests (isolated daemon + local stub upstreams) ──
+
+const LIVE_ROUTING_PORT = 9123;
+const LIVE_ROUTING_POLL_MS = 200;
+const LIVE_ROUTING_POLL_ATTEMPTS = 75; // 15 s ceiling
+
+/**
+ * Spawn a recording stub HTTP server on a random OS-assigned port.
+ *
+ * Each request is appended to `stub.requests` as `{ method, url, headers, body }`.
+ * `stub.nextStatus` controls the HTTP status returned; reset it between scenarios.
+ */
+async function spawnRecordingStub() {
+  const requests = [];
+  let nextStatus = 200;
+
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      requests.push({ method: req.method, url: req.url, headers: { ...req.headers }, body });
+      res.writeHead(nextStatus, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+  });
+
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+
+  return { server, port, requests, setStatus(s) { nextStatus = s; } };
+}
+
+/**
+ * Send a raw POST /v1/messages to the live routing daemon and return the
+ * response status code.  Collects and discards the response body so the
+ * socket closes cleanly.
+ */
+function postMessages(proxyPort, model) {
+  const body = JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] });
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        hostname: '127.0.0.1',
+        port: proxyPort,
+        path: '/v1/messages',
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(body),
+          authorization: 'Bearer oauth-sentinel',
+        },
+      },
+      (res) => {
+        res.resume();
+        res.on('end', () => resolve(res.statusCode));
+      }
+    );
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
+// Kill every process listening on `port`. The proxy worker is spawned detached
+// by the watchdog, so killing the watchdog pid does not reap it; this closes the
+// listener socket so the port is released and nothing leaks across test runs.
+function killListenersOnPort(port) {
+  if (!port) return;
+  try {
+    if (process.platform === 'win32') {
+      const r = runSync('netstat', ['-aon', '-p', 'TCP'], { encoding: 'utf8' });
+      const lines = (r.stdout || '').split('\n').filter((l) => l.includes(`:${port} `));
+      for (const line of lines) {
+        const pid = line.trim().split(/\s+/).pop();
+        if (pid && /^\d+$/.test(pid)) {
+          try { process.kill(Number(pid), 'SIGKILL'); } catch { }
+        }
+      }
+      return;
+    }
+    const ss = runSync('sh', ['-c', `ss -ltnp | grep :${port}`], { encoding: 'utf8' });
+    const pids = [...(ss.stdout || '').matchAll(/pid=(\d+)/g)].map((m) => Number(m[1]));
+    for (const pid of pids) {
+      try { process.kill(pid, 'SIGKILL'); } catch { }
+    }
+  } catch { }
+}
+
+async function runLiveRoutingTests() {
+  console.log('\n── Live routing tests (stub upstreams, isolated daemon on port ' + LIVE_ROUTING_PORT + ') ──');
+
+  // Snapshot before: any assert() failure increments `failed`; compare after to detect failures.
+  const failedBefore = failed;
+
+  const { RUNTIME_FILENAME: RT_FILENAME } = await import('../src/core/constants.js');
+
+  const anthropicStub = await spawnRecordingStub();
+  const primaryStub = await spawnRecordingStub();
+  const fallbackStub = await spawnRecordingStub();
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccb-live-routing-'));
+  const logsDir = path.join(tempDir, LOGS_DIR_NAME);
+  fs.mkdirSync(logsDir, { recursive: true });
+
+  let liveDaemonPid = null;
+  let resolvedPort = null;
+
+  try {
+    // ── Write providers.json ──
+    const providers = {
+      providers: {
+        primary: {
+          url: `http://127.0.0.1:${primaryStub.port}`,
+          anthropicCompliant: true,
+          apiKey: '',
+          models: {},
+          toolTransforms: {},
+        },
+        fb: {
+          url: `http://127.0.0.1:${fallbackStub.port}`,
+          anthropicCompliant: true,
+          apiKey: '',
+          models: {},
+          toolTransforms: {},
+        },
+      },
+      routes: {
+        models: {
+          'my-exact': 'primary.some-model',
+          '*haiku*': 'primary.some-model',
+          'my-fb': { target: 'primary.some-model', fallback: ['fb.some-model'] },
+        },
+        properties: {},
+        payloadSize: {},
+      },
+    };
+    fs.writeFileSync(path.join(tempDir, PROVIDERS_FILENAME), JSON.stringify(providers, null, 2), 'utf8');
+
+    // ── Write config.json ──
+    // anthropicBaseUrl points to anthropicStub so unmatched requests hit it.
+    const liveConfig = {
+      port: LIVE_ROUTING_PORT,
+      anthropicBaseUrl: `http://127.0.0.1:${anthropicStub.port}`,
+      daemon: {
+        healthCheckTimeoutMs: 1000,
+        pollIntervalMs: 200,
+        pollMaxAttempts: 15,
+        upstreamTimeoutMs: 0,
+        workerInitTimeoutMs: 20000,
+        drainTimeoutMs: 600000,
+        workerKeepaliveS: -1,
+        ipcTimeoutMs: 5000,
+        daemonStartTimeoutMs: 60000,
+        daemonStartProgressGraceMs: 15000,
+        bindHost: '127.0.0.1',
+        retry: {
+          maxAttempts: 2,
+          baseDelayMs: 0,
+          maxDelayMs: 0,
+          retryOnStatusCodes: [502, 503, 504],
+          retryOnTcpErrors: ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT'],
+          retryOnBodyPatterns: [],
+        },
+      },
+      logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000, level: 'trace' },
+      compression: { recompressRequests: false },
+    };
+    fs.writeFileSync(path.join(tempDir, CONFIG_FILENAME), JSON.stringify(liveConfig, null, 2), 'utf8');
+
+    // ── Write .env — keys follow providerIdToEnvKey("primary") = "PRIMARY_KEY" ──
+    fs.writeFileSync(
+      path.join(tempDir, ENV_FILENAME),
+      'PRIMARY_KEY=test-primary-key\nFB_KEY=test-fb-key\n',
+      'utf8'
+    );
+
+    // ── Spawn daemon ──
+    const WATCHDOG_BIN = path.join(PKG_ROOT, 'bin', WATCHDOG_SCRIPT_NAME);
+    const out = fs.openSync(path.join(logsDir, 'daemon.log'), 'a');
+    const err = fs.openSync(path.join(logsDir, 'daemon.err'), 'a');
+    const child = spawnDaemon(WATCHDOG_BIN, [], {
+      detached: true,
+      stdio: ['ignore', out, err],
+      windowsHide: true,
+      env: { ...process.env, CCB_CONFIG_DIR: tempDir },
+    });
+    liveDaemonPid = child.pid;
+    child.unref();
+
+    // ── Wait for daemon: read actual port from runtime.json ──
+    const runtimePath = path.join(tempDir, RT_FILENAME);
+    let runtime = null;
+    for (let i = 0; i < LIVE_ROUTING_POLL_ATTEMPTS; i++) {
+      if (fs.existsSync(runtimePath)) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(runtimePath, 'utf8'));
+          if (typeof parsed.port === 'number') { runtime = parsed; break; }
+        } catch { /* file mid-write */ }
+      }
+      await sleep(LIVE_ROUTING_POLL_MS);
+    }
+
+    if (!runtime) {
+      assert(false, 'live-routing: daemon runtime.json appeared within timeout');
+      return [false];
+    }
+
+    const livePort = runtime.port;
+    resolvedPort = livePort;
+
+    // Poll /v1/models until ready
+    let ready = false;
+    for (let i = 0; i < LIVE_ROUTING_POLL_ATTEMPTS; i++) {
+      const probe = await new Promise((resolve) => {
+        const req = http.get(`http://127.0.0.1:${livePort}/v1/models`, () => resolve(true));
+        req.on('error', () => resolve(false));
+        req.setTimeout(500, () => { req.destroy(); resolve(false); });
+      });
+      if (probe) { ready = true; break; }
+      await sleep(LIVE_ROUTING_POLL_MS);
+    }
+
+    assert(ready, 'live-routing: daemon answered /v1/models within timeout');
+    if (!ready) return [false];
+
+    // ── Scenario 1: EXACT custom match → primaryStub ──
+    console.log('  Scenario 1: exact custom match (my-exact)');
+    anthropicStub.requests.length = 0;
+    primaryStub.requests.length = 0;
+    fallbackStub.requests.length = 0;
+    primaryStub.setStatus(200);
+
+    await postMessages(livePort, 'my-exact');
+
+    assert(primaryStub.requests.length === 1, 'S1: primaryStub received exactly 1 request');
+    assert(anthropicStub.requests.length === 0, 'S1: anthropicStub received 0 requests');
+    assert(fallbackStub.requests.length === 0, 'S1: fallbackStub received 0 requests');
+
+    const s1Headers = primaryStub.requests[0]?.headers ?? {};
+    // anthropicCompliant providers: incoming oauth-sentinel is stripped, proxy sets x-api-key + authorization Bearer <apiKey>
+    assert(s1Headers['authorization'] !== 'Bearer oauth-sentinel', 'S1: oauth-sentinel authorization NOT forwarded to primary');
+    assert(s1Headers['x-api-key'] === 'test-primary-key', 'S1: x-api-key set to test-primary-key');
+
+    // ── Scenario 2: UNMATCHED → Anthropic passthrough ──
+    console.log('  Scenario 2: unmatched model → Anthropic passthrough');
+    anthropicStub.requests.length = 0;
+    primaryStub.requests.length = 0;
+    fallbackStub.requests.length = 0;
+
+    await postMessages(livePort, 'claude-opus-4-6');
+
+    assert(anthropicStub.requests.length === 1, 'S2: anthropicStub received exactly 1 request');
+    assert(primaryStub.requests.length === 0, 'S2: primaryStub received 0 requests');
+    assert(fallbackStub.requests.length === 0, 'S2: fallbackStub received 0 requests');
+
+    const s2Headers = anthropicStub.requests[0]?.headers ?? {};
+    assert(s2Headers['authorization'] === 'Bearer oauth-sentinel', 'S2: authorization header preserved on Anthropic passthrough');
+
+    // ── Scenario 3: WILDCARD → primaryStub ──
+    console.log('  Scenario 3: wildcard *haiku* match');
+    anthropicStub.requests.length = 0;
+    primaryStub.requests.length = 0;
+    fallbackStub.requests.length = 0;
+    primaryStub.setStatus(200);
+
+    await postMessages(livePort, 'claude-3-5-haiku-20241022');
+
+    assert(primaryStub.requests.length >= 1, 'S3: primaryStub received the wildcard-matched request');
+    assert(anthropicStub.requests.length === 0, 'S3: anthropicStub received 0 requests for wildcard match');
+
+    // ── Scenario 4: FALLBACK on 5xx ──
+    console.log('  Scenario 4: fallback on 503 from primary');
+    anthropicStub.requests.length = 0;
+    primaryStub.requests.length = 0;
+    fallbackStub.requests.length = 0;
+    // Return 503 for all attempts (initial + up to maxAttempts=2 retries)
+    primaryStub.setStatus(503);
+    fallbackStub.setStatus(200);
+
+    const s4Status = await postMessages(livePort, 'my-fb');
+
+    assert(primaryStub.requests.length >= 1, 'S4: primaryStub received the initial request before fallback');
+    assert(fallbackStub.requests.length >= 1, 'S4: fallbackStub received the retried (fallback) request');
+    assert(s4Status === 200, 'S4: client received 200 from fallback provider');
+
+    // Reset for any subsequent use
+    primaryStub.setStatus(200);
+
+    const liveRoutingPassed = failed === failedBefore;
+    if (liveRoutingPassed) {
+      console.log('  PASS: all live routing scenarios completed');
+    }
+    return [liveRoutingPassed];
+  } finally {
+    // Kill the watchdog first, then reap the detached worker it forked. The
+    // watchdog (liveDaemonPid) and the proxy.js worker are separate detached
+    // processes; SIGKILL on the watchdog alone orphans the worker, which keeps
+    // the listener socket open and leaks the port. Mirror killTestDaemon: after
+    // killing the watchdog, kill whatever still listens on the resolved port.
+    if (liveDaemonPid) {
+      try { process.kill(liveDaemonPid, 'SIGKILL'); } catch { }
+    }
+    killListenersOnPort(resolvedPort ?? LIVE_ROUTING_PORT);
+    await new Promise((resolve) => anthropicStub.server.close(() => resolve()));
+    await new Promise((resolve) => primaryStub.server.close(() => resolve()));
+    await new Promise((resolve) => fallbackStub.server.close(() => resolve()));
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { }
+  }
+}
+
 // ── Main ──
 
 async function main() {
@@ -4298,7 +4607,9 @@ async function main() {
 
   const integrationResults = await runIntegrationTests();
 
-  if (!portFallback || !integrationResults.every(Boolean)) {
+  const liveRoutingResults = await runLiveRoutingTests();
+
+  if (!portFallback || !integrationResults.every(Boolean) || !liveRoutingResults.every(Boolean)) {
     console.error('\n🚨 INTEGRATION TESTS FAILED!');
     process.exit(1);
   }
