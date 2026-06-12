@@ -8,10 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `POST /api/restart` (the dashboard "Restart Daemon" button and `--x-restart`)
+  no longer crashes the worker when the control channel is mid-close. The IPC
+  send was unguarded, so a restart arriving while a previous restart was still
+  draining the worker threw `ERR_IPC_CHANNEL_CLOSED` as an unhandled `'error'`
+  that killed the worker — after which the watchdog could not rebind its control
+  socket and the daemon stayed down. The send is now guarded (connected check,
+  error callback, try/catch) and reports 503 instead of crashing.
 - `CCB_VERSION` corrected to `2.1.0` to match `package.json`. It previously
   reported `2.0.0` through `ccb --version`, `runtime.json`, and the IPC
   handshake. A guard test now fails the suite if the constant and
   `package.json` version ever drift again.
+
+### Changed
+- Browser GUI test suite repaired and made reliable: the restart test now
+  authenticates its status poll with the proxy secret (re-read each attempt
+  since a restart rotates it) instead of hitting the auth-gated endpoint
+  unauthenticated, and the provider apiKey assertion matches the actual
+  redaction (every key — literal AND `ENV:` — is stripped from `/api/config`,
+  not just literals; the 2.1.0 note below overstated this).
 
 ### Added
 - Live-daemon wire-level routing behaviour test: drives the real proxy daemon
@@ -42,7 +57,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generated proxy secret backs an HttpOnly-cookie auth gate with Bearer
   fallback for CLI clients; the `/gui` route resolver rejects path
   traversal (`..`, percent-encoded `../`, null bytes); `GET /api/config`
-  redacts literal `apiKey` fields (ENV: references are preserved).
+  strips every provider `apiKey` field (literal keys AND `ENV:` references) so
+  the network surface never echoes a key — the dashboard renders the field
+  blank and the value stays in `providers.json` / the env var.
 - Routing to a provider whose env var is unset now raises a structured
   `ProviderApiKeyError` (HTTP 400 with the missing env var name) instead
   of silently sending the upstream request with no provider credentials.

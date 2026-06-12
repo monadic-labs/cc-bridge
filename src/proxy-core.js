@@ -618,12 +618,26 @@ export function createProxyCore({ configDir, port }) {
       }
 
       if (req.method === 'POST' && req.url === '/api/restart') {
-        if (!process.send) {
+        if (!process.send || process.connected === false) {
           res.writeHead(503, { 'Content-Type': 'text/plain' });
           res.end('Restart is only available when running under the watchdog.');
           return;
         }
-        process.send({ type: 'restart-request' });
+        // Guard the IPC send. If the control channel is closing — e.g. a restart
+        // arrives while a previous restart is still draining this worker — an
+        // unguarded process.send throws ERR_IPC_CHANNEL_CLOSED that surfaces as
+        // an unhandled 'error' event and crashes the worker, after which the
+        // watchdog cannot rebind its control socket (EADDRINUSE) and the daemon
+        // stays down. Passing a callback makes Node report the async failure to
+        // the callback instead of emitting 'error'; the try/catch absorbs a
+        // synchronous throw when the channel is already closed.
+        try {
+          process.send({ type: 'restart-request' }, () => {});
+        } catch {
+          res.writeHead(503, { 'Content-Type': 'text/plain' });
+          res.end('Restart could not be dispatched: the worker is shutting down.');
+          return;
+        }
         res.writeHead(202, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'restarting' }));
         return;
