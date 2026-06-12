@@ -11,6 +11,7 @@
   "files": [
     "bin/",
     "src/",
+    "!src/test.js",
     "scripts/setup-user-dir.js",
     "providers.example.json",
     "README.md",
