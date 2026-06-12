@@ -1,4 +1,8 @@
 CODE_MAP.json
+.vscode/
+.eo.json
+.claudeignore
+docs/
 node_modules/
 logs/
 proxy.log
