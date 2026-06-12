@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `CCB_VERSION` corrected to `2.1.0` to match `package.json`. It previously
+  reported `2.0.0` through `ccb --version`, `runtime.json`, and the IPC
+  handshake. A guard test now fails the suite if the constant and
+  `package.json` version ever drift again.
+
+### Added
+- Live-daemon wire-level routing behaviour test: drives the real proxy daemon
+  over raw HTTP against local stub upstreams, covering exact-model match
+  (OAuth header stripped, `x-api-key` injected), unmatched passthrough to
+  `anthropicBaseUrl` (OAuth header preserved), wildcard subagent routing, and
+  the 503-to-fallback chain. The daemon runs on an isolated config dir and
+  port; teardown reaps the detached worker so no port leaks across runs.
+
 ## [2.1.0] - 2026-06-11
 
 ### Fixed

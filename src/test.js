@@ -10,7 +10,8 @@ import {
   CONFIG_FILENAME,
   ENV_FILENAME,
   CCB_DIR_NAME,
-  WATCHDOG_SCRIPT_NAME
+  WATCHDOG_SCRIPT_NAME,
+  CCB_VERSION
 } from '../src/core/constants.js';
 import { ArgumentError } from '../src/core/exceptions.js';
 
@@ -2561,6 +2562,12 @@ async function runUnitTests() {
     assert(filesList.includes(entry), `files whitelist includes "${entry}"`);
   }
 
+  // Version drift guard: CCB_VERSION (reported by `ccb --version`, runtime.json,
+  // and the IPC handshake) must equal package.json "version". A release that
+  // bumps one without the other previously shipped a daemon reporting 2.0.0
+  // while the package was 2.1.0; this assertion fails the suite on any drift.
+  assert(CCB_VERSION === pkgJson.version, `CCB_VERSION (${CCB_VERSION}) matches package.json version (${pkgJson.version})`);
+
   // P3-15: CHANGELOG.md exists and matches Keep a Changelog 1.1 anchors.
   const changelogPath = path.join(PKG_ROOT, 'CHANGELOG.md');
   assert(fs.existsSync(changelogPath), 'CHANGELOG.md exists at repo root');
@@ -4089,7 +4096,10 @@ async function runIntegrationTests() {
   // moved to --x-use-version <v>.
   console.log('  Testing --version (POSIX) ...');
   assertCli(runCcb(['--version']), 0, '@monadic-labs/ccb', null, '--version prints package name');
-  assertCli(runCcb(['--version']), 0, '2.0.0', null, '--version prints semver');
+  // Assert against the single source (CCB_VERSION), not a hardcoded literal, so
+  // this expectation can never drift from the constant. The unit suite separately
+  // guards CCB_VERSION === package.json version.
+  assertCli(runCcb(['--version']), 0, CCB_VERSION, null, '--version prints semver');
 
   // Test --x-init
   console.log('  Testing --x-init...');

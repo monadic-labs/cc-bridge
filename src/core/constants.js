@@ -1,6 +1,9 @@
 import path from 'path';
 
-export const CCB_VERSION = '2.0.0';
+// Keep in lock-step with package.json "version". A guard test
+// (src/test.js, "CCB_VERSION matches package.json") fails the suite if these
+// drift, so a release bump that forgets this line cannot ship silently.
+export const CCB_VERSION = '2.1.0';
 export const CCB_DIR_NAME = '.ccb';
 export const CONFIG_FILENAME = 'config.json';
 export const PROVIDERS_FILENAME = 'providers.json';
