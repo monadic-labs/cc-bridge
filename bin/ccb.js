@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { spawnSync as _spawnSync } from 'child_process';
 import http from 'http';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
@@ -64,7 +63,7 @@ import {
 
 import { getControlIpcPath } from '../src/core/daemon-constants.js';
 import { serializeIpcMessage, parseIpcMessage } from '../src/core/ipc-protocol.js';
-import { runKill, spawnDaemon, spawnCommand, getProcesses } from '../src/infra/process-manager.js';
+import { runKill, runSync, spawnDaemon, spawnCommand, getProcesses } from '../src/infra/process-manager.js';
 
 const USER_CONFIG_DIR = resolveUserConfigDir();
 const LOGS_DIR = path.join(USER_CONFIG_DIR, LOGS_DIR_NAME);
@@ -168,7 +167,7 @@ async function handleVersionsCommand() {
     }
     console.log(`Creating git worktree for ${version} at ${targetDir}...`);
     try {
-      _spawnSync('git', ['worktree', 'add', targetDir, version], { stdio: 'inherit', windowsHide: true });
+      runSync('git', ['worktree', 'add', targetDir, version], { stdio: 'inherit' });
       const watchdogPath = path.resolve(targetDir, 'bin', WATCHDOG_SCRIPT_NAME);
       const versions = loadVersions();
       versions.versions[version] = watchdogPath;
@@ -249,7 +248,7 @@ async function findPortForPid(pid) {
   const isWin = process.platform === 'win32';
   try {
     if (isWin) {
-      const out = _spawnSync('netstat', ['-ano'], { encoding: 'utf8', windowsHide: true }).stdout;
+      const out = runSync('netstat', ['-ano'], { encoding: 'utf8' }).stdout;
       const lines = out.split('\n');
       for (const line of lines) {
         if (line.includes('LISTENING') && line.includes(String(pid))) {
@@ -260,7 +259,7 @@ async function findPortForPid(pid) {
       return null;
     }
 
-    const out = _spawnSync('lsof', ['-nP', '-iTCP', '-sTCP:LISTEN', '-p', String(pid)], { encoding: 'utf8' }).stdout;
+    const out = runSync('lsof', ['-nP', '-iTCP', '-sTCP:LISTEN', '-p', String(pid)], { encoding: 'utf8' }).stdout;
     const match = out.match(/:(\d+)\s+\(LISTEN\)/);
     if (match) return parseInt(match[1], 10);
   } catch { }
@@ -905,7 +904,7 @@ function parseCmdWrapper(cmdPath) {
 function resolveClaudeBin() {
   if (process.platform !== 'win32') return 'claude';
   try {
-    const result = _spawnSync('where.exe', ['claude'], { encoding: 'utf8', windowsHide: true });
+    const result = runSync('where.exe', ['claude'], { encoding: 'utf8' });
     const candidates = (result.stdout || '').split('\n').map(l => l.trim()).filter(Boolean);
     for (const candidate of candidates) {
       if (candidate.endsWith('.cmd')) {
