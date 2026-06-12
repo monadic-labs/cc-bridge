@@ -870,6 +870,28 @@ export function runWorkerMode({ configDir, port }) {
   let drainInterval = null;
   let bindCompleted = false;
 
+  // Last-resort fault isolation. Per-request faults are caught at the request
+  // boundary (proxy-upstream: finalizeUpstreamFailure + the upstream-handler
+  // guard), so this backstop should never fire in normal operation. It exists
+  // for an UNKNOWN escape only. Per industry + manifesto consensus we do NOT
+  // swallow-and-continue (a process past an uncaught fault is in undefined
+  // state and leaks sockets/FDs): log the fault clearly for diagnosis, then
+  // exit so the watchdog respawns a clean worker. Re-entrancy-guarded so the
+  // exit path cannot loop. (Node already crashes on uncaught faults by default;
+  // this wraps that in a single, diagnosable, controlled exit — which is also
+  // why it has no behaviour test: the boundary makes it unreachable through the
+  // real request interface.)
+  let crashingDown = false;
+  const exitForRespawn = (kind, error) => {
+    if (crashingDown) return;
+    crashingDown = true;
+    const detail = error?.stack ?? error?.message ?? String(error);
+    process.stderr.write(`[worker] FATAL ${kind} — exiting for watchdog respawn:\n${detail}\n`);
+    process.exit(1);
+  };
+  process.on('uncaughtException', (error) => exitForRespawn('uncaughtException', error));
+  process.on('unhandledRejection', (reason) => exitForRespawn('unhandledRejection', reason));
+
   // Workers self-bind with SO_REUSEPORT instead of receiving a TCP handle
   // from the watchdog. The watchdog assigns the target port via the env
   // var CCB_DAEMON_PORT (set when respawning after the first worker has

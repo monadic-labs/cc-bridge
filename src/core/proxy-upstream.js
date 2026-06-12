@@ -87,7 +87,7 @@ function forwardWithRetry({ ctx, handleResponseEnd, errorReporter, getConfig, po
           }
         }
       }
-      handleResponseEnd({ resCtx: ctx, resChunks: [] });
+      finalizeUpstreamFailure(ctx, retryState.retryReason);
       return;
     }
 
@@ -360,6 +360,24 @@ function streamBufferedError(reqCtx, proxyRes, chunks, _handleResponseEnd, _head
   }
   reqCtx.res.write(outBody);
   reqCtx.res.end();
+}
+
+/**
+ * Terminal for an upstream that never produced a response: every attempt failed
+ * with a TCP error, retries are exhausted, and no fallback applies. Sends a
+ * clean upstream-failure error to the client. It must NOT route through
+ * handleResponseEnd, whose contract requires a real upstream response
+ * (resCtx.proxyRes) — calling that finalizer with a response-less request
+ * context dereferenced undefined.proxyRes, an uncaught TypeError that crashed
+ * the worker (and, after repeated failures, the whole daemon).
+ */
+function finalizeUpstreamFailure(ctx, reason) {
+  if (ctx.clientAborted) return;
+  if (!ctx.res.headersSent) {
+    buildErrorResponse(ctx.res, new UpstreamError(`Upstream connection failed: ${reason}`, { code: reason }), ctx.startTime);
+    return;
+  }
+  if (!ctx.res.writableEnded) ctx.res.end();
 }
 
 function buildErrorResponse(res, error, startTime) {

@@ -4524,6 +4524,51 @@ function postMessages(proxyPort, model) {
   });
 }
 
+/**
+ * Like postMessages, but never rejects: resolves `{ status }` when the proxy
+ * returns an HTTP response, or `{ error }` (the socket error code) when the
+ * connection is reset / refused before a response arrives. Used by the
+ * upstream-failure survival scenario, where the distinction between "clean
+ * HTTP error" and "socket reset because the worker crashed" IS the assertion.
+ */
+function postMessagesDetailed(proxyPort, model) {
+  const body = JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] });
+  return new Promise((resolve) => {
+    const req = http.request(
+      {
+        hostname: '127.0.0.1',
+        port: proxyPort,
+        path: '/v1/messages',
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(body),
+          authorization: 'Bearer oauth-sentinel',
+        },
+      },
+      (res) => {
+        res.resume();
+        res.on('end', () => resolve({ status: res.statusCode }));
+      }
+    );
+    req.on('error', (err) => resolve({ error: err.code || err.message }));
+    req.setTimeout(5000, () => { req.destroy(); resolve({ error: 'CLIENT_TIMEOUT' }); });
+    req.end(body);
+  });
+}
+
+/**
+ * Bind an OS-assigned port and immediately release it, returning the number.
+ * Connecting to it then yields ECONNREFUSED — a deterministic dead upstream.
+ */
+async function acquireClosedPort() {
+  const server = http.createServer();
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  await new Promise((resolve) => server.close(() => resolve()));
+  return port;
+}
+
 // Kill every process listening on `port`. The proxy worker is spawned detached
 // by the watchdog, so killing the watchdog pid does not reap it; this closes the
 // listener socket so the port is released and nothing leaks across test runs.
@@ -4560,6 +4605,7 @@ async function runLiveRoutingTests() {
   const anthropicStub = await spawnRecordingStub();
   const primaryStub = await spawnRecordingStub();
   const fallbackStub = await spawnRecordingStub();
+  const deadPort = await acquireClosedPort();
 
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccb-live-routing-'));
   const logsDir = path.join(tempDir, LOGS_DIR_NAME);
@@ -4586,12 +4632,20 @@ async function runLiveRoutingTests() {
           models: {},
           toolTransforms: {},
         },
+        dead: {
+          url: `http://127.0.0.1:${deadPort}`,
+          anthropicCompliant: true,
+          apiKey: '',
+          models: {},
+          toolTransforms: {},
+        },
       },
       routes: {
         models: {
           'my-exact': 'primary.some-model',
           '*haiku*': 'primary.some-model',
           'my-fb': { target: 'primary.some-model', fallback: ['fb.some-model'] },
+          'my-dead': 'dead.some-model',
         },
         properties: {},
         payloadSize: {},
@@ -4633,7 +4687,7 @@ async function runLiveRoutingTests() {
     // ── Write .env — keys follow providerIdToEnvKey("primary") = "PRIMARY_KEY" ──
     fs.writeFileSync(
       path.join(tempDir, ENV_FILENAME),
-      'PRIMARY_KEY=test-primary-key\nFB_KEY=test-fb-key\n',
+      'PRIMARY_KEY=test-primary-key\nFB_KEY=test-fb-key\nDEAD_KEY=test-dead-key\n',
       'utf8'
     );
 
@@ -4748,6 +4802,34 @@ async function runLiveRoutingTests() {
 
     // Reset for any subsequent use
     primaryStub.setStatus(200);
+
+    // ── Scenario 5: UPSTREAM CONNECTION REFUSED → daemon must survive ──
+    // Routes to a provider whose port is closed, so every forward attempt
+    // (initial + retries) fails with ECONNREFUSED and no fallback applies.
+    // Regression for the worker crash where the retry-exhausted terminal called
+    // handleResponseEnd() with a context that had no proxyRes → uncaught
+    // TypeError → worker death → daemon ConnectionRefused. The client must get a
+    // clean HTTP error and the daemon must still serve the next request.
+    console.log('  Scenario 5: upstream connection refused → client error + daemon survives');
+    anthropicStub.requests.length = 0;
+    primaryStub.requests.length = 0;
+    fallbackStub.requests.length = 0;
+    primaryStub.setStatus(200);
+
+    const deadResult = await postMessagesDetailed(livePort, 'my-dead');
+    assert(
+      typeof deadResult.status === 'number' && deadResult.status >= 400,
+      `S5: client received a clean HTTP error for a refused upstream (got ${JSON.stringify(deadResult)})`
+    );
+
+    // The worker must still be alive: a healthy route answers immediately, with
+    // no respawn window. A crash would surface here as ECONNREFUSED/ECONNRESET.
+    const survivorResult = await postMessagesDetailed(livePort, 'my-exact');
+    assert(
+      survivorResult.status === 200,
+      `S5: daemon still served a healthy request after the refused upstream (got ${JSON.stringify(survivorResult)})`
+    );
+    assert(primaryStub.requests.length === 1, 'S5: healthy survivor request reached primaryStub');
 
     const liveRoutingPassed = failed === failedBefore;
     if (liveRoutingPassed) {
