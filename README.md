@@ -268,9 +268,30 @@ ccb --x-key prune          # removes orphaned keys from .env
 ```sh
 ccb --x-init               # initialize/re-sync config directory
 ccb --x-killall            # kill all background proxy + claude processes
+ccb --x-restart            # gracefully restart the proxy daemon (zero-downtime)
 ccb --x-clearlogs          # delete all log files in the logs directory
 ccb --x-help               # show help
 ```
+
+### Status and diagnostics
+```sh
+ccb --x-status             # show current daemon status (PID, uptime, keepalives)
+ccb --x-sessions           # list all active worker sessions with uptime and connection counts
+ccb --x-gui                # open the web GUI dashboard in your browser
+```
+
+### Version management
+```sh
+ccb --version                           # print "@monadic-labs/ccb <version>" and exit (POSIX convention)
+ccb --x-version                         # list installed daemon versions
+ccb --x-version add <v> <watchdog-path> # register an additional installed version
+ccb --x-version remove <v>             # unregister a version
+ccb --x-version set <v>                # set the default daemon version
+ccb --x-version create <v> [dir]        # create a git worktree and register it as a version
+ccb [--x-use-version <v>] [claude args] # run with a specific installed daemon version for this invocation
+```
+
+> **`--version` vs `--x-use-version`:** `--version` follows POSIX convention — it prints the package version and exits immediately. `--x-use-version <v>` is a passthrough-mode flag; it selects which installed daemon version to launch without printing anything. This flag was renamed from `--version` in 2.1.0 to avoid the ambiguity.
 
 ---
 
