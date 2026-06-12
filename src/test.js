@@ -508,15 +508,23 @@ async function runUnitTests() {
 
   // ── resolveGuiPath (security boundary — must reject path traversal) ──
   console.log('\nresolveGuiPath:');
-  const GUI_DIR = '/srv/ccb/gui';
+  // Build GUI_DIR and the expected outputs with `path`, so the equality holds on
+  // BOTH POSIX and Windows. A literal '/srv/ccb/gui' string is not a valid
+  // Windows absolute path — the resolver's path.resolve() turns it into a
+  // drive-lettered, backslashed path that can never equal the POSIX string, so
+  // these assertions failed on Windows. (The resolver is correct cross-platform;
+  // production always passes it a real absolute dir.)
+  const GUI_DIR = path.resolve('/srv/ccb/gui');
+  const GUI_INDEX = path.join(GUI_DIR, 'index.html');
+  const GUI_APP = path.join(GUI_DIR, 'app.js');
   // Happy paths
-  assert(resolveGuiPath(GUI_DIR, '/gui') === '/srv/ccb/gui/index.html', '/gui → index.html');
-  assert(resolveGuiPath(GUI_DIR, '/gui/') === '/srv/ccb/gui/index.html', '/gui/ → index.html');
-  assert(resolveGuiPath(GUI_DIR, '/gui/app.js') === '/srv/ccb/gui/app.js', '/gui/app.js inside');
-  assert(resolveGuiPath(GUI_DIR, '/gui/index.html') === '/srv/ccb/gui/index.html', '/gui/index.html inside');
+  assert(resolveGuiPath(GUI_DIR, '/gui') === GUI_INDEX, '/gui → index.html');
+  assert(resolveGuiPath(GUI_DIR, '/gui/') === GUI_INDEX, '/gui/ → index.html');
+  assert(resolveGuiPath(GUI_DIR, '/gui/app.js') === GUI_APP, '/gui/app.js inside');
+  assert(resolveGuiPath(GUI_DIR, '/gui/index.html') === GUI_INDEX, '/gui/index.html inside');
   // Query/fragment stripped
-  assert(resolveGuiPath(GUI_DIR, '/gui/app.js?v=1') === '/srv/ccb/gui/app.js', 'query stripped');
-  assert(resolveGuiPath(GUI_DIR, '/gui/app.js#frag') === '/srv/ccb/gui/app.js', 'fragment stripped');
+  assert(resolveGuiPath(GUI_DIR, '/gui/app.js?v=1') === GUI_APP, 'query stripped');
+  assert(resolveGuiPath(GUI_DIR, '/gui/app.js#frag') === GUI_APP, 'fragment stripped');
   // Exception paths — every traversal vector returns null
   assert(resolveGuiPath(GUI_DIR, '/gui/../../etc/passwd') === null, 'literal .. rejected');
   assert(resolveGuiPath(GUI_DIR, '/gui/../app.js') === null, 'sibling .. rejected');
@@ -529,7 +537,7 @@ async function runUnitTests() {
   // ZOMBIES boundary: absolute paths inside the request
   assert(resolveGuiPath(GUI_DIR, '/gui//etc/passwd') === null, 'absolute-path injection rejected');
   // Final-path containment: a path with .. that resolves back inside is allowed
-  assert(resolveGuiPath(GUI_DIR, '/gui/sub/../app.js') === '/srv/ccb/gui/app.js', '.. that resolves back inside allowed');
+  assert(resolveGuiPath(GUI_DIR, '/gui/sub/../app.js') === GUI_APP, '.. that resolves back inside allowed');
 
   // ── Result ──
   console.log('\nResult:');
