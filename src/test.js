@@ -3304,6 +3304,167 @@ async function testModelSwitch() {
 }
 
 /**
+ * Read the ordered route-target sequence from the most recent session log.
+ * Each forwarded request is logged `[REQ #N] → <routeLabel> ...`; the label is
+ * `Provider (...)` for a custom-provider route and `Anthropic (...)` for the
+ * OAuth passthrough. Returns e.g. ['Provider','Provider','Anthropic','Provider'].
+ */
+// Read the newest session.log under `logsDir` whose directory is NOT in
+// `excludeNames`. Pinning by an exclusion snapshot lets a test track ITS OWN
+// session's log; plain "most recent" is ambiguous because earlier tests in the
+// same daemon leave their own (already-stable) session logs behind, and reading
+// one of those makes a response-count wait return before this turn finishes.
+function newestSessionLogContent(logsDir, excludeNames) {
+  if (!fs.existsSync(logsDir)) return '';
+  const sessions = fs.readdirSync(logsDir, { withFileTypes: true })
+    .filter(d => d.isDirectory() && d.name !== '_unknown' && d.name !== 'api-samples' && !d.name.startsWith('archive-'))
+    .filter(d => !excludeNames.has(d.name))
+    .map(d => path.join(logsDir, d.name, 'session.log'))
+    .filter(p => fs.existsSync(p))
+    .map(p => ({ path: p, time: fs.statSync(p).mtime.getTime() }))
+    .sort((a, b) => b.time - a.time);
+  return sessions.length === 0 ? '' : fs.readFileSync(sessions[0].path, 'utf8');
+}
+
+// Collapse runs of the same value: ['P','P','A','P'] → ['P','A','P'].
+function condenseRouteSequence(sequence) {
+  const out = [];
+  for (const item of sequence) {
+    if (out[out.length - 1] !== item) out.push(item);
+  }
+  return out;
+}
+
+// True when `pattern` appears as an ordered (not necessarily contiguous) subsequence.
+function containsOrderedSubsequence(sequence, pattern) {
+  let matched = 0;
+  for (const item of sequence) {
+    if (item === pattern[matched]) matched++;
+    if (matched === pattern.length) return true;
+  }
+  return false;
+}
+
+/**
+ * Interactive BACK-AND-FORTH model switch through the real CLI under PTY.
+ *
+ * Starts on glm-4.7 (→ z.ai custom provider), sends a real prompt, switches
+ * `/model` to sonnet (→ Anthropic OAuth passthrough) MID-SESSION — handling the
+ * "Switch model?" confirm dialog that appears once a conversation is cached —
+ * sends another prompt, then switches `/model` BACK to glm-4.7 and sends a third.
+ *
+ * This is what "switch back and forth" requires and what a single one-way
+ * switch (testModelSwitch) cannot prove. The deterministic oracle is the proxy
+ * session log: the route sequence must contain Provider → Anthropic → Provider,
+ * proving each request after a switch is routed independently and the session
+ * round-trips both ways. Real upstream calls (z.ai + Anthropic OAuth), like the
+ * other interactive tests. A dropped keystroke (CLI input-buffer race) that
+ * lets fewer than 3 requests reach the proxy yields INCONCLUSIVE, not FAIL —
+ * same policy as the other TUI tests.
+ */
+async function testModelSwitchBackAndForth() {
+  console.log('\nTesting in-session model switch BACK AND FORTH (glm-4.7 → sonnet → glm-4.7)...');
+  const CCB_BIN = path.join(PKG_ROOT, 'bin', 'ccb.js');
+  // Snapshot the session-log dirs that already exist (from earlier tests on the
+  // same daemon) so we can read THIS session's log specifically, not whichever
+  // happens to be most recent.
+  const logsDir = path.join(TEST_CONFIG_DIR, LOGS_DIR_NAME);
+  const knownBefore = new Set(
+    fs.existsSync(logsDir)
+      ? fs.readdirSync(logsDir, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => d.name)
+      : []
+  );
+  const ownContent = () => newestSessionLogContent(logsDir, knownBefore);
+
+  const session = new InteractiveSession(process.execPath, [CCB_BIN, '--model', 'glm-4.7'], {
+    ...process.env,
+    CCB_CONFIG_DIR: TEST_CONFIG_DIR
+  });
+
+  // Switch /model, accepting the cached-conversation "Switch model?" confirm
+  // dialog (option 1 = Yes) when it appears. Returns false if nothing happened.
+  async function switchModel(target) {
+    session.clearOutput();
+    session.send(`/model ${target}\r`);
+    // Verified manually: once a conversation is cached, BOTH glm→sonnet and
+    // sonnet→glm pop a "Switch model?" confirm dialog ("1. Yes, switch to <m>");
+    // accepting it prints "Set model to <m>". (A switch before any history would
+    // skip straight to "Set model to".)
+    // The TUI renders spacing with cursor-positioning escapes, so stripAnsi
+    // collapses inter-word spaces ("Switch model?" → "Switchmodel?"). Match with
+    // \s* so the patterns hold whether or not a literal space survives.
+    const appeared = await session.waitFor(/Switch\s*model\?|Set\s*model\s*to/, 15000);
+    if (!appeared) return false;
+    if (/Switch\s*model\?|Yes,\s*switch/.test(session.visible)) {
+      session.send('1\r');                                  // option 1 = Yes
+    }
+    return await session.waitFor(/Set\s*model\s*to/, 15000);
+  }
+
+  // Send a prompt and wait until the proxy has FINISHED answering this turn,
+  // polling the session log's response count until it stops growing for a
+  // sustained window. This is TUI-independent: a terminal quiescence (or a
+  // word/digit match against the prompt's own echo) can return during a
+  // mid-generation pause and drop the next /model into an unfinished turn —
+  // verified, that is exactly what made the switch silently no-op.
+  async function ask(text) {
+    session.clearOutput();
+    // Type the prompt, let it render, THEN submit. Sending text+CR together can
+    // lose the submit when a late startup notice (e.g. the tmux focus-events
+    // banner) re-renders the input mid-keystroke — verified: that left only the
+    // background title request firing, never the real message.
+    session.send(text);
+    await sleep(400);
+    session.send('\r');
+    // The model's answer renders as "● <text>". The status bar ALWAYS shows a
+    // bullet too — "● high|low|medium · /effort" — so a bare /●/ matches instantly
+    // and a following quiescence then returns during the count_tokens→message gap.
+    // Match a bullet NOT followed by an effort word, i.e. the real answer.
+    await session.waitFor(/●\s*(?!high\b|low\b|medium\b)\S/, 90000);
+    await session.waitForQuiescence(2500, 30000);      // answer finished streaming
+  }
+
+  try {
+    // Startup may raise a "Settings Warning … 1. Continue" dialog (the repo
+    // .claude/settings.json carries an invalid rule) OR go straight to the
+    // prompt. Wait for DEFINITIVE content, never a quiet gap — the dialog can
+    // take several seconds to render and a premature quiescence check misses
+    // it, leaving every later keystroke typed into the open dialog.
+    const startup = await session.waitFor(/Settings\s*Warning|1\.\s*Continue|glm-4\.7\s*\[/, 45000);
+    if (!startup) { console.error('  FAIL: session never reached startup'); return false; }
+    if (/Settings\s*Warning|1\.\s*Continue/.test(session.visible)) {
+      session.send('\r');                                  // Enter = "1. Continue"
+    }
+    const ready = await session.waitFor(/glm-4\.7\s*\[/, 30000);   // model status bar = ready
+    if (!ready) { console.error('  FAIL: initial prompt never appeared'); return false; }
+    await session.waitForQuiescence(2500, 25000);   // let all startup notices (focus-events banner) finish
+
+    await ask('Remember the number 42. In ONE short line: your model name and maker.');         // glm-4.7 → z.ai
+    if (!(await switchModel('sonnet'))) { console.error('  FAIL: /model sonnet had no effect'); return false; }
+    await ask('What number did I ask you to remember, and what model are you now? One line.');   // sonnet → Anthropic
+    if (!(await switchModel('glm-4.7'))) { console.error('  FAIL: /model glm-4.7 had no effect'); return false; }
+    await ask('One short line: your model name and maker.');                                     // glm-4.7 → z.ai again
+  } finally {
+    await session.close();
+  }
+
+  const sequence = [...ownContent().matchAll(/\[REQ #\d+\] → (Provider|Anthropic)\b/g)].map(m => m[1]);
+  const condensed = condenseRouteSequence(sequence);
+  console.log(`  route sequence: ${condensed.join(' → ') || '(none)'}`);
+
+  if (containsOrderedSubsequence(condensed, ['Provider', 'Anthropic', 'Provider'])) {
+    console.log('  PASS: in-session switch routed BACK AND FORTH (z.ai → Anthropic → z.ai)');
+    return true;
+  }
+  if (sequence.length < 3) {
+    console.warn(`  INCONCLUSIVE: only ${sequence.length} forwarded request(s) reached the proxy (CLI input-buffer drop). Not a routing failure.`);
+    return true;
+  }
+  console.error(`  FAIL: routing did not round-trip both ways. Route sequence: ${condensed.join(' → ')}`);
+  return false;
+}
+
+/**
  * Concurrency stress through the full Claude → ccb → z.ai → response chain.
  * Spawns the real CLI under PTY (just like a user), fires several prompts in
  * a row without waiting for the previous response to fully complete, asserts
@@ -4247,6 +4408,9 @@ async function runIntegrationTests() {
 
   const rSwitch = await testModelSwitch();
   modelSuccess = modelSuccess && rSwitch;
+
+  const rBackForth = await testModelSwitchBackAndForth();
+  modelSuccess = modelSuccess && rBackForth;
 
   console.log('\nRunning TTY concurrency stress (real z.ai through Claude CLI)...');
   const rTtyConcurrency = await assertTtyConcurrency();
