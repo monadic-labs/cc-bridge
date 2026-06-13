@@ -1019,9 +1019,13 @@ async function entry() {
   const activePort = readActivePort(config);
   const ipcPath = getControlIpcPath(activePort);
   const KEEPALIVE_INTERVAL_MS = 15000;
+  const RECONNECT_FLOOR_MS = 1000;
+  const RECONNECT_CEILING_MS = 30000;
+  const RECONNECT_MULTIPLIER = 2;
 
   let ipcSocket = null;
   let keepaliveTimer = null;
+  let reconnectDelayMs = RECONNECT_FLOOR_MS;
   let claudeAlive = true;
 
   function connectKeepalive() {
@@ -1031,6 +1035,7 @@ async function entry() {
     }
 
     ipcSocket = net.connect(ipcPath, () => {
+      reconnectDelayMs = RECONNECT_FLOOR_MS;
       ipcSocket.write(serializeIpcMessage({ cmd: 'keepalive' }));
       if (keepaliveTimer) clearInterval(keepaliveTimer);
       keepaliveTimer = setInterval(() => {
@@ -1044,7 +1049,10 @@ async function entry() {
 
     ipcSocket.on('close', () => {
       if (keepaliveTimer) { clearInterval(keepaliveTimer); keepaliveTimer = null; }
-      if (claudeAlive) connectKeepalive();
+      if (!claudeAlive) return;
+      const delay = reconnectDelayMs;
+      reconnectDelayMs = Math.min(reconnectDelayMs * RECONNECT_MULTIPLIER, RECONNECT_CEILING_MS);
+      setTimeout(connectKeepalive, delay);
     });
   }
 
