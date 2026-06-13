@@ -1460,6 +1460,49 @@ async function runUnitTests() {
     defaultFallback: { providerId: 'nonexistent', model: 'm' }
   }), ArgErr, 'RoutingPolicy rejects unknown default fallback provider');
 
+  // Validation: wildcard-shadows-exact — regex preceding exact that it matches
+  console.log('\nRoutingPolicy wildcard-shadows-exact:');
+  assertThrows(() => new RoutingPolicy({
+    rules: [
+      new RegexRule({ pattern: '.*opus.*', targetProvider: 'local', targetModel: 'fast' }),
+      new ExactRule({ match: 'claude-opus-4-6', targetProvider: 'mirror', targetModel: 'real-opus' })
+    ],
+    providerConfigs: policyProviders,
+    legacyProvidersMap: legacyMap
+  }), ArgErr, 'RoutingPolicy rejects wildcard shadowing exact (regex before exact)');
+
+  // Reverse order (exact first, then wildcard) — no shadowing, should succeed
+  const exactBeforeWildcard = new RoutingPolicy({
+    rules: [
+      new ExactRule({ match: 'claude-opus-4-6', targetProvider: 'mirror', targetModel: 'real-opus' }),
+      new RegexRule({ pattern: '.*opus.*', targetProvider: 'local', targetModel: 'fast' })
+    ],
+    providerConfigs: policyProviders,
+    legacyProvidersMap: legacyMap
+  });
+  assert(exactBeforeWildcard.size === 2, 'RoutingPolicy exact-before-wildcard succeeds');
+
+  // Wildcard only (no exact) — no shadowing possible, should succeed
+  const wildcardOnly = new RoutingPolicy({
+    rules: [
+      new RegexRule({ pattern: '.*opus.*', targetProvider: 'local', targetModel: 'fast' })
+    ],
+    providerConfigs: policyProviders,
+    legacyProvidersMap: legacyMap
+  });
+  assert(wildcardOnly.size === 1, 'RoutingPolicy wildcard-only succeeds');
+
+  // Regex + exact for a DIFFERENT model — no shadowing, should succeed
+  const noOverlap = new RoutingPolicy({
+    rules: [
+      new RegexRule({ pattern: '.*sonnet.*', targetProvider: 'local', targetModel: 'fast' }),
+      new ExactRule({ match: 'claude-opus-4-6', targetProvider: 'mirror', targetModel: 'real-opus' })
+    ],
+    providerConfigs: policyProviders,
+    legacyProvidersMap: legacyMap
+  });
+  assert(noOverlap.size === 2, 'RoutingPolicy non-overlapping regex+exact succeeds');
+
   // ── applyRoutingWithMatch ──
   console.log('\napplyRoutingWithMatch:');
   const { applyRoutingWithMatch } = await import('../src/core/routing.js');

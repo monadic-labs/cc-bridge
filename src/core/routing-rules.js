@@ -343,6 +343,23 @@ export class RoutingPolicy {
       }
     }
 
+    // Detect wildcard-shadows-exact: a regex rule preceding an exact rule whose
+    // compiled pattern matches the exact key, silently routing requests away from it.
+    for (let i = 0; i < rules.length; i++) {
+      const rule = rules[i];
+      if (rule.type !== 'exact') continue;
+      for (let j = 0; j < i; j++) {
+        const predecessor = rules[j];
+        if (predecessor.type !== 'regex') continue;
+        if (predecessor.matches({ model: rule.match })) {
+          throw new ArgumentError(
+            `Exact rule "${rule.match}" is shadowed by preceding wildcard "${predecessor.pattern}" — reorder or narrow the wildcard`,
+            { context: { exact: rule.match, wildcard: predecessor.pattern } }
+          );
+        }
+      }
+    }
+
     this.#rules = Object.freeze([...rules]);
     this.#providerMap = Object.freeze(providerMap);
     this.#legacyMap = legacyProvidersMap ?? null;
