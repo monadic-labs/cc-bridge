@@ -13,9 +13,9 @@ import {
   ArgumentError 
 } from '../src/core/exceptions.js';
 
-import { 
-  loadConfigFromFile, 
-  resolveUserConfigDir 
+import {
+  loadConfigFromFile,
+  resolveUserConfigDir
 } from '../src/core/config.js';
 
 import {
@@ -28,6 +28,9 @@ import {
   ENV_FILENAME,
   WATCHDOG_SCRIPT_NAME
 } from '../src/core/constants.js';
+
+import { createSnapshot, listSnapshots, getSnapshotWatchdogPath } from '../src/core/snapshot.js';
+import { CCBSnapshotError } from '../src/core/exceptions.js';
 
 import { 
   addRouteModel, 
@@ -70,6 +73,8 @@ const LOGS_DIR = path.join(USER_CONFIG_DIR, LOGS_DIR_NAME);
 const providersPath = path.join(USER_CONFIG_DIR, PROVIDERS_FILENAME);
 const VERSIONS_PATH = path.join(USER_CONFIG_DIR, VERSIONS_FILENAME);
 const RUNTIME_PATH = path.join(USER_CONFIG_DIR, RUNTIME_FILENAME);
+const VERSIONS_DIR = path.join(USER_CONFIG_DIR, 'versions');
+const PKG_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function readRuntimeState() {
   try {
@@ -87,12 +92,13 @@ function readActivePort(config) {
 }
 
 function loadVersions() {
-  const versions = readJsonFile(VERSIONS_PATH) ?? { current: CCB_VERSION, versions: {} };
-  // Ensure current version is always in the list
-  const pkgRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-  const watchdogPath = path.join(pkgRoot, 'bin', WATCHDOG_SCRIPT_NAME);
-  versions.versions[CCB_VERSION] = watchdogPath;
-  return versions;
+  const legacy = readJsonFile(VERSIONS_PATH) ?? { current: CCB_VERSION, versions: {} };
+  const snapshots = listSnapshots(VERSIONS_DIR);
+  const mergedVersions = { ...legacy.versions };
+  for (const snap of snapshots) {
+    mergedVersions[snap.identity] = getSnapshotWatchdogPath(snap.snapshotDir);
+  }
+  return { current: legacy.current ?? CCB_VERSION, versions: mergedVersions };
 }
 
 function saveVersions(versions) {
@@ -827,22 +833,36 @@ function displaySessionSummary(info) {
     } catch { /* best effort */ }
   }
 
-  function startProxyDaemonProcess(versionInfo) {
+  async function startProxyDaemonProcess(versionInfo) {
   const logsDir = path.join(USER_CONFIG_DIR, LOGS_DIR_NAME);
   if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
+  if (!fs.existsSync(VERSIONS_DIR)) fs.mkdirSync(VERSIONS_DIR, { recursive: true });
 
   const out = fs.openSync(path.join(logsDir, 'daemon.log'), 'a');
   const err = fs.openSync(path.join(logsDir, 'daemon.err'), 'a');
 
-  let watchdogPath = path.join(path.dirname(fileURLToPath(import.meta.url)), WATCHDOG_SCRIPT_NAME);
+  // Explicit version selection takes priority over snapshot.
   if (versionInfo && versionInfo.path) {
-    watchdogPath = versionInfo.path;
+    const child = spawnDaemon(versionInfo.path, [], {
+      detached: true,
+      stdio: ['ignore', out, err],
+      env: { ...process.env, CCB_VERSION: versionInfo.name }
+    });
+    child.unref();
+    return;
   }
+
+  const snapshotResult = createSnapshot(PKG_ROOT, VERSIONS_DIR);
+  const watchdogPath = getSnapshotWatchdogPath(snapshotResult.snapshotDir);
 
   const child = spawnDaemon(watchdogPath, [], {
     detached: true,
     stdio: ['ignore', out, err],
-    env: { ...process.env, CCB_VERSION: versionInfo?.name || CCB_VERSION }
+    env: {
+      ...process.env,
+      CCB_VERSION: CCB_VERSION,
+      CCB_SNAPSHOT_DIR: snapshotResult.snapshotDir
+    }
   });
 
   child.unref();
@@ -887,7 +907,7 @@ function displaySessionSummary(info) {
     // Fall through to startProxyDaemonProcess.
   }
 
-  startProxyDaemonProcess(versionInfo);
+  await startProxyDaemonProcess(versionInfo);
 
   // Phase-aware startup wait with two progress signals:
   //  1. TCP port becomes listenable (insensitive to stdout buffering — works
@@ -1086,6 +1106,11 @@ async function entry() {
 }
 
 function handleError(err) {
+  if (err instanceof CCBSnapshotError) {
+    process.stderr.write(`ccb snapshot error: ${err.message}\n`);
+    process.exit(1);
+  }
+
   if (err instanceof ReadinessTimeoutException) {
     process.stderr.write(`ccb error: ${err.message}\n`);
     process.exit(1);

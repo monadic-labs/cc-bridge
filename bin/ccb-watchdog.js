@@ -19,7 +19,9 @@ import { spawnDaemon } from '../src/infra/process-manager.js';
 import { ReadinessTimeoutException } from '../src/core/exceptions.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const WORKER_SCRIPT = path.join(__dirname, '..', 'src', 'proxy.js');
+const WORKER_SCRIPT = process.env.CCB_SNAPSHOT_DIR
+  ? path.join(process.env.CCB_SNAPSHOT_DIR, 'src', 'proxy.js')
+  : path.join(__dirname, '..', 'src', 'proxy.js');
 
 // All daemon-lifecycle state lives in this single instance — the watchdog's
 // state machine. Module scope holds the instance, not the fields. See
