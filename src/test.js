@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import http from 'http';
 import fs from 'fs';
 import os from 'os';
@@ -2925,6 +2926,177 @@ async function runUnitTests() {
     anthropicZeroTr.transformChunk('data: {"type":"message_start","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100}}}\n\n');
     anthropicZeroTr.transformChunk('data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"output_tokens":5}}\n\n');
     assert(anthropicZeroTr.inputTokens === 100, 'transformer: delta input_tokens:0 does not clobber message_start value');
+  }
+
+  // ── Snapshot module ──
+  console.log('\nSnapshot module:');
+  {
+    const { createSnapshot, listSnapshots, findSnapshot, getSnapshotWatchdogPath } = await import('../src/core/snapshot.js');
+    const { CCBSnapshotError } = await import('../src/core/exceptions.js');
+
+    const makeSourceTree = (rootDir, version) => {
+      fs.mkdirSync(path.join(rootDir, 'src'), { recursive: true });
+      fs.mkdirSync(path.join(rootDir, 'bin'), { recursive: true });
+      fs.writeFileSync(path.join(rootDir, 'package.json'), JSON.stringify({ name: 'test', version }));
+      fs.writeFileSync(path.join(rootDir, 'src', 'proxy-core.js'), 'export const x = 1;');
+      fs.writeFileSync(path.join(rootDir, 'src', 'test.js'), 'should be excluded');
+      fs.writeFileSync(path.join(rootDir, 'bin', WATCHDOG_SCRIPT_NAME), '#!/usr/bin/env node\nconsole.log("watchdog");');
+    };
+
+    // Test 1: identity format <semver>+<hex10>
+    const tempRoot1 = path.join(os.tmpdir(), `ccb-snap-test-${crypto.randomBytes(4).toString('hex')}`);
+    const versionsDir1 = path.join(os.tmpdir(), `ccb-snap-vers-${crypto.randomBytes(4).toString('hex')}`);
+    try {
+      fs.mkdirSync(tempRoot1, { recursive: true });
+      fs.mkdirSync(versionsDir1, { recursive: true });
+      makeSourceTree(tempRoot1, '2.1.0');
+      const result1 = createSnapshot(tempRoot1, versionsDir1);
+      assert(/^2\.1\.0\+[0-9a-f]{10}$/.test(result1.identity), 'identity matches <semver>+<hex10> format');
+      assert(typeof result1.snapshotDir === 'string' && result1.snapshotDir.length > 0, 'snapshotDir is a non-empty string');
+    } finally {
+      try { fs.rmSync(tempRoot1, { recursive: true, force: true }); } catch { }
+      try { fs.rmSync(versionsDir1, { recursive: true, force: true }); } catch { }
+    }
+
+    // Test 2: snapshot contains src/, bin/, package.json
+    const tempRoot2 = path.join(os.tmpdir(), `ccb-snap-test-${crypto.randomBytes(4).toString('hex')}`);
+    const versionsDir2 = path.join(os.tmpdir(), `ccb-snap-vers-${crypto.randomBytes(4).toString('hex')}`);
+    try {
+      fs.mkdirSync(tempRoot2, { recursive: true });
+      fs.mkdirSync(versionsDir2, { recursive: true });
+      makeSourceTree(tempRoot2, '2.1.0');
+      const result2 = createSnapshot(tempRoot2, versionsDir2);
+      assert(fs.existsSync(path.join(result2.snapshotDir, 'src', 'proxy-core.js')), 'snapshot contains src/proxy-core.js');
+      assert(fs.existsSync(path.join(result2.snapshotDir, 'bin', WATCHDOG_SCRIPT_NAME)), 'snapshot contains bin/ccb-watchdog.js');
+      assert(fs.existsSync(path.join(result2.snapshotDir, 'package.json')), 'snapshot contains package.json');
+    } finally {
+      try { fs.rmSync(tempRoot2, { recursive: true, force: true }); } catch { }
+      try { fs.rmSync(versionsDir2, { recursive: true, force: true }); } catch { }
+    }
+
+    // Test 3: snapshot excludes src/test.js and package-lock.json
+    const tempRoot3 = path.join(os.tmpdir(), `ccb-snap-test-${crypto.randomBytes(4).toString('hex')}`);
+    const versionsDir3 = path.join(os.tmpdir(), `ccb-snap-vers-${crypto.randomBytes(4).toString('hex')}`);
+    try {
+      fs.mkdirSync(tempRoot3, { recursive: true });
+      fs.mkdirSync(versionsDir3, { recursive: true });
+      makeSourceTree(tempRoot3, '2.1.0');
+      fs.writeFileSync(path.join(tempRoot3, 'package-lock.json'), '{}');
+      const result3 = createSnapshot(tempRoot3, versionsDir3);
+      assert(!fs.existsSync(path.join(result3.snapshotDir, 'src', 'test.js')), 'snapshot excludes src/test.js');
+      assert(!fs.existsSync(path.join(result3.snapshotDir, 'package-lock.json')), 'snapshot excludes package-lock.json');
+    } finally {
+      try { fs.rmSync(tempRoot3, { recursive: true, force: true }); } catch { }
+      try { fs.rmSync(versionsDir3, { recursive: true, force: true }); } catch { }
+    }
+
+    // Test 4: editing source file after snapshot does not change snapshot copy
+    const tempRoot4 = path.join(os.tmpdir(), `ccb-snap-test-${crypto.randomBytes(4).toString('hex')}`);
+    const versionsDir4 = path.join(os.tmpdir(), `ccb-snap-vers-${crypto.randomBytes(4).toString('hex')}`);
+    try {
+      fs.mkdirSync(tempRoot4, { recursive: true });
+      fs.mkdirSync(versionsDir4, { recursive: true });
+      makeSourceTree(tempRoot4, '2.1.0');
+      const result4 = createSnapshot(tempRoot4, versionsDir4);
+      const snapshotContent = fs.readFileSync(path.join(result4.snapshotDir, 'src', 'proxy-core.js'), 'utf8');
+      fs.writeFileSync(path.join(tempRoot4, 'src', 'proxy-core.js'), 'MUTATED CONTENT');
+      const snapshotContentAfter = fs.readFileSync(path.join(result4.snapshotDir, 'src', 'proxy-core.js'), 'utf8');
+      assert(snapshotContent === snapshotContentAfter, 'snapshot is isolated — source mutation does not affect snapshot copy');
+    } finally {
+      try { fs.rmSync(tempRoot4, { recursive: true, force: true }); } catch { }
+      try { fs.rmSync(versionsDir4, { recursive: true, force: true }); } catch { }
+    }
+
+    // Test 5: calling createSnapshot twice with identical content returns same identity
+    const tempRoot5 = path.join(os.tmpdir(), `ccb-snap-test-${crypto.randomBytes(4).toString('hex')}`);
+    const versionsDir5 = path.join(os.tmpdir(), `ccb-snap-vers-${crypto.randomBytes(4).toString('hex')}`);
+    try {
+      fs.mkdirSync(tempRoot5, { recursive: true });
+      fs.mkdirSync(versionsDir5, { recursive: true });
+      makeSourceTree(tempRoot5, '2.1.0');
+      const first = createSnapshot(tempRoot5, versionsDir5);
+      const second = createSnapshot(tempRoot5, versionsDir5);
+      assert(first.identity === second.identity, 'idempotent: same content produces same identity');
+      assert(first.snapshotDir === second.snapshotDir, 'idempotent: same snapshotDir returned');
+    } finally {
+      try { fs.rmSync(tempRoot5, { recursive: true, force: true }); } catch { }
+      try { fs.rmSync(versionsDir5, { recursive: true, force: true }); } catch { }
+    }
+
+    // Test 6: listSnapshots returns created snapshots sorted by creation time
+    const tempRoot6 = path.join(os.tmpdir(), `ccb-snap-test-${crypto.randomBytes(4).toString('hex')}`);
+    const versionsDir6 = path.join(os.tmpdir(), `ccb-snap-vers-${crypto.randomBytes(4).toString('hex')}`);
+    try {
+      fs.mkdirSync(tempRoot6, { recursive: true });
+      fs.mkdirSync(versionsDir6, { recursive: true });
+      makeSourceTree(tempRoot6, '1.0.0');
+      const snap6a = createSnapshot(tempRoot6, versionsDir6);
+      // Mutate to get a different content hash / identity
+      fs.writeFileSync(path.join(tempRoot6, 'src', 'proxy-core.js'), 'export const x = 2;');
+      fs.writeFileSync(path.join(tempRoot6, 'package.json'), JSON.stringify({ name: 'test', version: '1.0.1' }));
+      const snap6b = createSnapshot(tempRoot6, versionsDir6);
+      const list6 = listSnapshots(versionsDir6);
+      assert(list6.length === 2, `listSnapshots returns 2 entries (got ${list6.length})`);
+      // Most recent first
+      assert(list6[0].identity === snap6b.identity || list6[0].identity === snap6a.identity, 'listSnapshots has correct identities');
+      // Verify sorted desc by createdAt
+      assert(list6[0].createdAt >= list6[1].createdAt, 'listSnapshots sorted by createdAt descending');
+    } finally {
+      try { fs.rmSync(tempRoot6, { recursive: true, force: true }); } catch { }
+      try { fs.rmSync(versionsDir6, { recursive: true, force: true }); } catch { }
+    }
+
+    // Test 7: findSnapshot returns correct snapshot by identity
+    const tempRoot7 = path.join(os.tmpdir(), `ccb-snap-test-${crypto.randomBytes(4).toString('hex')}`);
+    const versionsDir7 = path.join(os.tmpdir(), `ccb-snap-vers-${crypto.randomBytes(4).toString('hex')}`);
+    try {
+      fs.mkdirSync(tempRoot7, { recursive: true });
+      fs.mkdirSync(versionsDir7, { recursive: true });
+      makeSourceTree(tempRoot7, '2.1.0');
+      const snap7 = createSnapshot(tempRoot7, versionsDir7);
+      const found7 = findSnapshot(versionsDir7, snap7.identity);
+      assert(found7 !== null, 'findSnapshot returns non-null for existing identity');
+      assert(found7.snapshotDir === snap7.snapshotDir, 'findSnapshot returns correct snapshotDir');
+      const notFound7 = findSnapshot(versionsDir7, 'nonexistent+0000000000');
+      assert(notFound7 === null, 'findSnapshot returns null for unknown identity');
+    } finally {
+      try { fs.rmSync(tempRoot7, { recursive: true, force: true }); } catch { }
+      try { fs.rmSync(versionsDir7, { recursive: true, force: true }); } catch { }
+    }
+
+    // Test 8: getSnapshotWatchdogPath returns correct path
+    const tempRoot8 = path.join(os.tmpdir(), `ccb-snap-test-${crypto.randomBytes(4).toString('hex')}`);
+    const versionsDir8 = path.join(os.tmpdir(), `ccb-snap-vers-${crypto.randomBytes(4).toString('hex')}`);
+    try {
+      fs.mkdirSync(tempRoot8, { recursive: true });
+      fs.mkdirSync(versionsDir8, { recursive: true });
+      makeSourceTree(tempRoot8, '2.1.0');
+      const snap8 = createSnapshot(tempRoot8, versionsDir8);
+      const watchdogPath = getSnapshotWatchdogPath(snap8.snapshotDir);
+      assert(watchdogPath === path.join(snap8.snapshotDir, 'bin', WATCHDOG_SCRIPT_NAME), 'getSnapshotWatchdogPath returns correct absolute path');
+      assert(fs.existsSync(watchdogPath), 'watchdog file exists at the returned path');
+    } finally {
+      try { fs.rmSync(tempRoot8, { recursive: true, force: true }); } catch { }
+      try { fs.rmSync(versionsDir8, { recursive: true, force: true }); } catch { }
+    }
+
+    // Test 9: CCBSnapshotError is thrown when size limit exceeded
+    const tempRoot9 = path.join(os.tmpdir(), `ccb-snap-test-${crypto.randomBytes(4).toString('hex')}`);
+    const versionsDir9 = path.join(os.tmpdir(), `ccb-snap-vers-${crypto.randomBytes(4).toString('hex')}`);
+    try {
+      fs.mkdirSync(tempRoot9, { recursive: true });
+      fs.mkdirSync(path.join(tempRoot9, 'src'), { recursive: true });
+      fs.mkdirSync(path.join(tempRoot9, 'bin'), { recursive: true });
+      fs.mkdirSync(versionsDir9, { recursive: true });
+      fs.writeFileSync(path.join(tempRoot9, 'package.json'), JSON.stringify({ name: 'test', version: '9.9.9' }));
+      // Write a 6 MB file to trigger the limit
+      const bigBuffer = Buffer.alloc(6 * 1024 * 1024, 0x41);
+      fs.writeFileSync(path.join(tempRoot9, 'src', 'big.js'), bigBuffer);
+      assertThrows(() => createSnapshot(tempRoot9, versionsDir9), CCBSnapshotError, 'CCBSnapshotError thrown when snapshot exceeds 5 MB');
+    } finally {
+      try { fs.rmSync(tempRoot9, { recursive: true, force: true }); } catch { }
+      try { fs.rmSync(versionsDir9, { recursive: true, force: true }); } catch { }
+    }
   }
 
 }

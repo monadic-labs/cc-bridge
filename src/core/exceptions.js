@@ -89,6 +89,10 @@ export class UpstreamError extends ProxyError {
   get responseBody() { return this.#responseBody; }
 }
 
+export class CCBSnapshotError extends ProxyError {
+  constructor(message, props) { super(message, { operation: 'snapshot', ...props }); }
+}
+
 export class SessionInfoError extends ProxyError {
   #metadata;
 
