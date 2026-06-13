@@ -2,6 +2,7 @@ import { spawn, execFile, execSync, spawnSync } from 'child_process';
 import process from 'process';
 import path from 'path';
 import { WATCHDOG_SCRIPT_NAME } from '../core/constants.js';
+import { SubprocessTimeoutError, SubprocessOutputError, SubprocessExitError } from '../core/exceptions.js';
 
 /**
  * Spawn a Node.js script as a background/detached process.
@@ -41,6 +42,96 @@ export function execCommand(cmd, args, options) {
       if (err) return reject(err);
       resolve(stdout ?? '');
     });
+  });
+}
+
+/**
+ * Spawn a command, write `input` to its stdin, and return buffered stdout.
+ *
+ * Designed for CLI tools that read their prompt from stdin (e.g. `agy -p`).
+ * Avoids shell argument expansion entirely — the input is delivered over the
+ * pipe, so there is no per-argument size limit (MAX_ARG_STRLEN) and no shell
+ * quoting or injection surface.
+ *
+ * @param {string}   cmd     - Absolute path or PATH-resolvable command name.
+ * @param {string[]} args    - Arguments (no shell — each element is one argv).
+ * @param {string}   input   - Text to write to stdin (UTF-8).
+ * @param {object}   [options]
+ * @param {number}   [options.timeout]   - Hard-kill timeout in ms (default: none).
+ * @param {number}   [options.maxBuffer] - Max stdout bytes (default: 10 MB).
+ * @returns {Promise<string>} Resolves with stdout string on exit 0.
+ * @throws On non-zero exit, spawn error, or timeout.
+ */
+export function spawnWithStdin(cmd, args, input, options = {}) {
+  const { timeout, maxBuffer = 10 * 1024 * 1024 } = options;
+
+  return new Promise((resolve, reject) => {
+    // eslint-disable-next-line local/no-direct-spawn
+    const child = spawn(cmd, args, {
+      windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let stdoutBytes = 0;
+    let timedOut = false;
+    let settled = false;
+
+    function settle(err, value) {
+      if (settled) return;
+      settled = true;
+      if (err) return reject(err);
+      resolve(value);
+    }
+
+    let killTimer = null;
+    if (timeout != null) {
+      killTimer = setTimeout(() => {
+        timedOut = true;
+        try { child.kill('SIGKILL'); } catch { /* process may have already exited */ }
+      }, timeout);
+    }
+
+    child.stdout.on('data', (chunk) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > maxBuffer) {
+        try { child.kill('SIGKILL'); } catch { /* already dead */ }
+        settle(Object.assign(new SubprocessOutputError(`stdout exceeded maxBuffer (${maxBuffer} bytes)`, { maxBytes: maxBuffer }), { killed: true }));
+        return;
+      }
+      stdout += chunk.toString('utf8');
+    });
+
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString('utf8');
+    });
+
+    child.on('error', (err) => {
+      if (killTimer != null) clearTimeout(killTimer);
+      settle(err);
+    });
+
+    child.on('close', (code) => {
+      if (killTimer != null) clearTimeout(killTimer);
+      if (timedOut) {
+        settle(Object.assign(new SubprocessTimeoutError(`Process killed after ${timeout}ms timeout`, { timeoutMs: timeout }), { killed: true }));
+        return;
+      }
+      if (code !== 0) {
+        const errMsg = stderr.trim() || `exited with code ${code}`;
+        settle(Object.assign(new SubprocessExitError(errMsg, { exitCode: code }), { killed: false }));
+        return;
+      }
+      settle(null, stdout);
+    });
+
+    try {
+      child.stdin.write(input, 'utf8');
+      child.stdin.end();
+    } catch (err) {
+      settle(err);
+    }
   });
 }
 

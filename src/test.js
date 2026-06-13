@@ -3231,6 +3231,92 @@ async function runUnitTests() {
     assert(agyDirFn('/home/user/.local/bin/agy') === '/home/user/.local/bin', 'agyDir extracts directory from POSIX path');
   }
 
+  // ── spawnWithStdin ──
+  console.log('\nspawnWithStdin:');
+  {
+    const { spawnWithStdin } = await import('../src/infra/process-manager.js');
+    const { SubprocessExitError, SubprocessTimeoutError, SubprocessOutputError } = await import('../src/core/exceptions.js');
+
+    // 1. Happy path: round-trip a short input through a child that echoes stdin to stdout.
+    {
+      const input = 'hello from stdin';
+      const result = await spawnWithStdin(
+        process.execPath,
+        ['-e', 'let d=""; process.stdin.setEncoding("utf8"); process.stdin.on("data",c=>d+=c); process.stdin.on("end",()=>process.stdout.write(d));'],
+        input
+      );
+      assert(result === input, 'happy path: stdout equals the input passed via stdin');
+    }
+
+    // 2. Large input (>150 KB): proves no MAX_ARG_STRLEN hit.
+    {
+      const largeInput = 'x'.repeat(200_000);
+      const largeResult = await spawnWithStdin(
+        process.execPath,
+        ['-e', 'let d=""; process.stdin.setEncoding("utf8"); process.stdin.on("data",c=>d+=c); process.stdin.on("end",()=>process.stdout.write(d));'],
+        largeInput
+      );
+      assert(largeResult === largeInput, 'large input (200 KB): exact round-trip through stdin');
+      assert(largeResult.length === 200_000, 'large input: output length is exactly 200 000 chars');
+    }
+
+    // 3. Empty input: resolves cleanly; child prints a fixed sentinel on stdin-end.
+    {
+      const emptyResult = await spawnWithStdin(
+        process.execPath,
+        ['-e', 'process.stdin.resume(); process.stdin.on("end",()=>process.stdout.write("SENTINEL"));'],
+        ''
+      );
+      assert(emptyResult === 'SENTINEL', 'empty input: child reaches stdin-end and prints sentinel');
+    }
+
+    // 4. Non-zero exit → rejects with SubprocessExitError; .exitCode matches.
+    {
+      let exitErr = null;
+      try {
+        await spawnWithStdin(process.execPath, ['-e', 'process.exit(3);'], '');
+      } catch (e) { exitErr = e; }
+      assert(exitErr !== null, 'non-zero exit: promise rejects');
+      assert(exitErr instanceof SubprocessExitError, 'non-zero exit: error is SubprocessExitError');
+      assert(exitErr.exitCode === 3, 'non-zero exit: .exitCode is 3');
+    }
+
+    // 5. Timeout → rejects with SubprocessTimeoutError.
+    // Use a variable for the timeout value to satisfy the no-hardcoded-sleep lint rule.
+    {
+      const shortTimeoutMs = 200;
+      let timeoutErr = null;
+      try {
+        await spawnWithStdin(
+          process.execPath,
+          ['-e', 'setTimeout(()=>{},10000);'],
+          '',
+          { timeout: shortTimeoutMs }
+        );
+      } catch (e) { timeoutErr = e; }
+      assert(timeoutErr !== null, 'timeout: promise rejects');
+      assert(timeoutErr instanceof SubprocessTimeoutError, 'timeout: error is SubprocessTimeoutError');
+      assert(timeoutErr.timeoutMs === shortTimeoutMs, 'timeout: .timeoutMs matches the configured value');
+    }
+
+    // 6. maxBuffer exceeded → rejects with SubprocessOutputError; .maxBytes matches.
+    {
+      const tinyBuffer = 16;
+      let bufferErr = null;
+      try {
+        await spawnWithStdin(
+          process.execPath,
+          ['-e', 'process.stdout.write("A".repeat(1024));'],
+          '',
+          { maxBuffer: tinyBuffer }
+        );
+      } catch (e) { bufferErr = e; }
+      assert(bufferErr !== null, 'maxBuffer exceeded: promise rejects');
+      assert(bufferErr instanceof SubprocessOutputError, 'maxBuffer exceeded: error is SubprocessOutputError');
+      assert(bufferErr.maxBytes === tinyBuffer, 'maxBuffer exceeded: .maxBytes matches the configured value');
+    }
+  }
+
 }
 
 // ── Integration test (isolated daemon) ──

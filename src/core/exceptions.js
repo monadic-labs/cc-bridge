@@ -54,6 +54,36 @@ export class ReadinessTimeoutException extends ProxyError {
   constructor(message, props) { super(message, { operation: 'process-manager', ...props }); }
 }
 
+export class SubprocessTimeoutError extends ProxyError {
+  #timeoutMs;
+  constructor(message, opts = {}) {
+    const { timeoutMs, ...props } = opts;
+    super(message, { operation: 'process-manager', ...props });
+    this.#timeoutMs = timeoutMs ?? 0;
+  }
+  get timeoutMs() { return this.#timeoutMs; }
+}
+
+export class SubprocessOutputError extends ProxyError {
+  #maxBytes;
+  constructor(message, opts = {}) {
+    const { maxBytes, ...props } = opts;
+    super(message, { operation: 'process-manager', ...props });
+    this.#maxBytes = maxBytes ?? 0;
+  }
+  get maxBytes() { return this.#maxBytes; }
+}
+
+export class SubprocessExitError extends ProxyError {
+  #exitCode;
+  constructor(message, opts = {}) {
+    const { exitCode, ...props } = opts;
+    super(message, { operation: 'process-manager', ...props });
+    this.#exitCode = exitCode ?? -1;
+  }
+  get exitCode() { return this.#exitCode; }
+}
+
 export class AuthError extends ProxyError {
   #reason;
 

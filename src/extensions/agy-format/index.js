@@ -17,11 +17,8 @@
  *  - requestTimeoutMs: per-request agy subprocess timeout (default: 120000)
  */
 
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import { ProviderConfig } from '../../core/providers.js';
-import { execCommand } from '../../infra/process-manager.js';
+import { execCommand, spawnWithStdin } from '../../infra/process-manager.js';
 import { ModelResolver } from './model-resolver.js';
 import { buildAgyInvocation } from './invocation-builder.js';
 import { resolveAgyBinary, agyDir } from './binary-resolver.js';
@@ -92,24 +89,20 @@ export function createAgyFormatExtension(config = {}, binaryProbe = undefined) {
   /**
    * Execute agy with a prompt and model, return the text output.
    *
-   * The prompt is written to a unique temp file and read via $(cat 'FILE') inside
-   * a double-quoted command substitution. This makes prompt handling content-agnostic
-   * (no single-quote escaping needed) and injection-safe (the shell that runs inside
-   * `script -c` expands the substitution, but the file CONTENT is passed verbatim as
-   * a single argument — not re-parsed for quotes, $, or backticks).
+   * LOCAL (default): spawn agy directly and write the prompt to its stdin. agy -p
+   * reads the prompt from stdin over a plain pipe (no PTY on agy 1.0.8), so there is
+   * no per-argument size limit (MAX_ARG_STRLEN ~128KB — real Claude Code payloads are
+   * ~236KB) and no shell quoting/injection surface: model and prompt never touch a shell.
    *
-   * NOTE: the temp-file approach is correct for LOCAL execution (the default and only
-   * current use). When sshHost is set the temp file would need to exist on the remote
-   * host; the sshHost path therefore falls back to the original single-quote-escape
-   * approach and carries this limitation in a comment.
+   * REMOTE (sshHost set, not the default): falls back to the shell+single-quote-escape
+   * approach, which carries the arg-size and quoting limitations noted at that site.
    */
   async function executeAgy(displayName, prompt) {
-    const escapedModel = displayName.replace(/'/g, "'\"'\"'");
-
     if (sshHost) {
       // Remote SSH path: temp file would need to exist on the remote host.
       // Limitation: double-quotes and $-signs in the prompt will break the command.
       // A future improvement should SCP a temp file to the remote host instead.
+      const escapedModel = displayName.replace(/'/g, "'\"'\"'");
       const escapedPrompt = prompt.replace(/'/g, "'\"'\"'");
       const shellCommand = `export PATH=${resolvedAgyDir}:$PATH; script -qec "agy --model '${escapedModel}' -p '${escapedPrompt}'" /dev/null`;
       const { cmd, args } = buildAgyInvocation(shellCommand, sshHost);
@@ -120,29 +113,18 @@ export function createAgyFormatExtension(config = {}, binaryProbe = undefined) {
       return stripAnsi(raw);
     }
 
-    // Local path: write prompt to a temp file; read it via $(cat) inside the PTY.
-    // The double-quoted $(cat 'FILE') passes file CONTENT verbatim as one argument —
-    // the subshell does NOT re-parse the content for quotes, $-signs, or backticks.
-    const tempFile = path.join(os.tmpdir(), `agy-prompt-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
-    try {
-      fs.writeFileSync(tempFile, prompt, { encoding: 'utf8' });
-
-      // Inside the outer double-quoted script -qec arg, \$ prevents the outer
-      // bash -c from expanding $(cat ...) prematurely; the subshell spawned by
-      // `script -c` then performs the expansion, passing the file content as a
-      // single argument to agy -p.
-      const shellCommand = `export PATH=${resolvedAgyDir}:$PATH; script -qec "agy --model '${escapedModel}' -p \\"\\$(cat '${tempFile}')\\"" /dev/null`;
-      const { cmd, args } = buildAgyInvocation(shellCommand, sshHost);
-
-      const raw = await execCommand(cmd, args, {
-        timeout: requestTimeoutMs,
-        maxBuffer: 10 * 1024 * 1024,
-      });
-
-      return stripAnsi(raw);
-    } finally {
-      try { fs.unlinkSync(tempFile); } catch { /* best-effort cleanup */ }
-    }
+    // Local path: spawn agy directly and write the prompt to its STDIN.
+    // agy -p reads the prompt from stdin over a plain pipe (no PTY needed on
+    // agy 1.0.8), so there is no MAX_ARG_STRLEN per-argument limit (real Claude
+    // Code payloads are ~236KB, well over the ~128KB single-arg cap) and no shell
+    // quoting or injection surface — the model name and prompt never touch a shell.
+    const raw = await spawnWithStdin(
+      resolvedAgyPath,
+      ['-p', '--model', displayName],
+      prompt,
+      { timeout: requestTimeoutMs, maxBuffer: 10 * 1024 * 1024 },
+    );
+    return stripAnsi(raw);
   }
 
   return {
