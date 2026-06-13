@@ -3675,6 +3675,181 @@ async function runUnitTests() {
     assertThrows(() => createBridgeServer({ listTools: () => [], onToolCall: () => {}, onFinalAnswer: () => {}, stdio: {} }), McpBridgeError, 'bridge: malformed stdio throws McpBridgeError');
   }
 
+  // ── agy-provider: provisioning pure builders (GEMINI.md, permissions, mcp-config) ──
+  console.log('\nagy-provider provisioning builders:');
+  {
+    const { buildGeminiMd, REQUIRED_DIRECTIVES } = await import('../src/extensions/agy-provider/provisioning/gemini-md.js');
+    const { buildPermissionsSettings, PERMISSION_RULES } = await import('../src/extensions/agy-provider/provisioning/permissions.js');
+    const { buildMcpConfig, BRIDGE_SERVER_KEY, SESSION_ID_ENV, McpConfigError } = await import('../src/extensions/agy-provider/provisioning/mcp-config.js');
+
+    // GEMINI.md: every load-bearing directive is present (no-native-tools +
+    // submit_final_answer + "do NOT just print it"). These three phrases are
+    // what force MCP-only routing + the terminal answer channel.
+    const md = buildGeminiMd();
+    for (const phrase of REQUIRED_DIRECTIVES) {
+      assert(md.toLowerCase().includes(phrase.toLowerCase()), `gemini-md: contains directive "${phrase}"`);
+    }
+    assert(typeof md === 'string' && md.length > 0, 'gemini-md: returns non-empty string');
+
+    // permissions: merge adds deny/allow WITHOUT clobbering other base keys.
+    const base = { theme: 'dark', telemetry: true, permissions: { ask: true } };
+    const settings = buildPermissionsSettings(base);
+    assert(settings.theme === 'dark', 'permissions: base top-level key preserved');
+    assert(settings.telemetry === true, 'permissions: another base key preserved');
+    assert(Array.isArray(settings.permissions.deny), 'permissions: deny is an array');
+    assert(JSON.stringify(settings.permissions.deny) === JSON.stringify(PERMISSION_RULES.deny), 'permissions: deny = the confirmed deny rules');
+    assert(JSON.stringify(settings.permissions.allow) === JSON.stringify(PERMISSION_RULES.allow), 'permissions: allow = ["mcp(*)"]');
+    assert(settings.permissions.ask === true, 'permissions: a pre-existing permissions sub-key survives the merge');
+    // The base object is NOT mutated (functional core: returns new object).
+    assert(base.permissions.deny === undefined, 'permissions: base object left untouched');
+
+    // permissions: deny/allow are REPLICA-COPIES (mutating the result doesn't corrupt the frozen source).
+    settings.permissions.deny.push('extra(*)');
+    assert(PERMISSION_RULES.deny.length === 4, 'permissions: returned deny is a copy, not the frozen source');
+
+    // permissions: empty/missing base → still valid (deny/allow present).
+    const fromNothing = buildPermissionsSettings();
+    assert(Array.isArray(fromNothing.permissions.deny), 'permissions: no-arg call still yields deny rules');
+
+    // mcp-config: exact shape — mcpServers."ccb-bridge" with command/args/env.
+    const cfg = buildMcpConfig({ bridgeCommand: '/bin/ccb-agy-bridge', bridgeArgs: ['--stdio'], sessionId: 'sess-42' });
+    const srv = cfg.mcpServers[BRIDGE_SERVER_KEY];
+    assert(srv.command === '/bin/ccb-agy-bridge', 'mcp-config: command preserved');
+    assert(JSON.stringify(srv.args) === JSON.stringify(['--stdio']), 'mcp-config: args preserved');
+    assert(srv.env[SESSION_ID_ENV] === 'sess-42', 'mcp-config: session id surfaced via env var');
+    // No dispatcher-shim — exactly one server entry, key is ccb-bridge.
+    assert(Object.keys(cfg.mcpServers).length === 1, 'mcp-config: exactly one mcpServer (no shim)');
+    assert(Object.keys(cfg.mcpServers)[0] === 'ccb-bridge', 'mcp-config: server key is ccb-bridge');
+
+    // mcp-config: args default to [] when omitted; bridgeCommand required.
+    assert(JSON.stringify(buildMcpConfig({ bridgeCommand: 'x', sessionId: 's' }).mcpServers[BRIDGE_SERVER_KEY].args) === JSON.stringify([]), 'mcp-config: args default to empty array');
+    assertThrows(() => buildMcpConfig({ bridgeArgs: ['a'], sessionId: 's' }), McpConfigError, 'mcp-config: missing bridgeCommand throws McpConfigError');
+    assertThrows(() => buildMcpConfig({ bridgeCommand: '', sessionId: 's' }), McpConfigError, 'mcp-config: empty bridgeCommand throws McpConfigError');
+  }
+
+  // ── agy-provider: session-home provisioner (sociable — real fs on a per-test tmpdir) ──
+  console.log('\nagy-provider session-home:');
+  {
+    const { provisionSessionHome, GEMINI_LAYOUT, AUTH_FILES, SANDBOX_MANUAL_FILE } = await import('../src/extensions/agy-provider/provisioning/session-home.js');
+    const { buildGeminiMd } = await import('../src/extensions/agy-provider/provisioning/gemini-md.js');
+    const { buildPermissionsSettings } = await import('../src/extensions/agy-provider/provisioning/permissions.js');
+    const { buildMcpConfig } = await import('../src/extensions/agy-provider/provisioning/mcp-config.js');
+    const { McpBridgeError } = await import('../src/extensions/agy-provider/exceptions.js');
+
+    // One per-test root for BOTH homeDir and a FAKE realGeminiDir (never the
+    // user's real ~/.gemini). Fake auth files stand in for the real tokens.
+    const makeFixture = () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-prov-'));
+      const realGeminiDir = path.join(root, 'real-gemini');
+      fs.mkdirSync(path.join(realGeminiDir, GEMINI_LAYOUT.ANTIGRAVITY_DIR), { recursive: true });
+      // Write fake auth files at the exact relative paths AUTH_FILES expects.
+      for (const rel of AUTH_FILES) {
+        const p = path.join(realGeminiDir, rel);
+        fs.mkdirSync(path.dirname(p), { recursive: true });
+        fs.writeFileSync(p, `FAKE-AUTH-${rel}`, 'utf8');
+      }
+      return { root, realGeminiDir };
+    };
+
+    // Provision + assert the full tree, with cleanup on BOTH paths.
+    const { root, realGeminiDir } = makeFixture();
+    try {
+      const homeDir = path.join(root, 'session-home');
+      const sandboxDir = path.join(root, 'sandbox');
+      const geminiMd = buildGeminiMd();
+      const permissionsSettings = buildPermissionsSettings({ theme: 'dark' });
+      const mcpConfig = buildMcpConfig({ bridgeCommand: 'ccb-agy-bridge', sessionId: 's1' });
+
+      const result = provisionSessionHome({ homeDir, realGeminiDir, sandboxDir, geminiMd, permissionsSettings, mcpConfig });
+
+      // HOME value returned is the session home (to spawn agy with HOME=<this>).
+      assert(result.home === homeDir, 'session-home: returns the HOME dir to spawn agy with');
+      assert(result.sandboxDir === sandboxDir, 'session-home: returns the sandbox dir');
+
+      // The .gemini/config/mcp_config.json exists with the per-session config.
+      const mcpConfigPath = path.join(homeDir, GEMINI_LAYOUT.ROOT, GEMINI_LAYOUT.CONFIG_DIR, GEMINI_LAYOUT.MCP_CONFIG_FILE);
+      assert(result.mcpConfigPath === mcpConfigPath, 'session-home: mcpConfigPath points at .gemini/config/mcp_config.json');
+      const writtenCfg = JSON.parse(fs.readFileSync(mcpConfigPath, 'utf8'));
+      assert(writtenCfg.mcpServers['ccb-bridge'].env.CCB_AGY_SESSION_ID === 's1', 'session-home: mcp_config written with session id');
+
+      // The .gemini/antigravity-cli/settings.json exists with the merged permissions.
+      const settingsPath = path.join(homeDir, GEMINI_LAYOUT.ROOT, GEMINI_LAYOUT.ANTIGRAVITY_DIR, GEMINI_LAYOUT.SETTINGS_FILE);
+      const writtenSettings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+      assert(writtenSettings.permissions.deny.includes('read_file(*)'), 'session-home: settings.json has the deny rules');
+      assert(writtenSettings.theme === 'dark', 'session-home: settings.json preserves the base theme key');
+
+      // The sandbox/GEMINI.md exists with the operating manual.
+      const geminiMdPath = path.join(sandboxDir, SANDBOX_MANUAL_FILE);
+      assert(fs.readFileSync(geminiMdPath, 'utf8').includes('submit_final_answer'), 'session-home: GEMINI.md written with the manual');
+
+      // The 3 auth symlinks exist and RESOLVE to the fake real auth files.
+      assert(result.symlinkPaths.length === 3, 'session-home: 3 auth symlinks created');
+      for (let i = 0; i < result.symlinkPaths.length; i++) {
+        const target = result.symlinkPaths[i];
+        const rel = AUTH_FILES[i];
+        assert(fs.lstatSync(target).isSymbolicLink(), `session-home: symlink ${rel} is a symlink`);
+        // readlinkSync resolves the link target (the real auth path).
+        const resolved = fs.realpathSync(target);
+        const expected = fs.realpathSync(path.join(realGeminiDir, rel));
+        assert(resolved === expected, `session-home: symlink ${rel} resolves to the real auth file`);
+        // Reading THROUGH the symlink yields the fake auth content.
+        assert(fs.readFileSync(target, 'utf8') === `FAKE-AUTH-${rel}`, `session-home: reading symlink ${rel} returns the auth content`);
+      }
+
+      // The homeDir does NOT itself contain copies of the auth (they are links, not duplicates).
+      // (The content check above proves the link works; this guards against a future copy-instead-of-link regression.)
+    } finally {
+      try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* best-effort teardown */ }
+    }
+
+    // No collision: two DIFFERENT homeDirs produce independent trees (the
+    // confirmed isolation — sessions don't race a shared config).
+    const fix1 = makeFixture();
+    const fix2 = makeFixture();
+    try {
+      const a = provisionSessionHome({
+        homeDir: path.join(fix1.root, 'home-a'), realGeminiDir: fix1.realGeminiDir, sandboxDir: path.join(fix1.root, 'sand-a'),
+        geminiMd: buildGeminiMd(), permissionsSettings: buildPermissionsSettings({}), mcpConfig: buildMcpConfig({ bridgeCommand: 'b', sessionId: 'A' }),
+      });
+      const b = provisionSessionHome({
+        homeDir: path.join(fix2.root, 'home-b'), realGeminiDir: fix2.realGeminiDir, sandboxDir: path.join(fix2.root, 'sand-b'),
+        geminiMd: buildGeminiMd(), permissionsSettings: buildPermissionsSettings({}), mcpConfig: buildMcpConfig({ bridgeCommand: 'b', sessionId: 'B' }),
+      });
+      assert(a.mcpConfigPath !== b.mcpConfigPath, 'session-home: two sessions get distinct mcp_config paths (no collision)');
+      // Session A's config carries session A's id; B carries B's — they did not overwrite each other.
+      const cfgA = JSON.parse(fs.readFileSync(a.mcpConfigPath, 'utf8'));
+      const cfgB = JSON.parse(fs.readFileSync(b.mcpConfigPath, 'utf8'));
+      assert(cfgA.mcpServers['ccb-bridge'].env.CCB_AGY_SESSION_ID === 'A', 'session-home: session A config intact after session B provisioned');
+      assert(cfgB.mcpServers['ccb-bridge'].env.CCB_AGY_SESSION_ID === 'B', 'session-home: session B config carries its own id');
+    } finally {
+      try { fs.rmSync(fix1.root, { recursive: true, force: true }); } catch { }
+      try { fs.rmSync(fix2.root, { recursive: true, force: true }); } catch { }
+    }
+
+    // Idempotency: re-provisioning the SAME homeDir overwrites cleanly (final
+    // version as if first written — no stale-link corruption).
+    const fix3 = makeFixture();
+    try {
+      const homeDir = path.join(fix3.root, 'home');
+      const sandboxDir = path.join(fix3.root, 'sand');
+      const first = provisionSessionHome({ homeDir, realGeminiDir: fix3.realGeminiDir, sandboxDir, geminiMd: buildGeminiMd(), permissionsSettings: buildPermissionsSettings({}), mcpConfig: buildMcpConfig({ bridgeCommand: 'b', sessionId: 'first' }) });
+      const second = provisionSessionHome({ homeDir, realGeminiDir: fix3.realGeminiDir, sandboxDir, geminiMd: buildGeminiMd(), permissionsSettings: buildPermissionsSettings({}), mcpConfig: buildMcpConfig({ bridgeCommand: 'b', sessionId: 'second' }) });
+      assert(first.mcpConfigPath === second.mcpConfigPath, 'session-home: re-provision keeps the same paths');
+      const cfg = JSON.parse(fs.readFileSync(second.mcpConfigPath, 'utf8'));
+      assert(cfg.mcpServers['ccb-bridge'].env.CCB_AGY_SESSION_ID === 'second', 'session-home: re-provision overwrites with the latest session id');
+      // The symlinks still resolve after overwrite (stale link was removed + recreated).
+      assert(fs.readFileSync(second.symlinkPaths[0], 'utf8') === `FAKE-AUTH-${AUTH_FILES[0]}`, 'session-home: symlinks resolve after idempotent re-provision');
+    } finally {
+      try { fs.rmSync(fix3.root, { recursive: true, force: true }); } catch { }
+    }
+
+    // Dependency validation: each required field, when wrong/missing, throws McpBridgeError.
+    assertThrows(() => provisionSessionHome({}), McpBridgeError, 'session-home: empty deps throws McpBridgeError');
+    assertThrows(() => provisionSessionHome({ homeDir: '', realGeminiDir: 'x', sandboxDir: 'y', geminiMd: 'z', permissionsSettings: {}, mcpConfig: {} }), McpBridgeError, 'session-home: empty homeDir throws McpBridgeError');
+    assertThrows(() => provisionSessionHome({ homeDir: 'x', realGeminiDir: 'y', sandboxDir: 'z', geminiMd: 'm', permissionsSettings: 'not-obj', mcpConfig: {} }), McpBridgeError, 'session-home: non-object permissionsSettings throws McpBridgeError');
+    assertThrows(() => provisionSessionHome({ homeDir: 'x', realGeminiDir: 'y', sandboxDir: 'z', geminiMd: 'm', permissionsSettings: {}, mcpConfig: [] }), McpBridgeError, 'session-home: array mcpConfig throws McpBridgeError');
+  }
+
   // ── agy-format: invocation builder ──
   console.log('\nagy-format invocation builder:');
   {
