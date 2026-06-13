@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
-import pty from 'node-pty';
+import { runSync, spawnDaemon } from './infra/process-manager.js';
 import {
   LOGS_DIR_NAME,
   PROVIDERS_FILENAME,
@@ -13,7 +13,7 @@ import {
   WATCHDOG_SCRIPT_NAME,
   CCB_VERSION
 } from '../src/core/constants.js';
-import { ArgumentError } from '../src/core/exceptions.js';
+import { ArgumentError, ConfigError } from '../src/core/exceptions.js';
 
 // Enforce: tests must be invoked via `npm test` (or `npm run test`) — never
 // directly with `node src/test.js`. `npm test` runs lint first and is the
@@ -3006,8 +3006,6 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-import { spawnDaemon, runSync } from '../src/infra/process-manager.js';
-
 let testDaemonPid = null;
 
 async function startTestDaemon() {
@@ -3074,41 +3072,106 @@ function stripAnsi(s) {
 const INTERACTIVE_POLL_MS = 100;
 const INTERACTIVE_QUIESCE_MS = 250;
 const INTERACTIVE_MAX_OUTPUT_BYTES = 2 * 1024 * 1024; // 2 MiB cap per session
-const INTERACTIVE_CLOSE_GRACE_MS = 1000;
+
+/**
+ * Mux-backed interactive CLI driver.
+ *
+ * Drives the real Claude CLI through a terminal multiplexer (tmux on Linux)
+ * instead of node-pty. node-pty's raw writes race the CLI's own re-render —
+ * a keystroke written during a banner/startup/mid-generation redraw gets
+ * dropped, which made the interactive tests intermittently lose `/model`
+ * submits. A multiplexer decouples input delivery from the TUI's redraws:
+ * `send-keys -l` queues the literal text, a separate `send-keys Enter`
+ * submits it, and `capture-pane -p` is polled to CONFIRM each state
+ * transition before the next keystroke (verify-between-steps — the
+ * reliability node-pty lacked).
+ *
+ * Same public interface as the former pty-backed class (send / waitFor /
+ * waitForQuiescence / visible / clearOutput / close) so the call sites are
+ * unchanged.
+ *
+ * Platform: tmux on Linux/WSL now; the Windows (psmux) adapter is a stub
+ * that throws a clear message until T-p378u2bh lands. Verified manually
+ * against the real CLI before encoding (see T-dsgk8mey notes).
+ */
+
+// Session names are prefixed so they never collide with the live sessions on a
+// shared dev box (tmux has one global namespace per server).
+const MUX_SESSION_PREFIX = `ccbtest-${process.pid}-`;
+let muxSessionCounter = 0;
+
+function muxAvailable() {
+  if (process.platform === 'win32') return false;
+  return runSync('tmux', ['-V']).status === 0;
+}
+
+/**
+ * Single-quote a value for safe interpolation into a shell command, escaping
+ * any embedded single quotes. Used to build the env VAR=value prefix on the
+ * tmux command line.
+ */
+function shellQuote(value) {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * Raise a clear, actionable error when the mux backend is missing.
+ * Callers gate on `muxAvailable()` so this only fires if a test ran without
+ * the prerequisite — never a silent skip.
+ */
+function requireMux() {
+  if (muxAvailable()) return;
+  const hint = process.platform === 'win32'
+    ? 'psmux backend not implemented yet on Windows (T-p378u2bh); run on Linux/WSL'
+    : 'tmux not found on PATH (install tmux, e.g. `sudo apt install tmux`)';
+  throw new ConfigError(`InteractiveSession needs a terminal multiplexer: ${hint}`);
+}
 
 class InteractiveSession {
   constructor(cmd, args, env) {
+    requireMux();
     this.output = '';
     this.lastDataAt = Date.now();
     this.closed = false;
     this.exited = false;
-    this.exitInfo = null;
-    this.ptyProcess = pty.spawn(cmd, args, {
-      name: 'xterm-256color',
-      cols: 120,
-      rows: 40,
-      cwd: process.cwd(),
-      env: env
-    });
-    this.ptyProcess.onData((data) => {
-      this.output += data;
-      this.lastDataAt = Date.now();
-      if (this.output.length > INTERACTIVE_MAX_OUTPUT_BYTES) {
-        // Drop the oldest half; keep recent context for assertions.
-        this.output = this.output.slice(-INTERACTIVE_MAX_OUTPUT_BYTES / 2);
-      }
-    });
-    this.ptyProcess.onExit((info) => {
-      this.exited = true;
-      this.exitInfo = info;
-    });
+
+    // tmux runs the command inside a detached session. We pass the command as a
+    // single shell string so argv with spaces reaches the child intact.
+    this.sessionName = `${MUX_SESSION_PREFIX}${muxSessionCounter++}`;
+    const quotedArgs = args.map(a => `'${String(a).replace(/'/g, "'\\''")}'`).join(' ');
+    // Inject the caller's env DELTA as a shell VAR=value PREFIX on the command
+    // line. tmux's `new-session` joins an ALREADY-RUNNING server (this dev box
+    // always has one) and runs the command under the SERVER's environment,
+    // ignoring the client's {env} option — so CCB_CONFIG_DIR passed via
+    // spawnSync env never reaches the child, the spawned CLI falls back to
+    // ~/.claude/.ccb, and requests miss the test daemon entirely. The server
+    // already carries inherited vars (PATH/HOME/credentials); emit ONLY the
+    // caller-set keys whose value differs from process.env (the genuine delta —
+    // CCB_CONFIG_DIR, plus anything a call site deliberately overrides) to keep
+    // the line short and under ARG_MAX. The shell prefix runs inside the
+    // /bin/sh -c tmux uses, so it reaches the child regardless of server state.
+    const delta = Object.entries(env ?? {})
+      .filter(([k, v]) => v !== undefined && v !== null && process.env[k] !== v)
+      .map(([k, v]) => `${k}=${shellQuote(String(v))}`)
+      .join(' ');
+    const commandLine = delta ? `env ${delta} ${cmd} ${quotedArgs}` : `${cmd} ${quotedArgs}`;
+    // tmux -y/-x are advisory when a client is attached to the server (the
+    // attached client's size wins), so do not rely on them — capture-pane reads
+    // whatever renders. The CLI adapts to any size.
+    runSync('tmux', [
+      'new-session', '-d', '-s', this.sessionName,
+      '-x', '120', '-y', '40',
+      commandLine,
+    ], { encoding: 'utf8' });
   }
 
-  // Match pattern against ANSI-stripped output so assertions are stable across
-  // terminal escape variations. Returns early if the pty exits.
+  // Poll capture-pane until `pattern` matches the ANSI-stripped pane content.
+  // capture-pane -S includes scrollback so history scrolled off the visible 40
+  // rows is still observable. Returns early if the underlying process exits.
   async waitFor(pattern, timeoutMs = 60000) {
     const start = Date.now();
     while (Date.now() - start <= timeoutMs) {
+      this.refresh();
       if (pattern.test(stripAnsi(this.output))) return true;
       if (this.exited) return pattern.test(stripAnsi(this.output));
       await sleep(INTERACTIVE_POLL_MS);
@@ -3116,12 +3179,13 @@ class InteractiveSession {
     return false;
   }
 
-  // Wait until no new data has arrived for `quiesceMs`. Used to let the CLI
-  // settle its initial render before we start sending keys, rather than
-  // sleeping a hard-coded duration.
+  // Wait until the pane stops changing for `quiesceMs`. Used to let the CLI
+  // settle its initial render before sending keys. A redraw resets
+  // lastDataAt, so a still-streaming UI keeps quiescence at bay.
   async waitForQuiescence(quiesceMs = INTERACTIVE_QUIESCE_MS, timeoutMs = 15000) {
     const start = Date.now();
     while (Date.now() - start <= timeoutMs) {
+      this.refresh();
       if (Date.now() - this.lastDataAt >= quiesceMs) return true;
       if (this.exited) return true;
       await sleep(INTERACTIVE_POLL_MS);
@@ -3129,9 +3193,36 @@ class InteractiveSession {
     return false;
   }
 
+  // Deliver input as literal segments + a SEPARATE Enter per line terminator.
+  // Splitting text from CR/LF is the fix for the node-pty drop: a single
+  // combined write could land mid-redraw and lose the submit; two tmux
+  // commands (literal, then Enter) survive a redraw between them.
   send(text) {
-    if (this.exited) return;
-    this.ptyProcess.write(text);
+    if (this.exited || this.closed) return;
+    // Split into typed lines; a trailing terminator (e.g. "...text\r") yields a
+    // final empty segment that must NOT be sent as its own Enter-less literal —
+    // drop empties so each remaining segment is real content.
+    const segments = String(text).split(/\r\n|\r|\n/).filter(s => s.length > 0);
+    const hadTerminator = /\r|\n/.test(text);
+    // A pure-terminator input (e.g. send('\r') to dismiss a dialog) yields no
+    // text segments but still means "press Enter" — send exactly one.
+    if (segments.length === 0) {
+      if (hadTerminator) {
+        runSync('tmux', ['send-keys', '-t', this.sessionName, 'Enter'], { encoding: 'utf8' });
+      }
+      this.lastDataAt = Date.now();
+      return;
+    }
+    for (let i = 0; i < segments.length; i += 1) {
+      runSync('tmux', ['send-keys', '-t', this.sessionName, '-l', segments[i]], { encoding: 'utf8' });
+      // An interior segment is always followed by a terminator; the last
+      // segment is followed by one only if the input ended with CR/LF.
+      const followedByTerminator = i < segments.length - 1 || hadTerminator;
+      if (followedByTerminator) {
+        runSync('tmux', ['send-keys', '-t', this.sessionName, 'Enter'], { encoding: 'utf8' });
+      }
+    }
+    this.lastDataAt = Date.now();
   }
 
   clearOutput() {
@@ -3139,26 +3230,40 @@ class InteractiveSession {
     this.lastDataAt = Date.now();
   }
 
-  // Returns the ANSI-stripped accumulated output. Use this for any structural
-  // assertion (substring contains, regex match against plain text).
+  // Returns the ANSI-stripped accumulated pane content. Use this for any
+  // structural assertion (substring contains, regex match against plain text).
   get visible() {
+    this.refresh();
     return stripAnsi(this.output);
+  }
+
+  // Pull the current pane (with scrollback) into `this.output`, deduplicating
+  // unchanged captures so lastDataAt only advances on real change.
+  refresh() {
+    const result = runSync('tmux', ['capture-pane', '-t', this.sessionName, '-p', '-S', '-2000', '-E', '-'], { encoding: 'utf8' });
+    if (result.status !== 0) {
+      // capture-pane fails (no server / session gone) → the child has exited.
+      this.exited = true;
+      return;
+    }
+    const captured = result.stdout ?? '';
+    if (captured !== this.output) {
+      this.output = captured;
+      this.lastDataAt = Date.now();
+      if (this.output.length > INTERACTIVE_MAX_OUTPUT_BYTES) {
+        // Drop the oldest half; keep recent context for assertions.
+        this.output = this.output.slice(-INTERACTIVE_MAX_OUTPUT_BYTES / 2);
+      }
+    }
   }
 
   async close() {
     if (this.closed) return;
     this.closed = true;
-    // Ctrl+C twice asks Claude CLI to exit cleanly.
-    try { this.ptyProcess.write('\x03\x03'); } catch { /* may already be gone */ }
-
-    // Give it up to INTERACTIVE_CLOSE_GRACE_MS to exit on its own; otherwise kill.
-    const graceStart = Date.now();
-    while (!this.exited && Date.now() - graceStart < INTERACTIVE_CLOSE_GRACE_MS) {
-      await sleep(INTERACTIVE_POLL_MS);
-    }
-    if (!this.exited) {
-      try { this.ptyProcess.kill('SIGKILL'); } catch { /* best effort */ }
-    }
+    this.exited = true;
+    // kill-session tears down the tmux session and SIGKILLs the child it was
+    // running. Safe to call even if already gone.
+    try { runSync('tmux', ['kill-session', '-t', this.sessionName], { encoding: 'utf8' }); } catch { /* already gone */ }
   }
 }
 
@@ -3866,6 +3971,37 @@ async function runPortFallbackTest() {
   }
 }
 
+/**
+ * Run the interactive CLI model tests (real Claude CLI driven through tmux).
+ *
+ * Skips cleanly — returning success, not failure — when tmux is unavailable:
+ * the mux driver is a system prerequisite, and a missing one is a skip, not a
+ * regression (same convention as a missing ZAI_KEY). Single guard clause, one
+ * indentation level for the test body.
+ *
+ * Returns the aggregated pass/fail boolean.
+ */
+async function runInteractiveModelTests() {
+  if (!muxAvailable()) {
+    console.log('\nSKIP: interactive CLI tests — tmux not available (the mux driver needs it).');
+    return true;
+  }
+
+  let success = true;
+
+  console.log('\nRunning model identity tests (Interactive): GLM -> Claude');
+  success = success && (await assertModel('glm-4.7', /glm-/i));
+  success = success && (await assertModel('sonnet', /claude|sonnet/i));
+  success = success && (await assertModel('synthetic.gpt-4', /401|Incorrect API key|Authentication|API Error|Retrying/i));
+  success = success && (await testModelSwitch());
+  success = success && (await testModelSwitchBackAndForth());
+
+  console.log('\nRunning TTY concurrency stress (real z.ai through Claude CLI)...');
+  success = success && (await assertTtyConcurrency());
+
+  return success;
+}
+
 async function runIntegrationTests() {
   console.log('\n── Integration Tests (isolated daemon on port ' + TEST_PORT + ') ──');
 
@@ -4401,28 +4537,12 @@ async function runIntegrationTests() {
   await new Promise(resolve => setTimeout(resolve, HOT_RELOAD_MS));
 
   // 3. Real Model Tests
-  console.log('\nRunning model identity tests (Interactive): GLM -> Claude');
-
   let modelSuccess = true;
 
-  const rGlm = await assertModel('glm-4.7', /glm-/i);
-  modelSuccess = modelSuccess && rGlm;
-
-  const rSonnet = await assertModel('sonnet', /claude|sonnet/i);
-  modelSuccess = modelSuccess && rSonnet;
-
-  const rSynth = await assertModel('synthetic.gpt-4', /401|Incorrect API key|Authentication|API Error|Retrying/i);
-  modelSuccess = modelSuccess && rSynth;
-
-  const rSwitch = await testModelSwitch();
-  modelSuccess = modelSuccess && rSwitch;
-
-  const rBackForth = await testModelSwitchBackAndForth();
-  modelSuccess = modelSuccess && rBackForth;
-
-  console.log('\nRunning TTY concurrency stress (real z.ai through Claude CLI)...');
-  const rTtyConcurrency = await assertTtyConcurrency();
-  modelSuccess = modelSuccess && rTtyConcurrency;
+  // 3. Real Model Tests — the interactive CLI tests need a terminal multiplexer
+  // (tmux) to drive the real Claude CLI reliably. runInteractiveModelTests
+  // skips cleanly when tmux is absent and returns the aggregated pass/fail.
+  modelSuccess = modelSuccess && (await runInteractiveModelTests());
 
   // 3b. Web search tool transform test (live request through proxy)
   //    The daemon may have shut down after the last model test — restart it.
