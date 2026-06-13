@@ -1,11 +1,14 @@
 /**
  * Model resolver for the agy CLI extension.
  *
- * Discovers available models by calling `agy models` via SSH to the VM.
+ * Discovers available models by calling `agy models` locally (default) or
+ * via SSH when an explicit sshHost is configured.
  * Parses the display names, normalizes them for routing, and caches with TTL.
  */
 
 import { execCommand } from '../../infra/process-manager.js';
+import { buildAgyInvocation } from './invocation-builder.js';
+import { agyDir } from './binary-resolver.js';
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000;
 
@@ -33,16 +36,6 @@ function normalizeDisplayName(name) {
     .replace(/[^a-z0-9._-]/g, '');
 }
 
-/**
- * Derive the directory portion of an agy path for PATH setup.
- * "$HOME/.local/bin/agy" -> "$HOME/.local/bin"
- */
-function pathDir(agyPath) {
-  const slashIdx = agyPath.lastIndexOf('/');
-  if (slashIdx === -1) return '$HOME/.local/bin';
-  return agyPath.slice(0, slashIdx);
-}
-
 export class ModelResolver {
   #sshHost;
   #agyPath;
@@ -51,9 +44,15 @@ export class ModelResolver {
   #cacheTime;
   #discovering;
 
+  /**
+   * @param {object} opts
+   * @param {string|undefined} opts.sshHost     - Optional SSH host (absent = local).
+   * @param {string}           opts.agyPath     - Resolved path to the agy binary.
+   * @param {number|undefined} opts.cacheTtlMs  - Cache TTL in ms.
+   */
   constructor({ sshHost, agyPath, cacheTtlMs }) {
-    this.#sshHost = sshHost ?? 'oracle-vm';
-    this.#agyPath = agyPath ?? '$HOME/.local/bin/agy';
+    this.#sshHost = sshHost ?? undefined;
+    this.#agyPath = agyPath;
     this.#cacheTtlMs = cacheTtlMs ?? DEFAULT_TTL_MS;
     this.#models = new Map();
     this.#cacheTime = 0;
@@ -79,11 +78,12 @@ export class ModelResolver {
       return this.#models;
     }
 
-    const agyDir = pathDir(this.#agyPath);
-    const command = `export PATH=${agyDir}:$PATH; script -qec "agy models" /dev/null`;
+    const resolvedAgyDir = agyDir(this.#agyPath);
+    const shellCommand = `export PATH=${resolvedAgyDir}:$PATH; script -qec "agy models" /dev/null`;
+    const { cmd, args } = buildAgyInvocation(shellCommand, this.#sshHost);
 
     try {
-      const raw = await execCommand('ssh', [this.#sshHost, command], { timeout: 15000 });
+      const raw = await execCommand(cmd, args, { timeout: 15000 });
       const clean = stripAnsi(raw);
 
       const models = new Map();

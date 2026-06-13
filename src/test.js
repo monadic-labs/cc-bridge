@@ -12,7 +12,8 @@ import {
   ENV_FILENAME,
   CCB_DIR_NAME,
   WATCHDOG_SCRIPT_NAME,
-  CCB_VERSION
+  CCB_VERSION,
+  RUNTIME_FILENAME
 } from '../src/core/constants.js';
 import { ArgumentError, ConfigError } from '../src/core/exceptions.js';
 
@@ -3097,6 +3098,137 @@ async function runUnitTests() {
       try { fs.rmSync(tempRoot9, { recursive: true, force: true }); } catch { }
       try { fs.rmSync(versionsDir9, { recursive: true, force: true }); } catch { }
     }
+
+    // Test 10: loadVersions() merges snapshots from VERSIONS_DIR
+    // Exercises the new loadVersions() path that replaces the hardwired live-checkout entry
+    // with auto-scanned snapshot entries.
+    console.log('\nloadVersions snapshot merge:');
+    {
+      const tempRoot10 = path.join(os.tmpdir(), `ccb-snap-test-${crypto.randomBytes(4).toString('hex')}`);
+      const versionsDir10 = path.join(os.tmpdir(), `ccb-snap-vers-${crypto.randomBytes(4).toString('hex')}`);
+      try {
+        fs.mkdirSync(tempRoot10, { recursive: true });
+        fs.mkdirSync(versionsDir10, { recursive: true });
+        makeSourceTree(tempRoot10, '2.1.0');
+        const snap10 = createSnapshot(tempRoot10, versionsDir10);
+        const snaps10 = listSnapshots(versionsDir10);
+        assert(snaps10.length === 1, 'listSnapshots returns 1 entry after one createSnapshot');
+        assert(snaps10[0].identity === snap10.identity, 'listed entry identity matches created snapshot');
+        const expectedWatchdog = getSnapshotWatchdogPath(snap10.snapshotDir);
+        assert(snaps10[0].snapshotDir === snap10.snapshotDir, 'listed entry snapshotDir matches');
+        assert(expectedWatchdog === path.join(snap10.snapshotDir, 'bin', WATCHDOG_SCRIPT_NAME), 'getSnapshotWatchdogPath returns bin/ccb-watchdog.js inside snapshotDir');
+      } finally {
+        try { fs.rmSync(tempRoot10, { recursive: true, force: true }); } catch { }
+        try { fs.rmSync(versionsDir10, { recursive: true, force: true }); } catch { }
+      }
+    }
+
+    // Test 11: snapshot directory contains the expected file layout
+    // (src/, bin/ccb-watchdog.js, package.json — no test.js, no package-lock.json)
+    console.log('\nSnapshot directory layout:');
+    {
+      const tempRoot11 = path.join(os.tmpdir(), `ccb-snap-test-${crypto.randomBytes(4).toString('hex')}`);
+      const versionsDir11 = path.join(os.tmpdir(), `ccb-snap-vers-${crypto.randomBytes(4).toString('hex')}`);
+      try {
+        fs.mkdirSync(tempRoot11, { recursive: true });
+        fs.mkdirSync(versionsDir11, { recursive: true });
+        makeSourceTree(tempRoot11, '2.1.0');
+        // Add a package-lock.json that must be excluded
+        fs.writeFileSync(path.join(tempRoot11, 'package-lock.json'), '{}');
+        const snap11 = createSnapshot(tempRoot11, versionsDir11);
+        assert(fs.existsSync(path.join(snap11.snapshotDir, 'src', 'proxy-core.js')), 'snapshot layout: src/proxy-core.js present');
+        assert(fs.existsSync(path.join(snap11.snapshotDir, 'bin', WATCHDOG_SCRIPT_NAME)), 'snapshot layout: bin/ccb-watchdog.js present');
+        assert(fs.existsSync(path.join(snap11.snapshotDir, 'package.json')), 'snapshot layout: package.json present');
+        assert(!fs.existsSync(path.join(snap11.snapshotDir, 'src', 'test.js')), 'snapshot layout: src/test.js excluded');
+        assert(!fs.existsSync(path.join(snap11.snapshotDir, 'package-lock.json')), 'snapshot layout: package-lock.json excluded');
+        assert(fs.existsSync(path.join(snap11.snapshotDir, 'snapshot.json')), 'snapshot layout: snapshot.json metadata written');
+      } finally {
+        try { fs.rmSync(tempRoot11, { recursive: true, force: true }); } catch { }
+        try { fs.rmSync(versionsDir11, { recursive: true, force: true }); } catch { }
+      }
+    }
+  }
+
+  // ── agy-format: invocation builder ──
+  console.log('\nagy-format invocation builder:');
+  {
+    const { buildAgyInvocation } = await import('../src/extensions/agy-format/invocation-builder.js');
+
+    // No sshHost → local bash -c path
+    const local = buildAgyInvocation('export PATH=/bin; script -qec "agy models" /dev/null', undefined);
+    assert(local.cmd === 'bash', 'local invocation uses bash');
+    assert(local.args[0] === '-c', 'local invocation passes -c flag');
+    assert(local.args[1].includes('agy models'), 'local invocation embeds shell command');
+
+    // Explicit sshHost → ssh path
+    const remote = buildAgyInvocation('export PATH=/bin; script -qec "agy models" /dev/null', 'oracle-vm');
+    assert(remote.cmd === 'ssh', 'remote invocation uses ssh');
+    assert(remote.args[0] === 'oracle-vm', 'remote invocation passes sshHost as first arg');
+    assert(remote.args[1].includes('agy models'), 'remote invocation embeds shell command');
+
+    // Empty string sshHost → treated as falsy → local
+    const emptyHost = buildAgyInvocation('cmd', '');
+    assert(emptyHost.cmd === 'bash', 'empty sshHost falls through to local');
+  }
+
+  // ── agy-format: binary resolver ──
+  console.log('\nagy-format binary resolver:');
+  {
+    const { resolveAgyBinary, agyDir: agyDirFn } = await import('../src/extensions/agy-format/binary-resolver.js');
+    const { AgyBinaryNotFoundError } = await import('../src/extensions/agy-format/exceptions.js');
+
+    // Explicit override always wins
+    const overrideResult = resolveAgyBinary('/custom/path/agy');
+    assert(overrideResult === '/custom/path/agy', 'explicit config.agyPath override returned as-is');
+
+    // PATH lookup returns it when found
+    const pathFoundProbe = {
+      platform: 'linux',
+      homeDir: () => '/home/testuser',
+      localAppDataDir: () => undefined,
+      findOnPath: (_cmd) => '/usr/local/bin/agy',
+      fileExists: (_p) => false,
+    };
+    const pathResult = resolveAgyBinary(undefined, pathFoundProbe);
+    assert(pathResult === '/usr/local/bin/agy', 'PATH lookup result returned when agy on PATH');
+
+    // PATH miss → canonical POSIX fallback exists → returns it
+    const posixFallbackProbe = {
+      platform: 'linux',
+      homeDir: () => '/home/testuser',
+      localAppDataDir: () => undefined,
+      findOnPath: () => null,
+      fileExists: (p) => p === '/home/testuser/.local/bin/agy',
+    };
+    const posixFallback = resolveAgyBinary(undefined, posixFallbackProbe);
+    assert(posixFallback === '/home/testuser/.local/bin/agy', 'POSIX canonical fallback used when on disk');
+
+    // PATH miss → canonical Windows fallback exists → returns it
+    // path.win32.join is used in canonicalFallbackPath for win32 probes so
+    // the expected value must also use win32 separators, even on a Linux host.
+    const winExpected = 'C:\\Users\\testuser\\AppData\\Local\\agy\\bin\\agy';
+    const winFallbackProbe = {
+      platform: 'win32',
+      homeDir: () => 'C:\\Users\\testuser',
+      localAppDataDir: () => 'C:\\Users\\testuser\\AppData\\Local',
+      findOnPath: () => null,
+      fileExists: (p) => p === winExpected,
+    };
+    const winFallback = resolveAgyBinary(undefined, winFallbackProbe);
+    assert(winFallback === winExpected, 'Windows canonical fallback used when on disk');
+
+    // PATH miss → canonical fallback missing → fail loud
+    const notFoundProbe = {
+      platform: 'linux',
+      homeDir: () => '/home/nobody',
+      localAppDataDir: () => undefined,
+      findOnPath: () => null,
+      fileExists: () => false,
+    };
+    assertThrows(() => resolveAgyBinary(undefined, notFoundProbe), AgyBinaryNotFoundError, 'throws AgyBinaryNotFoundError when binary not found anywhere');
+
+    // agyDir helper
+    assert(agyDirFn('/home/user/.local/bin/agy') === '/home/user/.local/bin', 'agyDir extracts directory from POSIX path');
   }
 
 }
@@ -4559,6 +4691,143 @@ async function runMultiWorkerAuthTest() {
   return true;
 }
 
+async function runSnapshotIsolationTest() {
+  console.log('\n── Snapshot Isolation Test ──');
+
+  // Uses a dedicated temp versions dir — does not need an active daemon.
+  const TEST_VERSIONS_DIR = path.join(PKG_ROOT, '.test-snapshot-versions');
+  try {
+    fs.mkdirSync(TEST_VERSIONS_DIR, { recursive: true });
+
+    // 1. Create a snapshot of the live PKG_ROOT.
+    const { createSnapshot, listSnapshots } = await import('../src/core/snapshot.js');
+    const snapResult = createSnapshot(PKG_ROOT, TEST_VERSIONS_DIR);
+
+    if (!fs.existsSync(snapResult.snapshotDir)) {
+      console.error(`FAIL: Snapshot isolation — snapshot dir not created: ${snapResult.snapshotDir}`);
+      return false;
+    }
+    console.log(`  Snapshot created at: ${snapResult.snapshotDir}`);
+
+    // 2. listSnapshots must surface it.
+    const snaps = listSnapshots(TEST_VERSIONS_DIR);
+    if (snaps.length === 0) {
+      console.error('FAIL: Snapshot isolation — listSnapshots returned empty after createSnapshot');
+      return false;
+    }
+    if (!snaps.some((s) => s.identity === snapResult.identity)) {
+      console.error(`FAIL: Snapshot isolation — identity ${snapResult.identity} missing from listSnapshots`);
+      return false;
+    }
+    console.log(`  listSnapshots returned ${snaps.length} snapshot(s) including the new one`);
+
+    // 3. Snapshot dir must contain the expected file layout.
+    const watchdogInSnap = path.join(snapResult.snapshotDir, 'bin', WATCHDOG_SCRIPT_NAME);
+    if (!fs.existsSync(watchdogInSnap)) {
+      console.error(`FAIL: Snapshot isolation — watchdog not found in snapshot at ${watchdogInSnap}`);
+      return false;
+    }
+    console.log(`  Snapshot watchdog path verified: ${watchdogInSnap}`);
+
+    if (!fs.existsSync(path.join(snapResult.snapshotDir, 'src', 'proxy.js'))) {
+      console.error('FAIL: Snapshot isolation — src/proxy.js missing from snapshot');
+      return false;
+    }
+    if (!fs.existsSync(path.join(snapResult.snapshotDir, 'package.json'))) {
+      console.error('FAIL: Snapshot isolation — package.json missing from snapshot');
+      return false;
+    }
+    if (fs.existsSync(path.join(snapResult.snapshotDir, 'src', 'test.js'))) {
+      console.error('FAIL: Snapshot isolation — src/test.js must be excluded from snapshot');
+      return false;
+    }
+
+    // 4. The watchdog binary inside the snapshot must contain the CCB_SNAPSHOT_DIR
+    //    worker-path branch so that on crash-respawn the worker re-uses the snapshot.
+    const watchdogSource = fs.readFileSync(watchdogInSnap, 'utf8');
+    if (!watchdogSource.includes('CCB_SNAPSHOT_DIR')) {
+      console.error('FAIL: Snapshot isolation — snapshot watchdog does not contain CCB_SNAPSHOT_DIR branch');
+      return false;
+    }
+    console.log('  PASS: Snapshot watchdog contains CCB_SNAPSHOT_DIR worker-path branch');
+
+    // 5. Start the test daemon with CCB_SNAPSHOT_DIR set to verify the watchdog
+    //    propagates the env to the worker (runtime.json presence confirms daemon up).
+    killTestDaemon();
+    await setupTestConfig();
+    const snapVersionsDir = path.join(TEST_CONFIG_DIR, 'versions');
+    fs.mkdirSync(snapVersionsDir, { recursive: true });
+
+    const logsDir = path.join(TEST_CONFIG_DIR, LOGS_DIR_NAME);
+    const out = fs.openSync(path.join(logsDir, 'daemon.log'), 'a');
+    const err = fs.openSync(path.join(logsDir, 'daemon.err'), 'a');
+    const watchdogBin = watchdogInSnap;
+    const snapChild = spawnDaemon(watchdogBin, [], {
+      detached: true,
+      stdio: ['ignore', out, err],
+      windowsHide: true,
+      env: {
+        ...process.env,
+        CCB_CONFIG_DIR: TEST_CONFIG_DIR,
+        CCB_SNAPSHOT_DIR: snapResult.snapshotDir
+      }
+    });
+    testDaemonPid = snapChild.pid;
+    snapChild.unref();
+
+    const POLL_MS = 200;
+    let daemonUp = false;
+    for (let i = 0; i < 15; i++) {
+      if (await checkTestProxy()) { daemonUp = true; break; }
+      await sleep(POLL_MS);
+    }
+
+    if (!daemonUp) {
+      console.error('FAIL: Snapshot isolation — daemon spawned from snapshot did not start');
+      killTestDaemon();
+      return false;
+    }
+    console.log('  Daemon spawned from snapshot is up');
+
+    // runtime.json must be written by the watchdog on worker-ready.
+    const runtimePath = path.join(TEST_CONFIG_DIR, RUNTIME_FILENAME);
+    if (!fs.existsSync(runtimePath)) {
+      console.error('FAIL: Snapshot isolation — runtime.json not written by snapshot-spawned daemon');
+      killTestDaemon();
+      return false;
+    }
+    const runtime = JSON.parse(fs.readFileSync(runtimePath, 'utf8'));
+    if (!runtime.watchdogPid) {
+      console.error('FAIL: Snapshot isolation — watchdogPid missing from runtime.json');
+      killTestDaemon();
+      return false;
+    }
+    console.log(`  Watchdog PID from runtime.json: ${runtime.watchdogPid}`);
+
+    killTestDaemon();
+    killListenersOnPort(TEST_PORT);
+    // Wait for the port to be fully released before the next test claims it.
+    const PORT_RELEASE_TIMEOUT_MS = 2000;
+    const PORT_RELEASE_POLL_MS = 100;
+    const netMod = await import('net');
+    const releaseStart = Date.now();
+    while (Date.now() - releaseStart < PORT_RELEASE_TIMEOUT_MS) {
+      const held = await new Promise((resolve) => {
+        const sock = netMod.default.connect({ host: '127.0.0.1', port: TEST_PORT });
+        sock.once('connect', () => { sock.destroy(); resolve(true); });
+        sock.once('error', () => resolve(false));
+        sock.setTimeout(PORT_RELEASE_POLL_MS, () => { sock.destroy(); resolve(false); });
+      });
+      if (!held) break;
+      await sleep(PORT_RELEASE_POLL_MS);
+    }
+    console.log('  PASS: Snapshot isolation test passed');
+    return true;
+  } finally {
+    try { fs.rmSync(TEST_VERSIONS_DIR, { recursive: true, force: true }); } catch { }
+  }
+}
+
 async function runIntegrationTests() {
   console.log('\n── Integration Tests (isolated daemon on port ' + TEST_PORT + ') ──');
 
@@ -5633,6 +5902,71 @@ export function createFaultyUpstreamExtension(_config) {
   }
 }
 
+/**
+ * Integration test: drive the real local agy route end-to-end.
+ *
+ * Calls executeAgy through the extension's handleUpstream hook using
+ * a minimal Anthropic-format messages request, and asserts a non-empty
+ * Gemini text response is returned.
+ *
+ * This test makes a real agy call (~tens of seconds) — that is intended.
+ * It proves the local bash -c execution path actually works with the live
+ * Google-authenticated agy binary.
+ */
+async function runAgyLocalRouteIntegrationTest() {
+  console.log('\n── agy-format local route integration test (real agy call) ──');
+
+  const { createAgyFormatExtension } = await import('../src/extensions/agy-format/index.js');
+
+  // Use the real binary probe — agy is locally installed and Google-authenticated
+  const extension = createAgyFormatExtension({});
+
+  const upstream = extension.hooks.handleUpstream;
+
+  const requestBody = {
+    model: 'Gemini 3.1 Pro (High)',
+    max_tokens: 100,
+    stream: false,
+    messages: [{ role: 'user', content: 'Reply with exactly three words: the sky color.' }],
+  };
+
+  let responsePayload = null;
+  let responseStatus = null;
+
+  const res = {
+    headersSent: false,
+    writeHead(status, _headers) {
+      responseStatus = status;
+      this.headersSent = true;
+    },
+    write(_data) {},
+    end(data) {
+      if (data) {
+        try { responsePayload = JSON.parse(data); } catch { responsePayload = data; }
+      }
+    },
+  };
+
+  const ctx = { clientAborted: false };
+
+  console.log('  Sending real agy request (may take ~10-30s)...');
+  await upstream.handle({ body: requestBody, res, ctx });
+
+  if (responseStatus !== 200) {
+    console.error(`  FAIL: expected status 200, got ${responseStatus}. Payload: ${JSON.stringify(responsePayload)}`);
+    return false;
+  }
+
+  const text = responsePayload?.content?.[0]?.text ?? '';
+  if (!text || text.length < 1) {
+    console.error(`  FAIL: empty text in response. Payload: ${JSON.stringify(responsePayload)}`);
+    return false;
+  }
+
+  console.log(`  PASS: real agy response received (${text.length} chars): "${text.slice(0, 120)}"`);
+  return true;
+}
+
 // ── Main ──
 
 async function main() {
@@ -5653,11 +5987,15 @@ async function main() {
 
   const multiWorkerAuth = await runMultiWorkerAuthTest();
 
+  const snapshotIsolation = await runSnapshotIsolationTest();
+
   const integrationResults = await runIntegrationTests();
 
   const liveRoutingResults = await runLiveRoutingTests();
 
-  if (!portFallback || !orphanReap || !multiWorkerAuth || !integrationResults.every(Boolean) || !liveRoutingResults.every(Boolean)) {
+  const agyLocalRoute = await runAgyLocalRouteIntegrationTest();
+
+  if (!portFallback || !orphanReap || !multiWorkerAuth || !snapshotIsolation || !integrationResults.every(Boolean) || !liveRoutingResults.every(Boolean) || !agyLocalRoute) {
     console.error('\n🚨 INTEGRATION TESTS FAILED!');
     process.exit(1);
   }

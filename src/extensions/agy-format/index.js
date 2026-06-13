@@ -10,8 +10,9 @@
  *  - `gemini-3.1-pro`         -> fuzzy match against discovered models
  *
  * Configuration (in providers.json extensions section):
- *  - sshHost: SSH host where agy is installed (default: "oracle-vm")
- *  - agyPath: path to agy binary on the remote host (default: "$HOME/.local/bin/agy")
+ *  - sshHost: (optional) SSH host — only when agy is on a REMOTE machine.
+ *             When omitted (the default), agy runs locally via bash -c.
+ *  - agyPath: (optional) explicit path to agy binary; auto-resolved when absent.
  *  - cacheTtlMs: model discovery cache TTL (default: 300000)
  *  - requestTimeoutMs: per-request agy subprocess timeout (default: 120000)
  */
@@ -19,6 +20,8 @@
 import { ProviderConfig } from '../../core/providers.js';
 import { execCommand } from '../../infra/process-manager.js';
 import { ModelResolver } from './model-resolver.js';
+import { buildAgyInvocation } from './invocation-builder.js';
+import { resolveAgyBinary, agyDir } from './binary-resolver.js';
 import { convertRequest } from './converters/request.js';
 import { convertFullResponse, buildSseStream } from './converters/response.js';
 
@@ -37,15 +40,6 @@ function stripAnsi(str) {
   return str.replace(csi, '').replace(osc, '');
 }
 
-/**
- * Derive the directory portion of an agy path for PATH setup.
- */
-function pathDir(agyPath) {
-  const slashIdx = agyPath.lastIndexOf('/');
-  if (slashIdx === -1) return '$HOME/.local/bin';
-  return agyPath.slice(0, slashIdx);
-}
-
 export const EXTENSION_META = {
   activation: 'always',
   title: 'Antigravity (agy)',
@@ -54,8 +48,8 @@ export const EXTENSION_META = {
   schema: {
     type: 'object',
     properties: {
-      sshHost: { type: 'string', description: 'SSH host where agy is installed' },
-      agyPath: { type: 'string', description: 'Path to agy binary on the remote host' },
+      sshHost: { type: 'string', description: 'SSH host where agy is installed (optional — omit for local execution)' },
+      agyPath: { type: 'string', description: 'Path to agy binary (optional — auto-resolved when absent)' },
       cacheTtlMs: { type: 'number', description: 'Model discovery cache TTL in ms' },
       requestTimeoutMs: { type: 'number', description: 'Per-request agy timeout in ms' },
     },
@@ -66,24 +60,31 @@ export const EXTENSION_META = {
  * Create the agy-format extension.
  *
  * @param {object} config - Extension config from providers.json
+ * @param {object} [binaryProbe] - Optional probe seam for binary resolution (tests only).
  * @returns {object} Extension object with hooks
  */
-export function createAgyFormatExtension(config = {}) {
+export function createAgyFormatExtension(config = {}, binaryProbe = undefined) {
   // Satisfy the proxy's requireProviderApiKey check — agy uses its own Google auth
   if (!process.env.AGY_KEY) {
     process.env.AGY_KEY = 'local';
   }
 
-  const sshHost = config.sshHost ?? 'oracle-vm';
-  const agyPath = config.agyPath ?? '$HOME/.local/bin/agy';
+  // sshHost is optional — absent means local execution (default)
+  const sshHost = config.sshHost ?? undefined;
   const requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
-  const resolver = new ModelResolver({ sshHost, agyPath, cacheTtlMs: config.cacheTtlMs });
+  // Resolve agy binary: explicit config > PATH > OS fallback > fail loud
+  const resolvedAgyPath = resolveAgyBinary(config.agyPath, binaryProbe);
+  const resolvedAgyDir = agyDir(resolvedAgyPath);
+
+  const resolver = new ModelResolver({
+    sshHost,
+    agyPath: resolvedAgyPath,
+    cacheTtlMs: config.cacheTtlMs,
+  });
 
   // Trigger initial model discovery (async, non-blocking)
   resolver.discover();
-
-  const agyDir = pathDir(agyPath);
 
   /**
    * Execute agy with a prompt and model, return the text output.
@@ -92,9 +93,10 @@ export function createAgyFormatExtension(config = {}) {
     const escapedModel = displayName.replace(/'/g, "'\"'\"'");
     const escapedPrompt = prompt.replace(/'/g, "'\"'\"'");
 
-    const command = `export PATH=${agyDir}:$PATH; script -qec "agy --model '${escapedModel}' -p '${escapedPrompt}'" /dev/null`;
+    const shellCommand = `export PATH=${resolvedAgyDir}:$PATH; script -qec "agy --model '${escapedModel}' -p '${escapedPrompt}'" /dev/null`;
+    const { cmd, args } = buildAgyInvocation(shellCommand, sshHost);
 
-    const raw = await execCommand('ssh', [sshHost, command], {
+    const raw = await execCommand(cmd, args, {
       timeout: requestTimeoutMs,
       maxBuffer: 10 * 1024 * 1024,
     });
