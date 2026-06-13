@@ -3680,7 +3680,7 @@ async function runUnitTests() {
   {
     const { buildGeminiMd, REQUIRED_DIRECTIVES } = await import('../src/extensions/agy-provider/provisioning/gemini-md.js');
     const { buildPermissionsSettings, PERMISSION_RULES } = await import('../src/extensions/agy-provider/provisioning/permissions.js');
-    const { buildMcpConfig, BRIDGE_SERVER_KEY, SESSION_ID_ENV, McpConfigError } = await import('../src/extensions/agy-provider/provisioning/mcp-config.js');
+    const { buildMcpConfig, BRIDGE_SERVER_KEY, SESSION_ID_ENV, RUNTIME_DIR_ENV, McpConfigError } = await import('../src/extensions/agy-provider/provisioning/mcp-config.js');
 
     // GEMINI.md: every load-bearing directive is present (no-native-tools +
     // submit_final_answer + "do NOT just print it"). These three phrases are
@@ -3712,19 +3712,27 @@ async function runUnitTests() {
     assert(Array.isArray(fromNothing.permissions.deny), 'permissions: no-arg call still yields deny rules');
 
     // mcp-config: exact shape — mcpServers."ccb-bridge" with command/args/env.
-    const cfg = buildMcpConfig({ bridgeCommand: '/bin/ccb-agy-bridge', bridgeArgs: ['--stdio'], sessionId: 'sess-42' });
+    const cfg = buildMcpConfig({ bridgeCommand: '/bin/ccb-agy-bridge', bridgeArgs: ['--stdio'], sessionId: 'sess-42', runtimeDir: '/tmp/agy-run' });
     const srv = cfg.mcpServers[BRIDGE_SERVER_KEY];
     assert(srv.command === '/bin/ccb-agy-bridge', 'mcp-config: command preserved');
     assert(JSON.stringify(srv.args) === JSON.stringify(['--stdio']), 'mcp-config: args preserved');
     assert(srv.env[SESSION_ID_ENV] === 'sess-42', 'mcp-config: session id surfaced via env var');
+    assert(srv.env[RUNTIME_DIR_ENV] === '/tmp/agy-run', 'mcp-config: runtime dir surfaced via env var (entry needs it to find the socket)');
     // No dispatcher-shim — exactly one server entry, key is ccb-bridge.
     assert(Object.keys(cfg.mcpServers).length === 1, 'mcp-config: exactly one mcpServer (no shim)');
     assert(Object.keys(cfg.mcpServers)[0] === 'ccb-bridge', 'mcp-config: server key is ccb-bridge');
 
-    // mcp-config: args default to [] when omitted; bridgeCommand required.
-    assert(JSON.stringify(buildMcpConfig({ bridgeCommand: 'x', sessionId: 's' }).mcpServers[BRIDGE_SERVER_KEY].args) === JSON.stringify([]), 'mcp-config: args default to empty array');
-    assertThrows(() => buildMcpConfig({ bridgeArgs: ['a'], sessionId: 's' }), McpConfigError, 'mcp-config: missing bridgeCommand throws McpConfigError');
-    assertThrows(() => buildMcpConfig({ bridgeCommand: '', sessionId: 's' }), McpConfigError, 'mcp-config: empty bridgeCommand throws McpConfigError');
+    // mcp-config: args default to [] when omitted; bridgeCommand + sessionId + runtimeDir all required.
+    assert(JSON.stringify(buildMcpConfig({ bridgeCommand: 'x', sessionId: 's', runtimeDir: '/r' }).mcpServers[BRIDGE_SERVER_KEY].args) === JSON.stringify([]), 'mcp-config: args default to empty array');
+    assertThrows(() => buildMcpConfig({ bridgeArgs: ['a'], sessionId: 's', runtimeDir: '/r' }), McpConfigError, 'mcp-config: missing bridgeCommand throws McpConfigError');
+    assertThrows(() => buildMcpConfig({ bridgeCommand: '', sessionId: 's', runtimeDir: '/r' }), McpConfigError, 'mcp-config: empty bridgeCommand throws McpConfigError');
+    // sessionId + runtimeDir are load-bearing (the bridge↔actor socket keys on them) —
+    // guard both symmetrically: an undefined would silently yield env:{} otherwise.
+    assertThrows(() => buildMcpConfig({ bridgeCommand: 'x', runtimeDir: '/r' }), McpConfigError, 'mcp-config: missing sessionId throws McpConfigError');
+    assertThrows(() => buildMcpConfig({ bridgeCommand: 'x', sessionId: '', runtimeDir: '/r' }), McpConfigError, 'mcp-config: empty sessionId throws McpConfigError');
+    assertThrows(() => buildMcpConfig({ bridgeCommand: 'x', sessionId: undefined, runtimeDir: '/r' }), McpConfigError, 'mcp-config: undefined sessionId throws McpConfigError');
+    assertThrows(() => buildMcpConfig({ bridgeCommand: 'x', sessionId: 's' }), McpConfigError, 'mcp-config: missing runtimeDir throws McpConfigError');
+    assertThrows(() => buildMcpConfig({ bridgeCommand: 'x', sessionId: 's', runtimeDir: '' }), McpConfigError, 'mcp-config: empty runtimeDir throws McpConfigError');
   }
 
   // ── agy-provider: session-home provisioner (sociable — real fs on a per-test tmpdir) ──
@@ -3758,7 +3766,7 @@ async function runUnitTests() {
       const sandboxDir = path.join(root, 'sandbox');
       const geminiMd = buildGeminiMd();
       const permissionsSettings = buildPermissionsSettings({ theme: 'dark' });
-      const mcpConfig = buildMcpConfig({ bridgeCommand: 'ccb-agy-bridge', sessionId: 's1' });
+      const mcpConfig = buildMcpConfig({ bridgeCommand: 'ccb-agy-bridge', sessionId: 's1', runtimeDir: '/tmp/run-s1' });
 
       const result = provisionSessionHome({ homeDir, realGeminiDir, sandboxDir, geminiMd, permissionsSettings, mcpConfig });
 
@@ -3809,11 +3817,11 @@ async function runUnitTests() {
     try {
       const a = provisionSessionHome({
         homeDir: path.join(fix1.root, 'home-a'), realGeminiDir: fix1.realGeminiDir, sandboxDir: path.join(fix1.root, 'sand-a'),
-        geminiMd: buildGeminiMd(), permissionsSettings: buildPermissionsSettings({}), mcpConfig: buildMcpConfig({ bridgeCommand: 'b', sessionId: 'A' }),
+        geminiMd: buildGeminiMd(), permissionsSettings: buildPermissionsSettings({}), mcpConfig: buildMcpConfig({ bridgeCommand: 'b', sessionId: 'A', runtimeDir: '/tmp/run-a' }),
       });
       const b = provisionSessionHome({
         homeDir: path.join(fix2.root, 'home-b'), realGeminiDir: fix2.realGeminiDir, sandboxDir: path.join(fix2.root, 'sand-b'),
-        geminiMd: buildGeminiMd(), permissionsSettings: buildPermissionsSettings({}), mcpConfig: buildMcpConfig({ bridgeCommand: 'b', sessionId: 'B' }),
+        geminiMd: buildGeminiMd(), permissionsSettings: buildPermissionsSettings({}), mcpConfig: buildMcpConfig({ bridgeCommand: 'b', sessionId: 'B', runtimeDir: '/tmp/run-b' }),
       });
       assert(a.mcpConfigPath !== b.mcpConfigPath, 'session-home: two sessions get distinct mcp_config paths (no collision)');
       // Session A's config carries session A's id; B carries B's — they did not overwrite each other.
@@ -3832,8 +3840,8 @@ async function runUnitTests() {
     try {
       const homeDir = path.join(fix3.root, 'home');
       const sandboxDir = path.join(fix3.root, 'sand');
-      const first = provisionSessionHome({ homeDir, realGeminiDir: fix3.realGeminiDir, sandboxDir, geminiMd: buildGeminiMd(), permissionsSettings: buildPermissionsSettings({}), mcpConfig: buildMcpConfig({ bridgeCommand: 'b', sessionId: 'first' }) });
-      const second = provisionSessionHome({ homeDir, realGeminiDir: fix3.realGeminiDir, sandboxDir, geminiMd: buildGeminiMd(), permissionsSettings: buildPermissionsSettings({}), mcpConfig: buildMcpConfig({ bridgeCommand: 'b', sessionId: 'second' }) });
+      const first = provisionSessionHome({ homeDir, realGeminiDir: fix3.realGeminiDir, sandboxDir, geminiMd: buildGeminiMd(), permissionsSettings: buildPermissionsSettings({}), mcpConfig: buildMcpConfig({ bridgeCommand: 'b', sessionId: 'first', runtimeDir: '/tmp/run-3' }) });
+      const second = provisionSessionHome({ homeDir, realGeminiDir: fix3.realGeminiDir, sandboxDir, geminiMd: buildGeminiMd(), permissionsSettings: buildPermissionsSettings({}), mcpConfig: buildMcpConfig({ bridgeCommand: 'b', sessionId: 'second', runtimeDir: '/tmp/run-3' }) });
       assert(first.mcpConfigPath === second.mcpConfigPath, 'session-home: re-provision keeps the same paths');
       const cfg = JSON.parse(fs.readFileSync(second.mcpConfigPath, 'utf8'));
       assert(cfg.mcpServers['ccb-bridge'].env.CCB_AGY_SESSION_ID === 'second', 'session-home: re-provision overwrites with the latest session id');
@@ -3848,6 +3856,342 @@ async function runUnitTests() {
     assertThrows(() => provisionSessionHome({ homeDir: '', realGeminiDir: 'x', sandboxDir: 'y', geminiMd: 'z', permissionsSettings: {}, mcpConfig: {} }), McpBridgeError, 'session-home: empty homeDir throws McpBridgeError');
     assertThrows(() => provisionSessionHome({ homeDir: 'x', realGeminiDir: 'y', sandboxDir: 'z', geminiMd: 'm', permissionsSettings: 'not-obj', mcpConfig: {} }), McpBridgeError, 'session-home: non-object permissionsSettings throws McpBridgeError');
     assertThrows(() => provisionSessionHome({ homeDir: 'x', realGeminiDir: 'y', sandboxDir: 'z', geminiMd: 'm', permissionsSettings: {}, mcpConfig: [] }), McpBridgeError, 'session-home: array mcpConfig throws McpBridgeError');
+  }
+
+  // ── agy-provider: socket-path resolver (pure) ──
+  console.log('\nagy-provider socket-path:');
+  {
+    const { socketPathForSession } = await import('../src/extensions/agy-provider/mcp/socket-path.js');
+    const p = socketPathForSession('sess-42', '/tmp/agy-run');
+    assert(p.includes('ccb-agy-bridge-sess-42.sock'), 'socket-path: encodes the session id');
+    assert(p.startsWith('/tmp/agy-run'), 'socket-path: rooted at the runtime dir');
+    assert(socketPathForSession('a', '/r') !== socketPathForSession('b', '/r'), 'socket-path: distinct sessions → distinct paths');
+    assertThrows(() => socketPathForSession('', '/r'), TypeError, 'socket-path: empty sessionId throws TypeError');
+    assertThrows(() => socketPathForSession('s', ''), TypeError, 'socket-path: empty runtimeDir throws TypeError');
+  }
+
+  // ── agy-provider: actor (held-call map + SSE emission, in-process) ──
+  console.log('\nagy-provider actor:');
+  {
+    const { createSessionActor } = await import('../src/extensions/agy-provider/session/actor.js');
+    const { SessionActorError } = await import('../src/extensions/agy-provider/exceptions.js');
+
+    // A capturing SSE sink: records every chunk written + whether end() was called.
+    const capturingSink = () => {
+      const chunks = [];
+      let ended = false;
+      return {
+        writeSse: (s) => { chunks.push(s); },
+        end: () => { ended = true; },
+        get text() { return chunks.join(''); },
+        get wasEnded() { return ended; },
+      };
+    };
+
+    // A fake bridge server: records every fulfill/rejectAll call (state-verify,
+    // never a dynamic mock — it has real state, the actor drives it).
+    const fakeServer = () => {
+      const fulfilled = [];
+      const rejected = [];
+      return {
+        fulfill: (mcpId, result) => { fulfilled.push({ mcpId, result }); },
+        rejectAll: (error) => { rejected.push(error); },
+        get fulfillCalls() { return fulfilled; },
+        get rejectCalls() { return rejected; },
+      };
+    };
+
+    const waitForEvent = (cond, label) => new Promise((resolve) => {
+      const deadline = Date.now() + 500;
+      const POLL = 0;
+      const tick = () => {
+        if (cond()) { resolve(); return; }
+        if (Date.now() >= deadline) { assert(false, `${label} timed out`); resolve(); return; }
+        setTimeout(tick, POLL);
+      };
+      tick();
+    });
+
+    // mcp-tool-call → emits tool_use SSE with stop_reason:tool_use + ENDS the
+    // response (stateless-Messages correctness — the ONLY thing held is the
+    // MCP call in the actor's pending map). Assert SSE STRUCTURE, not PTY text.
+    {
+      const server = fakeServer();
+      const actor = createSessionActor({ server, config: { toolCallDeadlineMs: 90_000 } });
+      const sink = capturingSink();
+      actor.setTurnResponse(sink, 'gemini-3.1-pro');
+      actor.submit({ kind: 'mcp-tool-call', mcpId: 7, name: 'bridge_read', arguments: { path: '/tmp/x' } });
+
+      await waitForEvent(() => sink.wasEnded, 'tool_use SSE ended');
+      assert(sink.text.includes('content_block_start'), 'actor: tool_use SSE has content_block_start');
+      assert(sink.text.includes('"type":"tool_use"'), 'actor: tool_use SSE emits a tool_use block');
+      assert(sink.text.includes('"name":"bridge_read"'), 'actor: tool_use block carries the tool name');
+      // The input is streamed via input_json_delta partial_json (Anthropic's
+      // incremental-input SSE format), so assert that shape — not a static
+      // "input":{...} field (content_block_start carries input:{} by design).
+      assert(sink.text.includes('"input_json_delta"'), 'actor: tool_use SSE streams the input via input_json_delta');
+      assert(sink.text.includes('"partial_json":"{\\"path\\":\\"/tmp/x\\"}"'), 'actor: tool_use partial_json carries the input object');
+      assert(sink.text.includes('"stop_reason":"tool_use"'), 'actor: tool_use SSE ends with stop_reason:tool_use');
+      assert(sink.text.includes('message_stop'), 'actor: tool_use SSE ends with message_stop');
+      assert(sink.wasEnded === true, 'actor: tool_use turn CLOSES the SSE response (stateless correctness)');
+      assert(actor.state.pendingCount === 1, 'actor: held call sits in the pending map');
+      assert(server.fulfillCalls.length === 0, 'actor: no fulfill yet (the call is held, not resolved)');
+    }
+
+    // cc-request with tool_result → resolves the held call by toolUseId, clears deadline.
+    {
+      const server = fakeServer();
+      const actor = createSessionActor({ server, config: { toolCallDeadlineMs: 90_000 } });
+      const sink = capturingSink();
+      actor.setTurnResponse(sink, 'm');
+      actor.submit({ kind: 'mcp-tool-call', mcpId: 11, name: 'bash', arguments: {} });
+      await waitForEvent(() => sink.wasEnded, 'bash tool_use SSE ended');
+      const toolUseId = (sink.text.match(/"id":"(toolu_\d+)"/) || [])[1];
+      assert(typeof toolUseId === 'string', 'actor: minted a toolu_ id for the held call');
+
+      const sink2 = capturingSink();
+      actor.setTurnResponse(sink2, 'm');
+      actor.submit({ kind: 'cc-request', messages: [], toolResults: [{ tool_use_id: toolUseId, content: 'done', is_error: false }], model: 'm' });
+      await waitForEvent(() => server.fulfillCalls.length === 1, 'fulfill on tool_result');
+      assert(server.fulfillCalls[0].mcpId === 11, 'actor: tool_result resolves the held call by toolUseId→mcpId');
+      assert(server.fulfillCalls[0].result.isError === false, 'actor: fulfill carries isError:false');
+      assert(actor.state.pendingCount === 0, 'actor: held call dropped after fulfill');
+    }
+
+    // Deadline: a tool_result that never arrives → at toolCallDeadlineMs the held
+    // call is fulfilled isError:true BEFORE agy's --print-timeout (no leak).
+    {
+      const server = fakeServer();
+      const actor = createSessionActor({ server, config: { toolCallDeadlineMs: 30 } });
+      const sink = capturingSink();
+      actor.setTurnResponse(sink, 'm');
+      actor.submit({ kind: 'mcp-tool-call', mcpId: 22, name: 'slow_tool', arguments: {} });
+      // Do NOT submit a tool_result. Wait for the 30ms deadline to fire.
+      await waitForEvent(() => server.fulfillCalls.length === 1, 'deadline fulfill');
+      assert(server.fulfillCalls[0].mcpId === 22, 'actor: deadline fires fulfill on the unfulfilled call');
+      assert(server.fulfillCalls[0].result.isError === true, 'actor: deadline fulfill is isError:true');
+      assert(server.fulfillCalls[0].result.content[0].text.includes('deadline'), 'actor: deadline error names the cause');
+      assert(actor.state.pendingCount === 0, 'actor: deadline clears the pending stash');
+    }
+
+    // mcp-final-answer → terminal end_turn SSE (agy called submit_final_answer;
+    // the answer arrived over MCP, never parsed from PTY).
+    {
+      const server = fakeServer();
+      const actor = createSessionActor({ server, config: { toolCallDeadlineMs: 90_000 } });
+      const sink = capturingSink();
+      actor.setTurnResponse(sink, 'm');
+      actor.submit({ kind: 'mcp-final-answer', text: 'the answer is 42' });
+      await waitForEvent(() => sink.wasEnded, 'final answer SSE ended');
+      assert(sink.text.includes('"type":"text_delta"'), 'actor: final answer emits a text_delta');
+      assert(sink.text.includes('the answer is 42'), 'actor: final answer text delivered');
+      assert(sink.text.includes('"stop_reason":"end_turn"'), 'actor: final answer ends with stop_reason:end_turn');
+      assert(sink.wasEnded === true, 'actor: final answer turn ends the SSE');
+    }
+
+    // History diff: continuation/retry/reanchor processed serially (no crash).
+    {
+      const server = fakeServer();
+      const actor = createSessionActor({ server, config: { toolCallDeadlineMs: 90_000 } });
+      const u = (text) => ({ role: 'user', content: text });
+      actor.submit({ kind: 'cc-request', messages: [u('hello')], model: 'm' });
+      actor.submit({ kind: 'cc-request', messages: [u('hello')], model: 'm' });
+      actor.submit({ kind: 'cc-request', messages: [u('hello'), u('more')], model: 'm' });
+      assert(actor.state.status === 'ready', 'actor: history-diff sequence leaves actor ready (no crash)');
+    }
+
+    // death → rejectAll + stopped.
+    {
+      const server = fakeServer();
+      const actor = createSessionActor({ server, config: { toolCallDeadlineMs: 90_000 } });
+      const sink = capturingSink(); actor.setTurnResponse(sink, 'm');
+      actor.submit({ kind: 'mcp-tool-call', mcpId: 99, name: 'x', arguments: {} });
+      await waitForEvent(() => sink.wasEnded, 'hold before death');
+      actor.submit({ kind: 'death', error: new SessionActorError('agy died') });
+      await waitForEvent(() => server.rejectCalls.length === 1, 'rejectAll on death');
+      assert(server.rejectCalls.length === 1, 'actor: death rejects all pending via server.rejectAll');
+      assert(actor.state.status === 'stopped', 'actor: death transitions to stopped');
+      actor.submit({ kind: 'mcp-tool-call', mcpId: 100, name: 'late', arguments: {} });
+      assert(actor.state.pendingCount === 0, 'actor: stopped actor drops late events');
+    }
+
+    // Dependency validation: missing server throws SessionActorError.
+    assertThrows(() => createSessionActor({}), SessionActorError, 'actor: missing server throws SessionActorError');
+    assertThrows(() => createSessionActor({ server: {} }), SessionActorError, 'actor: server without fulfill/rejectAll throws');
+  }
+
+  // ── agy-provider: pty-spawn readiness (in-process, no real agy) ──
+  console.log('\nagy-provider pty-spawn readiness:');
+  {
+    const { spawnPtyAgy } = await import('../src/extensions/agy-provider/session/pty-spawn.js');
+    const { AgySpawnReadinessTimeout } = await import('../src/extensions/agy-provider/exceptions.js');
+
+    // Readiness resolves on onReady (NO sleep — deterministic signal). We use a
+    // real bash child so spawnCommand is exercised, but control readiness via a
+    // fake server whose onReady we invoke manually. Race the spawn promise
+    // against a sentinel — no thrown Error (sentinel string resolves instead).
+    const raceWithSentinel = (p, timeoutMs, sentinel) => {
+      const guard = new Promise((resolve) => setTimeout(() => resolve(sentinel), timeoutMs));
+      return Promise.race([p.then(() => 'resolved').catch((e) => `rejected:${e.constructor.name}`), guard]);
+    };
+
+    // Readiness resolves on onReady.
+    {
+      let readyCb = null;
+      const fakeServer = { onReady: (cb) => { readyCb = cb; } };
+      const p = spawnPtyAgy({ agyPath: '/usr/bin/agy', model: 'Gemini 3.1 Pro', prompt: 'hello', sandboxDir: '/tmp', env: { HOME: '/tmp', PATH: process.env.PATH }, server: fakeServer, sshHost: undefined, readyTimeoutMs: 5000 });
+      const FIRE = 0;
+      setTimeout(() => readyCb && readyCb(), FIRE);
+      const outcome = await raceWithSentinel(p, 6000, 'timeout');
+      assert(outcome === 'resolved', 'pty-spawn: resolves when server.onReady fires (no sleep)');
+    }
+
+    // Readiness never fires within readyTimeoutMs → AgySpawnReadinessTimeout.
+    {
+      const fakeServer = { onReady: () => { /* never fires */ } };
+      const p = spawnPtyAgy({ agyPath: '/usr/bin/agy', model: 'Gemini 3.1 Pro', prompt: 'hello', sandboxDir: '/tmp', env: { HOME: '/tmp', PATH: process.env.PATH }, server: fakeServer, readyTimeoutMs: 50 });
+      let rejected = null;
+      try { await p; } catch (e) { rejected = e; }
+      assert(rejected instanceof AgySpawnReadinessTimeout, 'pty-spawn: rejects AgySpawnReadinessTimeout when onReady never fires in time');
+    }
+
+    // env.HOME + prompt are mandatory; their absence fails loud.
+    assertThrows(() => spawnPtyAgy({ agyPath: '/x', model: 'm', prompt: 'p', sandboxDir: '/tmp', env: {}, server: { onReady: () => {} } }), AgySpawnReadinessTimeout, 'pty-spawn: missing env.HOME throws');
+    assertThrows(() => spawnPtyAgy({ agyPath: '', model: 'm', prompt: 'p', sandboxDir: '/tmp', env: { HOME: '/tmp' }, server: { onReady: () => {} } }), AgySpawnReadinessTimeout, 'pty-spawn: empty agyPath throws');
+    assertThrows(() => spawnPtyAgy({ agyPath: '/x', model: 'm', sandboxDir: '/tmp', env: { HOME: '/tmp' }, server: { onReady: () => {} } }), AgySpawnReadinessTimeout, 'pty-spawn: missing prompt throws');
+  }
+
+  // ── agy-provider: MVP proof against REAL agy (gated — opt-in) ──
+  // Runs only when CCB_AGY_MVP_TEST=1 AND agy is resolvable. This is the
+  // end-to-end held-call round: real PTY agy → actor receives the tool call →
+  // emits tool_use SSE → tool_result fulfills the held call → agy continues →
+  // final answer via submit_final_answer. Assert SSE STRUCTURE, never PTY text.
+  if (process.env.CCB_AGY_MVP_TEST === '1') {
+    console.log('\nagy-provider MVP proof (real agy):');
+    const { resolveAgyBinary, agyDir: agyDirFn } = await import('../src/extensions/agy-format/binary-resolver.js');
+    let agyPresent = true;
+    let resolvedAgy = '';
+    try { resolvedAgy = resolveAgyBinary(undefined); } catch { agyPresent = false; }
+    if (!agyPresent) {
+      console.log('  (skipped: agy binary not resolvable on this host)');
+    }
+    if (agyPresent) {
+      const { createSessionActor } = await import('../src/extensions/agy-provider/session/actor.js');
+      const { spawnPtyAgy } = await import('../src/extensions/agy-provider/session/pty-spawn.js');
+      const { createBridgeSocketServer } = await import('../src/extensions/agy-provider/mcp/bridge-socket-server.js');
+      const { socketPathForSession } = await import('../src/extensions/agy-provider/mcp/socket-path.js');
+      const { provisionSessionHome } = await import('../src/extensions/agy-provider/provisioning/session-home.js');
+      const { buildGeminiMd } = await import('../src/extensions/agy-provider/provisioning/gemini-md.js');
+      const { buildPermissionsSettings } = await import('../src/extensions/agy-provider/provisioning/permissions.js');
+      const { buildMcpConfig } = await import('../src/extensions/agy-provider/provisioning/mcp-config.js');
+
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-mvp-'));
+      try {
+        // The real-agy proof needs REAL OAuth auth (agy cannot run without it).
+        // realGeminiDir points at the user's real ~/.gemini: provisionSessionHome
+        // creates READ-ONLY symlinks TO it and never mutates it. If the real auth
+        // files are absent (an unauthed host), SKIP — never fail the suite on auth.
+        const realGeminiDir = path.join(os.homedir(), '.gemini');
+        const hasRealAuth = fs.existsSync(path.join(realGeminiDir, 'oauth_creds.json'));
+        if (!hasRealAuth) {
+          console.log('  (skipped: no real ~/.gemini/oauth_creds.json on this host — agy auth unavailable)');
+        }
+        if (hasRealAuth) {
+        const homeDir = path.join(root, 'home');
+        const sandboxDir = path.join(root, 'sandbox');
+        const targetFile = path.join(sandboxDir, 'target.txt');
+
+        const sessionId = 'mvp';
+        const bridgeScript = path.join(PKG_ROOT, 'src/extensions/agy-provider/mcp/bridge-entry.js');
+        // runtimeDir = root: the per-session adapter socket lives in the tmpdir.
+        const mcpConfig = buildMcpConfig({ bridgeCommand: process.execPath, bridgeArgs: [bridgeScript], sessionId, runtimeDir: root });
+        const provisioned = provisionSessionHome({
+          homeDir, realGeminiDir, sandboxDir,
+          geminiMd: buildGeminiMd(),
+          permissionsSettings: buildPermissionsSettings({}),
+          mcpConfig,
+        });
+        // Write the target AFTER provisionSessionHome has created the sandbox dir.
+        fs.writeFileSync(targetFile, 'MVP_PROOF_CONTENT_42\n', 'utf8');
+
+        const capturedSse = [];
+        // The poll gates on the FINAL-ANSWER SSE content, not on sink.end().
+        // The actor ends the response after the tool_use round (spec Q2:
+        // stateless Messages API holds only the MCP call, not the HTTP
+        // response), so a sink.end()-based gate would stop the loop during the
+        // tool round — before agy is fed the tool_result and calls
+        // submit_final_answer. The end_turn SSE appears only when agy actually
+        // calls submit_final_answer; a print-and-exit failure never produces it,
+        // so child-close is also a terminal (the loop stops and the assertions
+        // below then fail loudly on the missing end_turn marker).
+        let childClosed = false;
+        const sink = {
+          writeSse: (s) => { capturedSse.push(s); },
+          end: () => { /* per-turn response closed; the poll gates on SSE content */ },
+        };
+        const actorRef = { current: null };
+        // The actor-side socket server: binds Unit 3's bridge to each accepted
+        // connection and bubbles onReady/fulfill/rejectAll. Single BDT engine.
+        const socketServer = createBridgeSocketServer({
+          socketPath: socketPathForSession(sessionId, root),
+          listTools: () => [{ name: 'read_file', description: 'read a file', inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } }],
+          onToolCall: (call) => {
+            actorRef.current.setTurnResponse(sink, 'gemini-3.1-pro');
+            actorRef.current.submit({ kind: 'mcp-tool-call', mcpId: call.mcpId, name: call.name, arguments: call.arguments });
+            // Fulfill after the actor has stashed the held call (deterministic
+            // readiness: pendingCount>0 means the call is held), no arbitrary sleep.
+            const POLL_FULFILL = 0;
+            const tryFulfill = () => {
+              if (actorRef.current.state.pendingCount > 0) {
+                const content = fs.readFileSync(call.arguments.path, 'utf8');
+                socketServer.fulfill(call.mcpId, { content: [{ type: 'text', text: content }], isError: false });
+                return;
+              }
+              setTimeout(tryFulfill, POLL_FULFILL);
+            };
+            tryFulfill();
+          },
+          onFinalAnswer: (text) => {
+            actorRef.current.setTurnResponse(sink, 'gemini-3.1-pro');
+            actorRef.current.submit({ kind: 'mcp-final-answer', text });
+          },
+        });
+        socketServer.start();
+        actorRef.current = createSessionActor({ server: socketServer, config: { toolCallDeadlineMs: 60_000 } });
+
+        const env = { ...process.env, HOME: provisioned.home, CCB_AGY_SESSION_ID: sessionId, CCB_AGY_RUNTIME_DIR: root, PATH: `${agyDirFn(resolvedAgy)}:${process.env.PATH}` };
+        const prompt = `Read the file at ${targetFile} using the read_file tool, then call submit_final_answer with the file's contents as your answer.`;
+
+        const { child } = await spawnPtyAgy({ agyPath: resolvedAgy, model: 'Gemini 3.1 Pro', prompt, sandboxDir, env, server: socketServer, readyTimeoutMs: 30_000 });
+        child.on('close', () => { childClosed = true; });
+
+        // Wait for the end_turn SSE (agy called submit_final_answer) OR agy
+        // exiting (print-and-exit failure → no end_turn marker; the assertions
+        // below then fail loudly). Bounded deadline as a hard backstop.
+        const deadline = Date.now() + 90_000;
+        const POLL = 100;
+        const tick = (resolve) => {
+          const haveEndTurn = capturedSse.join('').includes('"stop_reason":"end_turn"');
+          if (haveEndTurn || childClosed || Date.now() >= deadline) { resolve(); return; }
+          setTimeout(() => tick(resolve), POLL);
+        };
+        await new Promise((resolve) => tick(resolve));
+        try { child.kill('SIGTERM'); } catch { /* already exited */ }
+        socketServer.stop();
+
+        const allSse = capturedSse.join('');
+        assert(allSse.includes('"type":"tool_use"'), 'MVP: real agy round produced a tool_use SSE block (held call emitted)');
+        assert(allSse.includes('"stop_reason":"tool_use"'), 'MVP: tool_use SSE carries stop_reason:tool_use');
+        assert(allSse.includes('"stop_reason":"end_turn"'), 'MVP: final answer emitted as end_turn SSE (submit_final_answer path)');
+        assert(allSse.includes('MVP_PROOF_CONTENT_42'), 'MVP: the file content agy read flowed through to the final answer SSE');
+        console.log('  MVP proof PASSED: real agy held-call round + submit_final_answer confirmed.');
+        } // end if (hasRealAuth)
+      } catch (err) {
+        assert(false, `MVP proof against real agy failed: ${err && err.message ? err.message : err}`);
+      } finally {
+        try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
+      }
+    }
   }
 
   // ── agy-format: invocation builder ──
