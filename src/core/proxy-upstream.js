@@ -113,8 +113,34 @@ function extractProviderIdFromLabel(label) {
   return base.split('.')[0];
 }
 
-function singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, _retryConfig, onUpstreamResponse, onRetryNeeded, openaiProviders }) {
+async function singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, _retryConfig, onUpstreamResponse, onRetryNeeded, openaiProviders }) {
   const providerId = extractProviderIdFromLabel(ctx.routeLabel);
+
+  // If an extension handles this upstream directly (e.g. CLI-based providers), delegate.
+  // The extension receives the request body and writes the client response itself —
+  // so we must NOT call handleResponseEnd here (it requires resCtx.proxyRes, which
+  // this request-only context lacks, and would double-finalize an already-ended
+  // response). A malformed body or a throwing handler becomes a clean upstream
+  // failure instead of an unhandled rejection that would crash the worker.
+  if (extensions?.hasUpstreamHandler(providerId)) {
+    if (ctx.clientAborted) return;
+    try {
+      const body = JSON.parse(ctx.forwardBody.toString());
+      await extensions.invokeUpstream({ providerId, body, req: ctx.req, res: ctx.res, ctx });
+    } catch (err) {
+      errorReporter.write(new UpstreamError(err.message, { code: err.code }), {
+        requestId: ctx.id,
+        route: ctx.routeLabel,
+        model: ctx.reqModel,
+        sessionId: ctx.sessionId,
+        operation: 'upstream_handler_error',
+        elapsedMs: Date.now() - ctx.startTime
+      });
+      finalizeUpstreamFailure(ctx, err.message);
+    }
+    return;
+  }
+
   const isOpenaiFormat = !!(openaiProviders && providerId && openaiProviders[providerId]?.format === 'openai');
   const target = resolveUpstreamUrl(ctx.targetBase, ctx.req.url, ctx.isCustom, isOpenaiFormat);
   const finalHeaders = { ...ctx.routedHeaders, host: target.host, 'content-length': String(ctx.forwardBody.length) };

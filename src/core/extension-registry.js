@@ -51,6 +51,7 @@ export class ExtensionRegistry {
   #unmatchedResolvers = [];
   #requestStartHandlers = [];
   #requestEndHandlers = [];
+  #upstreamHandlers = [];
 
   /** Register an extension. Idempotent — re-registering replaces the previous entry. */
   register(extension) {
@@ -98,6 +99,9 @@ export class ExtensionRegistry {
     }
     if (extension.hooks?.onRequestEnd) {
       this.#requestEndHandlers = this.#upsert(this.#requestEndHandlers, extension.name, extension.hooks.onRequestEnd);
+    }
+    if (extension.hooks?.handleUpstream) {
+      this.#upstreamHandlers = this.#upsert(this.#upstreamHandlers, extension.name, extension.hooks.handleUpstream);
     }
   }
 
@@ -261,6 +265,29 @@ export class ExtensionRegistry {
   }
 
   /**
+   * Check if any extension handles upstream directly for the given provider.
+   * Used for CLI-based providers (e.g. agy) that bypass HTTP forwarding.
+   */
+  hasUpstreamHandler(providerId) {
+    for (const h of this.#upstreamHandlers) {
+      if (h.handles(providerId)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Delegate upstream handling to the first extension that accepts the provider.
+   * The extension receives the parsed body and writes directly to the client response.
+   */
+  async invokeUpstream({ providerId, body, req, res, ctx }) {
+    for (const h of this.#upstreamHandlers) {
+      if (h.handles(providerId)) {
+        return h.handle({ body, req, res, ctx });
+      }
+    }
+  }
+
+  /**
    * Get configuration schemas for all registered extensions.
    */
   getSchemas() {
@@ -326,6 +353,8 @@ export class ExtensionRegistry {
     if (hook.format) entry.format = hook.format;
     if (hook.convertSseChunk) entry.convertSseChunk = hook.convertSseChunk;
     if (hook.convertFullResponse) entry.convertFullResponse = hook.convertFullResponse;
+    if (hook.handles) entry.handles = hook.handles;
+    if (hook.handle) entry.handle = hook.handle;
     filtered.push(entry);
     filtered.sort((a, b) => a.order - b.order);
     return filtered;

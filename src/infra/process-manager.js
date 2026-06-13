@@ -1,4 +1,4 @@
-import { spawn, execSync, spawnSync } from 'child_process';
+import { spawn, execFile, execSync, spawnSync } from 'child_process';
 import process from 'process';
 import path from 'path';
 import { WATCHDOG_SCRIPT_NAME } from '../core/constants.js';
@@ -27,6 +27,21 @@ export function spawnCommand(cmd, args, options) {
 export function runSync(cmd, args, options) {
   // eslint-disable-next-line local/no-direct-spawn
   return spawnSync(cmd, args, { windowsHide: true, ...options });
+}
+
+/**
+ * Execute a command and return buffered stdout via callback-style execFile.
+ * Returns a Promise that resolves with stdout string.
+ * Used by extensions that need subprocess output (e.g. SSH commands).
+ */
+export function execCommand(cmd, args, options) {
+  return new Promise((resolve, reject) => {
+    // eslint-disable-next-line local/no-direct-spawn
+    execFile(cmd, args, { windowsHide: true, ...options }, (err, stdout) => {
+      if (err) return reject(err);
+      resolve(stdout ?? '');
+    });
+  });
 }
 
 export function getProcesses() {

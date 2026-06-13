@@ -2,7 +2,7 @@ import http from 'http';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import pty from 'node-pty';
 import {
   LOGS_DIR_NAME,
@@ -1971,13 +1971,13 @@ async function runUnitTests() {
   // discoverExtensions on built-in dir
   const extDir = path.join(PKG_ROOT, 'src', 'extensions');
   const discovered = await discoverExtensions(extDir);
-  assert(discovered.length === 7, `discovers 7 extensions (found ${discovered.length})`);
+  assert(discovered.length === 8, `discovers 8 extensions (found ${discovered.length})`);
   const errors = discovered.filter(m => m.error);
   assert(errors.length === 0, `no discovery errors (${errors.map(e => e.error).join(', ')})`);
 
   // buildRegistry with no providers — only always-on extensions
   const { registry: regNoProviders } = buildRegistry(discovered, []);
-  assert(regNoProviders.size === 6, `6 always-on extensions without providers (got ${regNoProviders.size})`);
+  assert(regNoProviders.size === 7, `7 always-on extensions without providers (got ${regNoProviders.size})`);
   assert(regNoProviders.requestTransformerCount >= 2, 'at least 2 request transformers (sanitization + non-compliant)');
 
   // buildRegistry with provider that has toolTransforms.web_search
@@ -1986,15 +1986,15 @@ async function runUnitTests() {
     toolTransforms: { web_search: {} }
   });
   const { registry: regWithWs } = buildRegistry(discovered, [providerWithWs]);
-  assert(regWithWs.size === 7, `7 extensions with web_search provider (got ${regWithWs.size})`);
+  assert(regWithWs.size === 8, `8 extensions with web_search provider (got ${regWithWs.size})`);
 
   // getAll() exposes the full extension list including those without
   // tunable schemas — this is what the GUI Extensions tab consumes.
   const allExtensions = regWithWs.getAll();
-  assert(allExtensions.length === 7, `getAll returns 7 extensions (got ${allExtensions.length})`);
+  assert(allExtensions.length === 8, `getAll returns 8 extensions (got ${allExtensions.length})`);
   const byName = Object.fromEntries(allExtensions.map(e => [e.name, e]));
 
-  for (const name of ['fallback', 'load-balancer', 'non-compliant-transform', 'openai-format', 'sanitization', 'thinking-sse', 'web-search-zai']) {
+  for (const name of ['agy-format', 'fallback', 'load-balancer', 'non-compliant-transform', 'openai-format', 'sanitization', 'thinking-sse', 'web-search-zai']) {
     assert(byName[name], `getAll includes ${name}`);
     assert(typeof byName[name].title === 'string' && byName[name].title.length > 0, `${name} has non-empty title`);
     assert(typeof byName[name].description === 'string' && byName[name].description.length > 0, `${name} has non-empty description`);
@@ -4639,6 +4639,10 @@ async function runLiveRoutingTests() {
           models: {},
           toolTransforms: {},
         },
+        // Provider "faulty" is NOT declared here: the fake extension's
+        // resolveUnmatched hook supplies it on the fly (mirroring agy-format),
+        // which is the only path that yields a `direct:faulty→...` route label
+        // from which the upstream-handler dispatch recovers the provider id.
       },
       routes: {
         models: {
@@ -4646,6 +4650,8 @@ async function runLiveRoutingTests() {
           '*haiku*': 'primary.some-model',
           'my-fb': { target: 'primary.some-model', fallback: ['fb.some-model'] },
           'my-dead': 'dead.some-model',
+          // 'faulty-ok' / 'faulty-throw' are intentionally UNMATCHED here so they
+          // reach the fake extension's resolveUnmatched hook (Scenarios 6A/6B).
         },
         properties: {},
         payloadSize: {},
@@ -4687,9 +4693,61 @@ async function runLiveRoutingTests() {
     // ── Write .env — keys follow providerIdToEnvKey("primary") = "PRIMARY_KEY" ──
     fs.writeFileSync(
       path.join(tempDir, ENV_FILENAME),
-      'PRIMARY_KEY=test-primary-key\nFB_KEY=test-fb-key\nDEAD_KEY=test-dead-key\n',
+      'PRIMARY_KEY=test-primary-key\nFB_KEY=test-fb-key\nDEAD_KEY=test-dead-key\nFAULTY_KEY=test-faulty-key\n',
       'utf8'
     );
+
+    // ── Write fake upstream-handler extension (Scenarios 6A + 6B) ──
+    // Routes to provider "faulty" are intercepted here; the extension writes
+    // the response directly and never touches the HTTP forward path.
+    // Success path (body.model === 'faulty.some-model' routed via 'my-faulty-ok'):
+    //   writes a 200 JSON response.
+    // Throw path (routed via 'my-faulty-throw'):
+    //   throws synchronously to prove fix 2 converts it to a clean 5xx.
+    const faultyExtDir = path.join(tempDir, 'extensions', 'faulty-upstream');
+    fs.mkdirSync(faultyExtDir, { recursive: true });
+    // The fake lives in a temp dir, so it imports the real ProviderConfig by
+    // absolute file URL (relative '../../core/...' would not resolve from here).
+    const providersModuleUrl = pathToFileURL(path.join(PKG_ROOT, 'src', 'core', 'providers.js')).href;
+    const faultyExtCode = `
+import { ProviderConfig } from ${JSON.stringify(providersModuleUrl)};
+export const EXTENSION_META = { activation: 'always' };
+export function createFaultyUpstreamExtension(_config) {
+  const provider = new ProviderConfig({ id: 'faulty', url: 'faulty://local', models: {}, anthropicCompliant: true, toolTransforms: {} });
+  return {
+    name: 'faulty-upstream',
+    hooks: {
+      // Resolve the unmatched test models to provider "faulty". This is the only
+      // path that yields a 'direct:faulty→<model>' route label, from which the
+      // upstream-handler dispatch recovers the provider id (mirrors agy-format).
+      resolveUnmatched: {
+        order: 50,
+        resolve: async ({ modelName }) => {
+          if (modelName === 'faulty-ok') return { provider, model: 'ok', providerId: 'faulty' };
+          if (modelName === 'faulty-throw') return { provider, model: 'throw', providerId: 'faulty' };
+          return null;
+        },
+      },
+      // Writes the client response directly (like agy). On the throw path it
+      // rejects WITHOUT writing — proving the forward layer converts the
+      // rejection into a clean error instead of crashing the worker.
+      handleUpstream: {
+        order: 50,
+        handles: (providerId) => providerId === 'faulty',
+        handle: async ({ body, res }) => {
+          if (body.model === 'throw') {
+            throw new Error('faulty-upstream: deliberate test throw');
+          }
+          const payload = JSON.stringify({ type: 'message', content: 'ok-from-faulty' });
+          res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) });
+          res.end(payload);
+        },
+      },
+    },
+  };
+}
+`;
+    fs.writeFileSync(path.join(faultyExtDir, 'index.js'), faultyExtCode, 'utf8');
 
     // ── Spawn daemon ──
     const WATCHDOG_BIN = path.join(PKG_ROOT, 'bin', WATCHDOG_SCRIPT_NAME);
@@ -4830,6 +4888,51 @@ async function runLiveRoutingTests() {
       `S5: daemon still served a healthy request after the refused upstream (got ${JSON.stringify(survivorResult)})`
     );
     assert(primaryStub.requests.length === 1, 'S5: healthy survivor request reached primaryStub');
+
+    // ── Scenario 6A: UPSTREAM-HANDLER SUCCESS PATH → worker must survive ──
+    // Routes to "faulty" provider whose handleUpstream writes a 200 directly.
+    // Without fix 1 the bogus handleResponseEnd() call after invokeUpstream
+    // dereferences ctx.proxyRes (undefined) → TypeError → worker crash.
+    console.log('  Scenario 6A: upstream-handler success path → 200 + worker survives');
+    anthropicStub.requests.length = 0;
+    primaryStub.requests.length = 0;
+
+    const s6aResult = await postMessagesDetailed(livePort, 'faulty-ok');
+    assert(
+      s6aResult.status === 200,
+      `S6A: client received 200 from upstream-handler success path (got ${JSON.stringify(s6aResult)})`
+    );
+
+    // Worker must still serve healthy requests with no respawn window.
+    primaryStub.setStatus(200);
+    const s6aSurvivor = await postMessagesDetailed(livePort, 'my-exact');
+    assert(
+      s6aSurvivor.status === 200,
+      `S6A: daemon still alive after upstream-handler success path (got ${JSON.stringify(s6aSurvivor)})`
+    );
+
+    // ── Scenario 6B: UPSTREAM-HANDLER THROW PATH → clean 5xx + worker survives ──
+    // Routes to "faulty" provider whose handleUpstream throws synchronously.
+    // Without fix 2 the unhandled rejection kills the worker; the client gets
+    // a socket reset instead of a clean HTTP error response.
+    console.log('  Scenario 6B: upstream-handler throw path → clean 5xx + worker survives');
+    anthropicStub.requests.length = 0;
+    primaryStub.requests.length = 0;
+
+    const s6bResult = await postMessagesDetailed(livePort, 'faulty-throw');
+    assert(
+      typeof s6bResult.status === 'number' && s6bResult.status >= 400,
+      `S6B: client received a clean HTTP error when upstream-handler threw (got ${JSON.stringify(s6bResult)})`
+    );
+
+    // Worker must still be alive after the error was contained.
+    primaryStub.setStatus(200);
+    const s6bSurvivor = await postMessagesDetailed(livePort, 'my-exact');
+    assert(
+      s6bSurvivor.status === 200,
+      `S6B: daemon still alive after upstream-handler throw (got ${JSON.stringify(s6bSurvivor)})`
+    );
+    assert(primaryStub.requests.length === 1, 'S6B: healthy survivor request reached primaryStub');
 
     const liveRoutingPassed = failed === failedBefore;
     if (liveRoutingPassed) {
