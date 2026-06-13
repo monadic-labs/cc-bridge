@@ -3862,12 +3862,28 @@ async function runUnitTests() {
   console.log('\nagy-provider socket-path:');
   {
     const { socketPathForSession } = await import('../src/extensions/agy-provider/mcp/socket-path.js');
+    const { McpBridgeError } = await import('../src/extensions/agy-provider/exceptions.js');
     const p = socketPathForSession('sess-42', '/tmp/agy-run');
     assert(p.includes('ccb-agy-bridge-sess-42.sock'), 'socket-path: encodes the session id');
     assert(p.startsWith('/tmp/agy-run'), 'socket-path: rooted at the runtime dir');
     assert(socketPathForSession('a', '/r') !== socketPathForSession('b', '/r'), 'socket-path: distinct sessions → distinct paths');
-    assertThrows(() => socketPathForSession('', '/r'), TypeError, 'socket-path: empty sessionId throws TypeError');
-    assertThrows(() => socketPathForSession('s', ''), TypeError, 'socket-path: empty runtimeDir throws TypeError');
+    assertThrows(() => socketPathForSession('', '/r'), McpBridgeError, 'socket-path: empty sessionId throws McpBridgeError');
+    assertThrows(() => socketPathForSession('s', ''), McpBridgeError, 'socket-path: empty runtimeDir throws McpBridgeError');
+  }
+
+  // ── agy-provider: bridge-socket-server dependency validation (contract — ungated) ──
+  console.log('\nagy-provider bridge-socket-server guards:');
+  {
+    const { createBridgeSocketServer } = await import('../src/extensions/agy-provider/mcp/bridge-socket-server.js');
+    const { McpBridgeError } = await import('../src/extensions/agy-provider/exceptions.js');
+    const ok = { socketPath: '/tmp/x.sock', listTools: () => [], onToolCall: () => {}, onFinalAnswer: () => {} };
+    // Each required injection, when wrong/missing, throws the named domain error.
+    assertThrows(() => createBridgeSocketServer({}), McpBridgeError, 'socket-server: missing socketPath throws McpBridgeError');
+    assertThrows(() => createBridgeSocketServer({ ...ok, socketPath: '' }), McpBridgeError, 'socket-server: empty socketPath throws McpBridgeError');
+    assertThrows(() => createBridgeSocketServer({ ...ok, listTools: undefined }), McpBridgeError, 'socket-server: missing listTools throws McpBridgeError');
+    assertThrows(() => createBridgeSocketServer({ ...ok, listTools: 'not a fn' }), McpBridgeError, 'socket-server: non-function listTools throws McpBridgeError');
+    assertThrows(() => createBridgeSocketServer({ ...ok, onToolCall: undefined }), McpBridgeError, 'socket-server: missing onToolCall throws McpBridgeError');
+    assertThrows(() => createBridgeSocketServer({ ...ok, onFinalAnswer: undefined }), McpBridgeError, 'socket-server: missing onFinalAnswer throws McpBridgeError');
   }
 
   // ── agy-provider: actor (held-call map + SSE emission, in-process) ──
@@ -4024,7 +4040,7 @@ async function runUnitTests() {
   console.log('\nagy-provider pty-spawn readiness:');
   {
     const { spawnPtyAgy } = await import('../src/extensions/agy-provider/session/pty-spawn.js');
-    const { AgySpawnReadinessTimeout } = await import('../src/extensions/agy-provider/exceptions.js');
+    const { AgySpawnReadinessTimeout, SessionActorError } = await import('../src/extensions/agy-provider/exceptions.js');
 
     // Readiness resolves on onReady (NO sleep — deterministic signal). We use a
     // real bash child so spawnCommand is exercised, but control readiness via a
@@ -4038,12 +4054,17 @@ async function runUnitTests() {
     // Readiness resolves on onReady.
     {
       let readyCb = null;
+      let spawnedChild = null;
       const fakeServer = { onReady: (cb) => { readyCb = cb; } };
       const p = spawnPtyAgy({ agyPath: '/usr/bin/agy', model: 'Gemini 3.1 Pro', prompt: 'hello', sandboxDir: '/tmp', env: { HOME: '/tmp', PATH: process.env.PATH }, server: fakeServer, sshHost: undefined, readyTimeoutMs: 5000 });
+      // Capture the child for teardown as soon as the promise settles.
+      p.then((r) => { spawnedChild = r.child; }).catch(() => {});
       const FIRE = 0;
       setTimeout(() => readyCb && readyCb(), FIRE);
       const outcome = await raceWithSentinel(p, 6000, 'timeout');
       assert(outcome === 'resolved', 'pty-spawn: resolves when server.onReady fires (no sleep)');
+      // Deterministic teardown: kill the spawned bash/script child so none leaks.
+      try { spawnedChild && spawnedChild.kill('SIGTERM'); } catch { /* already exited */ }
     }
 
     // Readiness never fires within readyTimeoutMs → AgySpawnReadinessTimeout.
@@ -4055,10 +4076,12 @@ async function runUnitTests() {
       assert(rejected instanceof AgySpawnReadinessTimeout, 'pty-spawn: rejects AgySpawnReadinessTimeout when onReady never fires in time');
     }
 
-    // env.HOME + prompt are mandatory; their absence fails loud.
-    assertThrows(() => spawnPtyAgy({ agyPath: '/x', model: 'm', prompt: 'p', sandboxDir: '/tmp', env: {}, server: { onReady: () => {} } }), AgySpawnReadinessTimeout, 'pty-spawn: missing env.HOME throws');
-    assertThrows(() => spawnPtyAgy({ agyPath: '', model: 'm', prompt: 'p', sandboxDir: '/tmp', env: { HOME: '/tmp' }, server: { onReady: () => {} } }), AgySpawnReadinessTimeout, 'pty-spawn: empty agyPath throws');
-    assertThrows(() => spawnPtyAgy({ agyPath: '/x', model: 'm', sandboxDir: '/tmp', env: { HOME: '/tmp' }, server: { onReady: () => {} } }), AgySpawnReadinessTimeout, 'pty-spawn: missing prompt throws');
+    // Pre-spawn config validation fails loud with a domain config error (not a
+    // readiness timeout — nothing spawned yet). env.HOME / prompt / agyPath all
+    // mandatory; their absence is a caller bug, not a runtime readiness miss.
+    assertThrows(() => spawnPtyAgy({ agyPath: '/x', model: 'm', prompt: 'p', sandboxDir: '/tmp', env: {}, server: { onReady: () => {} } }), SessionActorError, 'pty-spawn: missing env.HOME throws SessionActorError');
+    assertThrows(() => spawnPtyAgy({ agyPath: '', model: 'm', prompt: 'p', sandboxDir: '/tmp', env: { HOME: '/tmp' }, server: { onReady: () => {} } }), SessionActorError, 'pty-spawn: empty agyPath throws SessionActorError');
+    assertThrows(() => spawnPtyAgy({ agyPath: '/x', model: 'm', sandboxDir: '/tmp', env: { HOME: '/tmp' }, server: { onReady: () => {} } }), SessionActorError, 'pty-spawn: missing prompt throws SessionActorError');
   }
 
   // ── agy-provider: MVP proof against REAL agy (gated — opt-in) ──
@@ -4086,6 +4109,11 @@ async function runUnitTests() {
       const { buildMcpConfig } = await import('../src/extensions/agy-provider/provisioning/mcp-config.js');
 
       const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-mvp-'));
+      // Hoisted so the finally below can tear them down even if an assertion
+      // throws mid-round (manifesto §zero-global-state: cleanup on success AND
+      // panic paths). Both are null until/unless hasRealAuth sets them.
+      let socketServer = null;
+      let spawnedChild = null;
       try {
         // The real-agy proof needs REAL OAuth auth (agy cannot run without it).
         // realGeminiDir points at the user's real ~/.gemini: provisionSessionHome
@@ -4132,7 +4160,7 @@ async function runUnitTests() {
         const actorRef = { current: null };
         // The actor-side socket server: binds Unit 3's bridge to each accepted
         // connection and bubbles onReady/fulfill/rejectAll. Single BDT engine.
-        const socketServer = createBridgeSocketServer({
+        socketServer = createBridgeSocketServer({
           socketPath: socketPathForSession(sessionId, root),
           listTools: () => [{ name: 'read_file', description: 'read a file', inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } }],
           onToolCall: (call) => {
@@ -4140,11 +4168,18 @@ async function runUnitTests() {
             actorRef.current.submit({ kind: 'mcp-tool-call', mcpId: call.mcpId, name: call.name, arguments: call.arguments });
             // Fulfill after the actor has stashed the held call (deterministic
             // readiness: pendingCount>0 means the call is held), no arbitrary sleep.
+            // Bounded: a hard deadline + loud failure if the held call never lands
+            // (manifesto §Background-work hygiene — uncapped poll loops are banned).
             const POLL_FULFILL = 0;
+            const fulfillDeadline = Date.now() + 5_000;
             const tryFulfill = () => {
               if (actorRef.current.state.pendingCount > 0) {
                 const content = fs.readFileSync(call.arguments.path, 'utf8');
                 socketServer.fulfill(call.mcpId, { content: [{ type: 'text', text: content }], isError: false });
+                return;
+              }
+              if (Date.now() >= fulfillDeadline) {
+                assert(false, 'tryFulfill: deadline exceeded waiting for pendingCount>0');
                 return;
               }
               setTimeout(tryFulfill, POLL_FULFILL);
@@ -4156,14 +4191,18 @@ async function runUnitTests() {
             actorRef.current.submit({ kind: 'mcp-final-answer', text });
           },
         });
-        socketServer.start();
+        // Create the actor BEFORE start(): a tool call arriving between start()
+        // and the assignment would deref actorRef.current === null. start() only
+        // begins accepting after the actor is wired, closing the null window.
         actorRef.current = createSessionActor({ server: socketServer, config: { toolCallDeadlineMs: 60_000 } });
+        socketServer.start();
 
         const env = { ...process.env, HOME: provisioned.home, CCB_AGY_SESSION_ID: sessionId, CCB_AGY_RUNTIME_DIR: root, PATH: `${agyDirFn(resolvedAgy)}:${process.env.PATH}` };
         const prompt = `Read the file at ${targetFile} using the read_file tool, then call submit_final_answer with the file's contents as your answer.`;
 
-        const { child } = await spawnPtyAgy({ agyPath: resolvedAgy, model: 'Gemini 3.1 Pro', prompt, sandboxDir, env, server: socketServer, readyTimeoutMs: 30_000 });
-        child.on('close', () => { childClosed = true; });
+        const spawnResult = await spawnPtyAgy({ agyPath: resolvedAgy, model: 'Gemini 3.1 Pro', prompt, sandboxDir, env, server: socketServer, readyTimeoutMs: 30_000 });
+        spawnedChild = spawnResult.child;
+        spawnedChild.on('close', () => { childClosed = true; });
 
         // Wait for the end_turn SSE (agy called submit_final_answer) OR agy
         // exiting (print-and-exit failure → no end_turn marker; the assertions
@@ -4176,8 +4215,6 @@ async function runUnitTests() {
           setTimeout(() => tick(resolve), POLL);
         };
         await new Promise((resolve) => tick(resolve));
-        try { child.kill('SIGTERM'); } catch { /* already exited */ }
-        socketServer.stop();
 
         const allSse = capturedSse.join('');
         assert(allSse.includes('"type":"tool_use"'), 'MVP: real agy round produced a tool_use SSE block (held call emitted)');
@@ -4189,6 +4226,11 @@ async function runUnitTests() {
       } catch (err) {
         assert(false, `MVP proof against real agy failed: ${err && err.message ? err.message : err}`);
       } finally {
+        // Teardown runs on success AND any panic path (assertion throw, spawn
+        // reject) — otherwise the listening net.Server + spawned agy leak.
+        // Both are guarded + idempotent (stop() re-entrantly closes).
+        try { if (spawnedChild) { spawnedChild.kill('SIGTERM'); } } catch { /* already exited */ }
+        try { if (socketServer) { socketServer.stop(); } } catch { /* already stopped */ }
         try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
       }
     }

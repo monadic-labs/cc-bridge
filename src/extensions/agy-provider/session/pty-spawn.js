@@ -21,7 +21,7 @@
 import { agyDir } from '../../agy-format/binary-resolver.js';
 import { buildAgyInvocation } from '../../agy-format/invocation-builder.js';
 import { spawnCommand } from '../../../infra/process-manager.js';
-import { AgySpawnReadinessTimeout } from '../exceptions.js';
+import { AgySpawnReadinessTimeout, SessionActorError } from '../exceptions.js';
 
 const DEFAULT_READY_TIMEOUT_MS = 10_000;
 
@@ -59,10 +59,10 @@ export function spawnPtyAgy(deps) {
   requireNonEmpty(prompt, 'prompt');
   requireNonEmpty(sandboxDir, 'sandboxDir');
   if (!env || typeof env.HOME !== 'string' || env.HOME.length === 0) {
-    throw new AgySpawnReadinessTimeout('spawnPtyAgy: env.HOME must be set (per-session isolation)');
+    throw new SessionActorError('spawnPtyAgy: env.HOME must be set (per-session isolation)');
   }
   if (!server || typeof server.onReady !== 'function') {
-    throw new AgySpawnReadinessTimeout('spawnPtyAgy: server.onReady is required for readiness');
+    throw new SessionActorError('spawnPtyAgy: server.onReady is required for readiness');
   }
 
   const agyDirectory = agyDir(agyPath);
@@ -116,6 +116,19 @@ export function spawnPtyAgy(deps) {
         reject(new AgySpawnReadinessTimeout('agy exited before the MCP initialize handshake'));
       }
     });
+
+    // Hardening: a spawn-level failure (binary missing, EACCES) emits 'error'
+    // rather than 'close'. Today's tests spawn bash (always present) so this is
+    // not hit, but a missing agy on some host surfaces here — settle loudly with
+    // a domain error rather than letting the timer run to its deadline.
+    child.on('error', (err) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(readinessTimer);
+      reject(new SessionActorError(`spawnPtyAgy: child error before readiness (${err.message})`));
+    });
   });
 }
 
@@ -132,6 +145,6 @@ function registerDeath(child) {
 
 function requireNonEmpty(value, label) {
   if (typeof value !== 'string' || value.length === 0) {
-    throw new AgySpawnReadinessTimeout(`spawnPtyAgy: ${label} must be a non-empty string`);
+    throw new SessionActorError(`spawnPtyAgy: ${label} must be a non-empty string`);
   }
 }

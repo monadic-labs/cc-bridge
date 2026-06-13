@@ -9,6 +9,7 @@
  */
 
 import path from 'node:path';
+import { McpBridgeError } from '../exceptions.js';
 
 /** The filename (under the per-adapter runtime dir) for one session's socket. */
 function socketFileName(sessionId) {
@@ -21,13 +22,15 @@ function socketFileName(sessionId) {
  * @param {string} sessionId  - the session id (CCB_AGY_SESSION_ID).
  * @param {string} runtimeDir - the per-adapter runtime dir (a tmp/work area).
  * @returns {string} absolute socket path.
+ * @throws {McpBridgeError} if either argument is missing/empty (domain error,
+ *   not a generic built-in — manifesto §Exceptions).
  */
 export function socketPathForSession(sessionId, runtimeDir) {
   if (typeof sessionId !== 'string' || sessionId.length === 0) {
-    throw new TypeError('sessionId must be a non-empty string');
+    throw new McpBridgeError('sessionId must be a non-empty string');
   }
   if (typeof runtimeDir !== 'string' || runtimeDir.length === 0) {
-    throw new TypeError('runtimeDir must be a non-empty string');
+    throw new McpBridgeError('runtimeDir must be a non-empty string');
   }
   return path.join(runtimeDir, socketFileName(sessionId));
 }
