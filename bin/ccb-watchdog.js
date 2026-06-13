@@ -110,12 +110,11 @@ function removeRuntimeFile() {
  */
 function reapDrainingWorkers() {
   for (const [worker, workerState] of drainingWorkers) {
+    if (workerState.keepaliveCount !== 0) continue;
     if (workerState.timer) clearTimeout(workerState.timer);
-    if (workerState.keepaliveCount === 0) {
-      log(`Reaping draining worker (PID ${worker.pid}) — zero keepalives`);
-      try { worker.kill('SIGKILL'); } catch { /* already gone */ }
-      drainingWorkers.delete(worker);
-    }
+    log(`Reaping draining worker (PID ${worker.pid}) — zero keepalives`);
+    try { worker.kill('SIGKILL'); } catch { /* already gone */ }
+    drainingWorkers.delete(worker);
   }
 }
 
