@@ -3286,6 +3286,140 @@ async function runUnitTests() {
     assert(noSchema.inputSchema !== undefined && typeof noSchema.inputSchema === 'object', 'convertToolToMcp: missing schema defaults to empty object');
   }
 
+  // ── agy-provider: MCP call → Anthropic tool_use SSE (Seam2, pure) ──
+  console.log('\nagy-provider tool-use-emit:');
+  {
+    const { buildToolUseBlock, buildToolUseSseSequence } = await import('../src/extensions/agy-provider/converters/tool-use-emit.js');
+
+    // buildToolUseBlock: exact Anthropic tool_use block shape
+    const block = buildToolUseBlock('toolu_01', 'read_file', { path: '/tmp/x' });
+    assert(block.type === 'tool_use', 'buildToolUseBlock: type is tool_use');
+    assert(block.id === 'toolu_01', 'buildToolUseBlock: id preserved');
+    assert(block.name === 'read_file', 'buildToolUseBlock: name preserved');
+    assert(JSON.stringify(block.input) === '{"path":"/tmp/x"}', 'buildToolUseBlock: input preserved as object');
+
+    // buildToolUseSseSequence: ends the stream after tool_use (protocol-correct close)
+    const seq = buildToolUseSseSequence({ messageId: 'msg_1', model: 'gemini-3.1-pro', toolUseBlocks: [block], usage: { inputTokens: 10, outputTokens: 3 } });
+    assert(seq.includes('message_start'), 'sse: emits message_start');
+    assert(seq.includes('content_block_start'), 'sse: emits content_block_start');
+    assert(seq.includes('"type":"tool_use"'), 'sse: tool_use block advertised');
+    assert(seq.includes('content_block_stop'), 'sse: emits content_block_stop');
+    assert(seq.includes('"stop_reason":"tool_use"'), 'sse: stop_reason is tool_use (NOT end_turn)');
+    assert(seq.includes('message_stop'), 'sse: ends with message_stop (response closes after tool_use)');
+    // The sequence MUST terminate the HTTP response: message_stop is the last event.
+    const lastEvent = seq.trim().split('\n\n').pop();
+    assert(lastEvent.startsWith('event: message_stop'), 'sse: message_stop is the final event');
+
+    // Multiple tool_use blocks in one response (parallel-call readiness; v1 issues sequentially but the shape holds)
+    const b1 = buildToolUseBlock('toolu_1', 'read_file', { path: '/a' });
+    const b2 = buildToolUseBlock('toolu_2', 'write_file', { path: '/b' });
+    const multi = buildToolUseSseSequence({ messageId: 'msg_2', model: 'm', toolUseBlocks: [b1, b2], usage: { inputTokens: 0, outputTokens: 0 } });
+    // Count event-LINES, not the bare substring: "content_block_start" also appears
+    // inside each event's data field ("type":"content_block_start"), so a naive
+    // substring count double-counts. Match the event header only.
+    const starts = (multi.match(/^event: content_block_start/gm) || []).length;
+    assert(starts === 2, 'sse: two tool_use blocks → two content_block_start event lines');
+    assert(multi.includes('"index":0') && multi.includes('"index":1'), 'sse: block indices are sequential 0,1');
+
+    // ZOMBIES: zero blocks still produces a well-formed (if empty) message that closes
+    const empty = buildToolUseSseSequence({ messageId: 'msg_3', model: 'm', toolUseBlocks: [], usage: { inputTokens: 0, outputTokens: 0 } });
+    assert(empty.includes('message_start') && empty.includes('message_stop'), 'sse: zero-block sequence still framed start→stop');
+
+    // usage synthesized into message_start/message_delta (CC context-tracking needs the fields present)
+    assert(seq.includes('"input_tokens":10'), 'sse: input_tokens synthesized in message_start');
+    assert(seq.includes('"output_tokens":3'), 'sse: output_tokens synthesized in message_delta');
+  }
+
+  // ── agy-provider: tool_result → MCP structured result (Seam3, pure) ──
+  console.log('\nagy-provider tool-result-to-mcp:');
+  {
+    const { convertToolResult } = await import('../src/extensions/agy-provider/converters/tool-result-to-mcp.js');
+
+    // Happy path: string content → single text part, isError false
+    const r1 = convertToolResult({ tool_use_id: 'toolu_01', content: 'file contents here' });
+    assert(r1.isSuccess === true, 'convertToolResult: string content succeeds');
+    assert(r1.value.isError === false, 'convertToolResult: normal result isError false');
+    assert(Array.isArray(r1.value.content) && r1.value.content[0].type === 'text', 'convertToolResult: content is a text part array');
+    assert(r1.value.content[0].text === 'file contents here', 'convertToolResult: string content preserved');
+
+    // Array content (Anthropic allows content to be string OR array of blocks) → preserved
+    const r2 = convertToolResult({ tool_use_id: 'toolu_02', content: [{ type: 'text', text: 'part A' }, { type: 'text', text: 'part B' }] });
+    assert(r2.isSuccess === true, 'convertToolResult: array content succeeds');
+    assert(r2.value.content.length === 2, 'convertToolResult: array content keeps both parts');
+    assert(r2.value.content.map(p => p.text).join('|') === 'part A|part B', 'convertToolResult: array parts preserved');
+
+    // is_error: true → isError true (the MCP exception path)
+    const r3 = convertToolResult({ tool_use_id: 'toolu_03', content: 'command failed', is_error: true });
+    assert(r3.isSuccess === true, 'convertToolResult: error result still a successful conversion');
+    assert(r3.value.isError === true, 'convertToolResult: is_error → isError true');
+    assert(r3.value.content[0].text === 'command failed', 'convertToolResult: error content preserved');
+
+    // Adversarial: malformed payload (missing tool_use_id) → Result.fail, NEVER salvage
+    const bad = convertToolResult({ content: 'no id' });
+    assert(bad.isSuccess === false, 'convertToolResult: missing tool_use_id fails as Result (never salvage)');
+
+    // Adversarial: not an object at all
+    assert(convertToolResult(null).isSuccess === false, 'convertToolResult: null fails');
+    assert(convertToolResult('string').isSuccess === false, 'convertToolResult: non-object fails');
+    assert(convertToolResult(undefined).isSuccess === false, 'convertToolResult: undefined fails');
+
+    // ZOMBIES: empty-string content (valid — a tool may legitimately return "")
+    const rEmpty = convertToolResult({ tool_use_id: 'toolu_04', content: '' });
+    assert(rEmpty.isSuccess === true && rEmpty.value.content[0].text === '', 'convertToolResult: empty-string content preserved');
+  }
+
+  // ── agy-provider: history reconciliation (pure, ZOMBIES) ──
+  console.log('\nagy-provider history-diff:');
+  {
+    const { reconcileHistory } = await import('../src/extensions/agy-provider/session/history-diff.js');
+    const u = (text) => ({ role: 'user', content: text });
+
+    // continuation: incoming is the consumed prefix PLUS a new tail → delta is the tail, prefix pointer advances
+    const consumed = [u('hello')];
+    const incoming1 = [u('hello'), u('what is 2+2?')];
+    const c1 = reconcileHistory(consumed, incoming1);
+    assert(c1.kind === 'continuation', 'history: equal-prefix+longer → continuation');
+    assert(c1.delta.length === 1, 'history: continuation delta is the new tail (1 message)');
+    assert(c1.delta[0].content === 'what is 2+2?', 'history: continuation delta carries only the new message');
+    assert(typeof c1.reason === 'string' && c1.reason.length > 0, 'history: continuation carries a reason');
+
+    // retry: incoming deep-equals the consumed prefix → re-emit, do NOT advance
+    const c2 = reconcileHistory(consumed, consumed);
+    assert(c2.kind === 'retry', 'history: deep-equal → retry');
+    assert(!c2.delta, 'history: retry carries no delta (re-emit, no advance)');
+
+    // reanchor: divergence (prefix differs) → replay all
+    const diverged = [u('different first message')];
+    const c3 = reconcileHistory(consumed, diverged);
+    assert(c3.kind === 'reanchor', 'history: divergent prefix → reanchor');
+    assert(c3.delta.length === 1, 'history: reanchor delta is the full incoming set to replay');
+
+    // continuation when consumed is empty (first turn) → delta is the whole incoming
+    const c4 = reconcileHistory([], [u('first')]);
+    assert(c4.kind === 'continuation', 'history: empty consumed + incoming → continuation (first turn)');
+    assert(c4.delta.length === 1, 'history: first-turn delta is the whole incoming');
+
+    // ZOMBIES
+    // 0: both empty
+    const z0 = reconcileHistory([], []);
+    assert(z0.kind === 'retry', 'history: 0/0 → retry (nothing new, nothing changed)');
+    // N-1 vs N: prefix of length 2, incoming length 3 → continuation delta length 1
+    const consumed5 = [u('m1'), u('m2')];
+    const incoming5 = [u('m1'), u('m2'), u('m3')];
+    assert(reconcileHistory(consumed5, incoming5).delta.length === 1, 'history: N-1 prefix vs N incoming → delta 1');
+    // N vs N+1
+    const incoming6 = [u('m1'), u('m2'), u('m3'), u('m4')];
+    assert(reconcileHistory(consumed5, incoming6).delta.length === 2, 'history: N-1 prefix vs N+1 incoming → delta 2');
+
+    // Adversarial: incoming SHORTER than consumed (prefix truncated) is a divergence → reanchor
+    const cShort = reconcileHistory(consumed5, [u('m1')]);
+    assert(cShort.kind === 'reanchor', 'history: incoming shorter than consumed → reanchor (truncation is divergence)');
+
+    // Content equality is deep, not reference: same-shaped different object instance → retry
+    const copy = JSON.parse(JSON.stringify(consumed));
+    assert(reconcileHistory(consumed, copy).kind === 'retry', 'history: deep-equal different instances → retry');
+  }
+
   // ── agy-format: invocation builder ──
   console.log('\nagy-format invocation builder:');
   {
