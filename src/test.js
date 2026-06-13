@@ -3420,6 +3420,261 @@ async function runUnitTests() {
     assert(reconcileHistory(consumed, copy).kind === 'retry', 'history: deep-equal different instances → retry');
   }
 
+  // ── agy-provider: bridge-server (sociable — real JSON-RPC over a real pipe) ──
+  console.log('\nagy-provider bridge-server:');
+  {
+    const { PassThrough } = await import('node:stream');
+    const { createBridgeServer, PROTOCOL_VERSION, SUBMIT_FINAL_ANSWER_TOOL } = await import('../src/extensions/agy-provider/mcp/bridge-server.js');
+    const { McpBridgeError } = await import('../src/extensions/agy-provider/exceptions.js');
+    const { CCB_VERSION } = await import('../src/core/constants.js');
+
+    // A sociable harness: real PassThrough pipes are the transport (no spawn,
+    // no dynamic mocks). send() writes one JSON-RPC line the way agy does;
+    // out() reads whatever the server has written so far.
+    const harness = () => {
+      const input = new PassThrough();
+      const output = new PassThrough();
+      let buf = '';
+      output.on('data', (chunk) => { buf += chunk.toString(); });
+      const send = (obj) => input.write(`${JSON.stringify(obj)}\n`);
+      const out = () => buf;
+      const lines = () => buf.split('\n').filter((l) => l.length > 0);
+      return { input, output, send, out, lines };
+    };
+
+    // Poll a deterministic readiness condition (no arbitrary sleep — manifesto
+    // §Synchronization). Resolves the instant `cond()` is true. On timeout it
+    // records a FAILED ASSERTION (the real failure signal in this runner) and
+    // resolves anyway so the suite reports the failure instead of hanging.
+    // POLL_INTERVAL is a named event-loop yield (not a literal) so the only
+    // delay is "let readline emit its next line"; the bound is `timeoutMs`.
+    const POLL_INTERVAL = 0;
+    const waitFor = (cond, timeoutMs, label) => new Promise((resolve) => {
+      const deadline = Date.now() + timeoutMs;
+      const tick = () => {
+        if (cond()) { resolve(); return; }
+        if (Date.now() >= deadline) { assert(false, `${label ?? 'waitFor'} timed out after ${timeoutMs}ms`); resolve(); return; }
+        setTimeout(tick, POLL_INTERVAL);
+      };
+      tick();
+    });
+
+    // initialize → protocolVersion 2024-11-05 (spike-verified: agy SENT
+    // 2025-11-25 and ACCEPTED our 2024-11-05 reply — received.log:2-12),
+    // capabilities:{tools:{}}, serverInfo with the canonical CCB version.
+    {
+      const h = harness();
+      const server = createBridgeServer({ listTools: () => [], onToolCall: () => {}, onFinalAnswer: () => {}, stdio: { in: h.input, out: h.output } });
+      server.start();
+      h.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+
+      await waitFor(() => h.out().length > 0, 500, 'initialize reply');
+      const replied = JSON.parse(h.lines()[0]);
+      assert(replied.id === 1, 'bridge: initialize answered with the request id');
+      assert(replied.result.protocolVersion === PROTOCOL_VERSION, 'bridge: initialize advertises spike-verified protocolVersion 2024-11-05');
+      assert(replied.result.protocolVersion === '2024-11-05', 'bridge: protocolVersion literal is 2024-11-05 (not the plan\'s guessed 2025-11-05)');
+      assert(replied.result.capabilities.tools !== undefined, 'bridge: capabilities declares tools');
+      assert(replied.result.serverInfo.name === 'ccb-agy-bridge', 'bridge: serverInfo.name is ccb-agy-bridge');
+      assert(replied.result.serverInfo.version === CCB_VERSION, 'bridge: serverInfo.version is the canonical CCB_VERSION');
+      server.stop();
+    }
+
+    // tools/list → listTools() PLUS the submit_final_answer pseudo-tool.
+    {
+      const h = harness();
+      const declared = [{ name: 'read_file', description: 'd', inputSchema: { type: 'object' } }];
+      const server = createBridgeServer({ listTools: () => declared, onToolCall: () => {}, onFinalAnswer: () => {}, stdio: { in: h.input, out: h.output } });
+      server.start();
+      h.send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+
+      await waitFor(() => h.out().length > 0, 500, 'tools/list reply');
+      const replied = JSON.parse(h.lines()[0]);
+      assert(replied.id === 2, 'bridge: tools/list answered with the request id');
+      const names = replied.result.tools.map((t) => t.name);
+      assert(names.includes('read_file'), 'bridge: tools/list includes the supplied CC tool');
+      assert(names.includes(SUBMIT_FINAL_ANSWER_TOOL.name), 'bridge: tools/list includes the submit_final_answer pseudo-tool');
+      assert(replied.result.tools.at(-1).name === SUBMIT_FINAL_ANSWER_TOOL.name, 'bridge: submit_final_answer is appended last');
+      server.stop();
+    }
+
+    // submit_final_answer → onFinalAnswer(text) fires AND an immediate ack
+    // (terminal — the one call that is NOT held). This is the verified-reliable
+    // final-answer channel; PTY text is never parsed for content.
+    {
+      const h = harness();
+      let finalText = null;
+      const server = createBridgeServer({ listTools: () => [], onToolCall: () => {}, onFinalAnswer: (t) => { finalText = t; }, stdio: { in: h.input, out: h.output } });
+      server.start();
+      h.send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'submit_final_answer', arguments: { text: 'the answer is 42' } } });
+
+      await waitFor(() => h.out().length > 0 && finalText !== null, 500, 'submit_final_answer ack');
+      assert(finalText === 'the answer is 42', 'bridge: submit_final_answer delivers the text to onFinalAnswer');
+      const replied = JSON.parse(h.lines()[0]);
+      assert(replied.id === 3, 'bridge: submit_final_answer ack carries the request id');
+      assert(replied.result.content[0].text === 'ack', 'bridge: submit_final_answer acks with text "ack"');
+      assert(replied.result.isError === false, 'bridge: submit_final_answer ack is not an error');
+      assert(server.pendingCount === 0, 'bridge: submit_final_answer is NOT held (terminal)');
+      server.stop();
+    }
+
+    // THE BLOCK-DON'T-TERMINATE PROOF (hold test). Send a normal tools/call,
+    // gate on onToolCall firing (definitive proof dispatch completed), then
+    // assert NO response was written — the call is held. Then fulfill() and
+    // assert the exact result envelope now appears. No timing assumption:
+    // the held path writes nothing AND calls onToolCall at its end, so a
+    // fired callback + empty output = the hold is proven.
+    {
+      const h = harness();
+      let heldCall = null;
+      const server = createBridgeServer({ listTools: () => [], onToolCall: (c) => { heldCall = c; }, onFinalAnswer: () => {}, stdio: { in: h.input, out: h.output } });
+      server.start();
+      h.send({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'bridge_read', arguments: { path: '/tmp/x' } } });
+
+      // Gate on dispatch completing — onToolCall is the LAST thing the held
+      // path does, so once it has fired the server has decided to hold.
+      await waitFor(() => heldCall !== null, 500, 'held call dispatch');
+      assert(heldCall.mcpId === 7, 'bridge: held call carries the mcpId');
+      assert(heldCall.name === 'bridge_read', 'bridge: held call carries the tool name');
+      assert(heldCall.arguments.path === '/tmp/x', 'bridge: held call carries the arguments object (object→object, no string round-trip)');
+      assert(server.pendingCount === 1, 'bridge: held call is stashed in the pending map');
+      assert(h.out() === '', 'bridge HOLD: no response written while the call is held (BDT core)');
+
+      // Now resolve it and assert the exact envelope.
+      server.fulfill(7, { content: [{ type: 'text', text: 'file body' }], isError: false });
+      await waitFor(() => h.out().length > 0, 500, 'fulfill reply');
+      const replied = JSON.parse(h.lines()[0]);
+      assert(replied.id === 7, 'bridge: fulfill answers the held call by its mcpId');
+      assert(replied.result.content[0].text === 'file body', 'bridge: fulfill writes the supplied content');
+      assert(replied.result.isError === false, 'bridge: fulfill preserves isError:false');
+      assert(server.pendingCount === 0, 'bridge: fulfill drops the stash after resolving');
+      server.stop();
+    }
+
+    // fulfill with isError:true (a failed CC tool_result) → isError reflected.
+    {
+      const h = harness();
+      let held = null;
+      const server = createBridgeServer({ listTools: () => [], onToolCall: (c) => { held = c; }, onFinalAnswer: () => {}, stdio: { in: h.input, out: h.output } });
+      server.start();
+      h.send({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'bash', arguments: { command: 'exit 1' } } });
+      await waitFor(() => held !== null, 500, 'held bash call');
+      server.fulfill(9, { content: [{ type: 'text', text: 'boom' }], isError: true });
+      await waitFor(() => h.out().length > 0, 500, 'fulfill isError reply');
+      const replied = JSON.parse(h.lines()[0]);
+      assert(replied.result.isError === true, 'bridge: fulfill with isError:true surfaces the MCP error path');
+      server.stop();
+    }
+
+    // fulfill on an UNKNOWN id → fail loud (McpBridgeError), never silent.
+    // A phantom fulfill means a wiring bug (deadline/teardown already
+    // resolved it); swallowing it would corrupt the held-call invariant.
+    {
+      const h = harness();
+      const server = createBridgeServer({ listTools: () => [], onToolCall: () => {}, onFinalAnswer: () => {}, stdio: { in: h.input, out: h.output } });
+      server.start();
+      assertThrows(() => server.fulfill(999, { content: [], isError: false }), McpBridgeError, 'bridge: fulfill on unknown id throws McpBridgeError (fail loud)');
+      server.stop();
+    }
+
+    // rejectAll → every stashed call gets an MCP error envelope (clean teardown
+    // so agy's loop terminates; a held call with no response hangs agy).
+    {
+      const h = harness();
+      const heldIds = [];
+      const server = createBridgeServer({ listTools: () => [], onToolCall: (c) => { heldIds.push(c.mcpId); }, onFinalAnswer: () => {}, stdio: { in: h.input, out: h.output } });
+      server.start();
+      h.send({ jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 't1', arguments: {} } });
+      h.send({ jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 't2', arguments: {} } });
+      await waitFor(() => heldIds.length === 2, 500, 'two held calls');
+      assert(server.pendingCount === 2, 'bridge: two calls held before rejectAll');
+      assert(h.out() === '', 'bridge: neither held call answered before rejectAll');
+
+      server.rejectAll(new McpBridgeError('session teardown'));
+      await waitFor(() => h.lines().length === 2, 500, 'rejectAll replies');
+      const replies = h.lines().map((l) => JSON.parse(l));
+      const erroredIds = replies.filter((r) => r.error).map((r) => r.id).sort();
+      assert(erroredIds.join(',') === '10,11', 'bridge: rejectAll errors every stashed call by id');
+      assert(replies.every((r) => r.error.code === -32603), 'bridge: rejectAll uses INTERNAL_ERROR (-32603)');
+      assert(replies.some((r) => r.error.message.includes('session teardown')), 'bridge: rejectAll carries the teardown reason');
+      assert(server.pendingCount === 0, 'bridge: rejectAll clears the pending map');
+      server.stop();
+    }
+
+    // Malformed line → skipped, no crash (the loop survives bad input).
+    {
+      const h = harness();
+      let toolCalls = 0;
+      const server = createBridgeServer({ listTools: () => [], onToolCall: () => { toolCalls++; }, onFinalAnswer: () => {}, stdio: { in: h.input, out: h.output } });
+      server.start();
+      h.input.write('this is not json\n');
+      h.send({ jsonrpc: '2.0', id: 20, method: 'tools/call', params: { name: 'good', arguments: {} } });
+      await waitFor(() => toolCalls === 1, 500, 'dispatch after malformed line');
+      assert(toolCalls === 1, 'bridge: a malformed line is skipped and the next good line still dispatches');
+      assert(h.out() === '', 'bridge: good non-terminal call after a malformed line is still held');
+      server.stop();
+    }
+
+    // Unknown method (with an id) → -32601 method-not-found; no held call.
+    {
+      const h = harness();
+      const server = createBridgeServer({ listTools: () => [], onToolCall: () => {}, onFinalAnswer: () => {}, stdio: { in: h.input, out: h.output } });
+      server.start();
+      h.send({ jsonrpc: '2.0', id: 30, method: 'resources/read', params: {} });
+      await waitFor(() => h.out().length > 0, 500, 'unknown-method error');
+      const replied = JSON.parse(h.lines()[0]);
+      assert(replied.error.code === -32601, 'bridge: unknown method → -32601 method-not-found');
+      assert(replied.id === 30, 'bridge: unknown-method error echoes the request id');
+      server.stop();
+    }
+
+    // notifications/* (no id) → no reply. agy sends notifications/initialized
+    // and notifications/roots/list_changed (received.log:4-7); both are silent.
+    // Gate by feeding a probe tools/call after them and waiting for its
+    // onToolCall — proves the notification lines were read and produced no reply.
+    {
+      const h = harness();
+      let seen = false;
+      const server = createBridgeServer({ listTools: () => [], onToolCall: () => { seen = true; }, onFinalAnswer: () => {}, stdio: { in: h.input, out: h.output } });
+      server.start();
+      h.send({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} });
+      h.send({ jsonrpc: '2.0', method: 'notifications/roots/list_changed', params: {} });
+      h.send({ jsonrpc: '2.0', id: 40, method: 'tools/call', params: { name: 'probe', arguments: {} } });
+      await waitFor(() => seen, 500, 'probe after notifications');
+      assert(h.out() === '', 'bridge: notifications produce no reply (the probe tool/call is held, which also writes nothing)');
+      server.stop();
+    }
+
+    // onReady fires AFTER initialize + tools/list are both answered (the
+    // deterministic readiness signal pty-spawn awaits — no PTY scrape, no sleep).
+    {
+      const h = harness();
+      let ready = false;
+      const server = createBridgeServer({ listTools: () => [], onToolCall: () => {}, onFinalAnswer: () => {}, stdio: { in: h.input, out: h.output } });
+      server.onReady(() => { ready = true; });
+      server.start();
+      assert(ready === false, 'bridge: onReady does NOT fire before the handshake');
+      h.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+      await waitFor(() => h.lines().length === 1, 500, 'initialize only');
+      assert(ready === false, 'bridge: onReady does NOT fire after initialize alone (tools/list still pending)');
+      h.send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+      await waitFor(() => ready, 500, 'onReady fire');
+      assert(ready === true, 'bridge: onReady fires once initialize AND tools/list are answered');
+      // Late onReady registration (already ready) fires immediately.
+      let lateReady = false;
+      server.onReady(() => { lateReady = true; });
+      assert(lateReady === true, 'bridge: a late onReady fires immediately when already ready');
+      server.stop();
+    }
+
+    // Dependency validation (boundary guards): each required injection, when
+    // wrong/missing, throws the named domain error (fail loud at construction).
+    assertThrows(() => createBridgeServer({}), McpBridgeError, 'bridge: missing listTools throws McpBridgeError');
+    assertThrows(() => createBridgeServer({ listTools: () => [] }), McpBridgeError, 'bridge: missing onToolCall throws McpBridgeError');
+    assertThrows(() => createBridgeServer({ listTools: () => [], onToolCall: () => {} }), McpBridgeError, 'bridge: missing onFinalAnswer throws McpBridgeError');
+    assertThrows(() => createBridgeServer({ listTools: 'not a fn', onToolCall: () => {}, onFinalAnswer: () => {} }), McpBridgeError, 'bridge: non-function listTools throws McpBridgeError');
+    assertThrows(() => createBridgeServer({ listTools: () => [], onToolCall: () => {}, onFinalAnswer: () => {}, stdio: {} }), McpBridgeError, 'bridge: malformed stdio throws McpBridgeError');
+  }
+
   // ── agy-format: invocation builder ──
   console.log('\nagy-format invocation builder:');
   {
