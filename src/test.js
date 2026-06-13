@@ -3149,6 +3149,143 @@ async function runUnitTests() {
     }
   }
 
+  // ── agy-provider: JSON-RPC codec (pure) ──
+  console.log('\nagy-provider json-rpc:');
+  {
+    const { parseMessage, buildResult, buildError, buildRequest, JSONRPC_VERSION, ERROR_CODES } = await import('../src/extensions/agy-provider/mcp/json-rpc.js');
+
+    // parseMessage: valid request line → {id, method, params}
+    const parsed = parseMessage('{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}');
+    assert(parsed.isSuccess === true, 'parseMessage: valid request line succeeds');
+    assert(parsed.value.id === 1, 'parseMessage: id preserved');
+    assert(parsed.value.method === 'tools/list', 'parseMessage: method preserved');
+    assert(JSON.stringify(parsed.value.params) === '{}', 'parseMessage: params preserved');
+
+    // parseMessage: notification (no id) → object with undefined id
+    const notif = parseMessage('{"jsonrpc":"2.0","method":"notifications/initialized"}');
+    assert(notif.isSuccess === true, 'parseMessage: notification line succeeds');
+    assert(notif.value.id === undefined, 'parseMessage: notification has no id');
+    assert(notif.value.method === 'notifications/initialized', 'parseMessage: notification method preserved');
+
+    // parseMessage: non-JSON → Result.fail (never salvage, never throw)
+    const bad = parseMessage('this is not json');
+    assert(bad.isSuccess === false, 'parseMessage: non-JSON line fails as Result');
+    assert(typeof bad.error === 'object' && bad.error.raw === 'this is not json', 'parseMessage: failure carries raw input');
+
+    // parseMessage: empty string → Result.fail
+    assert(parseMessage('').isSuccess === false, 'parseMessage: empty string fails');
+
+    // parseMessage: JSON-but-not-object (a bare number) → Result.fail
+    assert(parseMessage('42').isSuccess === false, 'parseMessage: bare scalar fails (not an object)');
+
+    // buildResult: exact envelope
+    const resultEnv = buildResult(5, { content: [{ type: 'text', text: 'pong' }], isError: false });
+    const resultParsed = JSON.parse(resultEnv);
+    assert(resultParsed.jsonrpc === JSONRPC_VERSION, 'buildResult: jsonrpc version set');
+    assert(resultParsed.id === 5, 'buildResult: id preserved');
+    assert(resultParsed.result.content[0].text === 'pong', 'buildResult: result body preserved');
+    assert(resultParsed.error === undefined, 'buildResult: no error field');
+
+    // buildError: exact envelope, code preserved
+    const errorEnv = buildError(7, ERROR_CODES.METHOD_NOT_FOUND, 'Method not found: tools/call');
+    const errorParsed = JSON.parse(errorEnv);
+    assert(errorParsed.id === 7, 'buildError: id preserved');
+    assert(errorParsed.error.code === ERROR_CODES.METHOD_NOT_FOUND, 'buildError: error code preserved');
+    assert(errorParsed.error.message === 'Method not found: tools/call', 'buildError: message preserved');
+    assert(errorParsed.result === undefined, 'buildError: no result field');
+
+    // buildRequest: server-initiated request envelope
+    const reqEnv = buildRequest(9, 'ping', {});
+    const reqParsed = JSON.parse(reqEnv);
+    assert(reqParsed.id === 9, 'buildRequest: id preserved');
+    assert(reqParsed.method === 'ping', 'buildRequest: method preserved');
+
+    // Adversarial: deeply nested params survive round-trip
+    const nested = { a: { b: { c: [{ d: 1 }, { e: 'x' }] } } };
+    const nestedEnv = buildResult(2, nested);
+    assert(JSON.parse(nestedEnv).result.a.b.c[1].e === 'x', 'buildResult: deeply nested params round-trip');
+  }
+
+  // ── agy-provider: Anthropic tools → MCP defs (Seam1, pure) ──
+  console.log('\nagy-provider tools-to-mcp:');
+  {
+    const { classifyTool, convertToolToMcp, convertTools } = await import('../src/extensions/agy-provider/converters/tools-to-mcp.js');
+
+    // classifyTool: server-side (web_search) tools excluded by the local-execution criterion
+    assert(classifyTool({ type: 'web_search' }) === 'server-side', 'classifyTool: web_search type → server-side');
+    assert(classifyTool({ type: 'web_search_20250305' }) === 'server-side', 'classifyTool: web_search_* variant → server-side');
+    assert(classifyTool({ name: 'web_search' }) === 'server-side', 'classifyTool: web_search by name → server-side');
+    assert(classifyTool({ name: 'bash', type: 'bash_20250124' }) === 'local-exec', 'classifyTool: client-side bash built-in → local-exec');
+    assert(classifyTool({ name: 'Read', type: 'custom' }) === 'local-exec', 'classifyTool: custom tool → local-exec');
+    assert(classifyTool({ name: 'my_skill' }) === 'local-exec', 'classifyTool: plain custom tool (no type) → local-exec');
+
+    // convertToolToMcp: input_schema → inputSchema, 1:1, complex nested schema survives (spike's ask_user fixture)
+    const askUserSchema = {
+      type: 'object',
+      $schema: 'https://json-schema.org/draft/2020-12/schema',
+      properties: {
+        questions: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 4,
+          items: {
+            type: 'object',
+            properties: {
+              question: { type: 'string' },
+              options: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: { label: { type: 'string' }, description: { type: 'string' } },
+                  required: ['label', 'description'],
+                },
+              },
+            },
+            required: ['question', 'options'],
+          },
+        },
+      },
+      required: ['questions'],
+      additionalProperties: false,
+    };
+    const askUser = convertToolToMcp({ name: 'ask_user', description: 'Asks the user questions', input_schema: askUserSchema });
+    assert(askUser.name === 'ask_user', 'convertToolToMcp: name preserved');
+    assert(askUser.description === 'Asks the user questions', 'convertToolToMcp: description preserved');
+    assert(askUser.inputSchema.properties.questions.items.properties.options.items.required[0] === 'label', 'convertToolToMcp: deeply nested input_schema survives');
+    assert(askUser.inputSchema.$schema === 'https://json-schema.org/draft/2020-12/schema', 'convertToolToMcp: $schema keyword survives');
+
+    // convertToolToMcp: also accepts parameters alias
+    const aliasTool = convertToolToMcp({ name: 'fn', description: 'd', parameters: { type: 'object' } });
+    assert(aliasTool.inputSchema.type === 'object', 'convertToolToMcp: parameters alias accepted');
+
+    // convertToolToMcp: server-side tool → null (filtered out, never partially converted)
+    assert(convertToolToMcp({ type: 'web_search' }) === null, 'convertToolToMcp: web_search → null');
+    assert(convertToolToMcp({ name: 'web_search_20250305' }) === null, 'convertToolToMcp: web_search_ variant → null');
+
+    // convertTools: maps + filters in one pass; server-side tools dropped, locals kept
+    const mixed = convertTools([
+      { type: 'web_search' },
+      { name: 'web_search_20250305', description: 'server search', input_schema: {} },
+      { name: 'Read', description: 'read a file', input_schema: { type: 'object', properties: { file_path: { type: 'string' } } } },
+      { name: 'Bash', description: 'run a command', input_schema: { type: 'object', properties: { command: { type: 'string' } } } },
+    ]);
+    assert(mixed.length === 2, 'convertTools: server-side tools filtered out (4 in → 2 kept)');
+    assert(mixed[0].name === 'Read', 'convertTools: first kept tool is Read');
+    assert(mixed[1].name === 'Bash', 'convertTools: second kept tool is Bash');
+    assert(mixed.every(t => t.inputSchema !== undefined), 'convertTools: every kept tool has inputSchema');
+
+    // ZOMBIES
+    // 0 tools
+    assert(convertTools([]).length === 0, 'convertTools: empty array → empty array');
+    // 1 tool (custom)
+    assert(convertTools([{ name: 'solo', description: 'd', input_schema: {} }]).length === 1, 'convertTools: single custom tool kept');
+    // all server-side → empty
+    assert(convertTools([{ type: 'web_search' }, { type: 'web_search_20250305' }]).length === 0, 'convertTools: all server-side → empty');
+    // adversarial: tool missing input_schema AND parameters → inputSchema defaults to empty object (never undefined)
+    const noSchema = convertToolToMcp({ name: 'bare', description: 'd' });
+    assert(noSchema.inputSchema !== undefined && typeof noSchema.inputSchema === 'object', 'convertToolToMcp: missing schema defaults to empty object');
+  }
+
   // ── agy-format: invocation builder ──
   console.log('\nagy-format invocation builder:');
   {
