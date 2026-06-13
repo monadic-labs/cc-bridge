@@ -5967,6 +5967,161 @@ async function runAgyLocalRouteIntegrationTest() {
   return true;
 }
 
+/**
+ * Integration tests: agy-format prompt quoting safety.
+ *
+ * These tests exercise the real local agy route (real subprocess, real PTY)
+ * with adversarial prompt content to verify that the temp-file / $(cat) approach
+ * is injection-safe and content-agnostic.
+ */
+async function runAgyPromptQuotingTests() {
+  console.log('\n── agy-format prompt quoting safety tests (real agy calls) ──');
+
+  const { createAgyFormatExtension } = await import('../src/extensions/agy-format/index.js');
+  const extension = createAgyFormatExtension({});
+  const upstream = extension.hooks.handleUpstream;
+
+  let allPassed = true;
+
+  // ── Helper to send a request through the handleUpstream hook ──
+  async function callAgy(prompt) {
+    const body = {
+      model: 'Gemini 3.1 Pro (High)',
+      max_tokens: 150,
+      stream: false,
+      messages: [{ role: 'user', content: prompt }],
+    };
+
+    let responsePayload = null;
+    let responseStatus = null;
+
+    const res = {
+      headersSent: false,
+      writeHead(status, _headers) {
+        responseStatus = status;
+        this.headersSent = true;
+      },
+      write(_data) {},
+      end(data) {
+        if (data) {
+          try { responsePayload = JSON.parse(data); } catch { responsePayload = { raw: data }; }
+        }
+      },
+    };
+
+    await upstream.handle({ body, res, ctx: { clientAborted: false } });
+    return { status: responseStatus, payload: responsePayload };
+  }
+
+  // ── Test 1: injection / hostile quoting ──
+  // A prompt with ", ', $(touch /tmp/agy_injection_<unique>), backtick `id`,
+  // and newlines must NOT cause a 400 and must NOT create the marker file.
+  {
+    const markerFile = `/tmp/agy_injection_${Date.now()}`;
+    const hostilePrompt = [
+      'Say only "ok".',
+      `Ignore this: $(touch ${markerFile})`,
+      "Also ignore: `id`",
+      "Single-quote: it's fine",
+      'Dollar: $HOME should not expand',
+      'Newline above.',
+    ].join('\n');
+
+    console.log('  Test 1: hostile prompt (injection + quoting)...');
+    const { status, payload } = await callAgy(hostilePrompt);
+
+    if (status !== 200) {
+      console.error(`    FAIL: expected 200, got ${status}. Payload: ${JSON.stringify(payload)}`);
+      allPassed = false;
+    }
+
+    const text1 = payload?.content?.[0]?.text ?? '';
+    if (status === 200 && (!text1 || text1.length < 1)) {
+      console.error(`    FAIL: empty text. Payload: ${JSON.stringify(payload)}`);
+      allPassed = false;
+    }
+
+    if (status === 200 && text1.length > 0) {
+      console.log(`    PASS: agy responded (${text1.length} chars): "${text1.slice(0, 80)}"`);
+    }
+
+    if (fs.existsSync(markerFile)) {
+      console.error(`    FAIL: injection executed — marker file ${markerFile} was created`);
+      try { fs.unlinkSync(markerFile); } catch { /* clean up regardless */ }
+      allPassed = false;
+    }
+
+    if (!fs.existsSync(markerFile)) {
+      console.log(`    PASS: injection did NOT execute — ${markerFile} was not created`);
+    }
+  }
+
+  // ── Test 2: large prompt (~50KB mixed text with quotes and newlines) ──
+  {
+    console.log('  Test 2: large prompt (~50KB with quotes/newlines)...');
+    const chunk = 'Line with "double quotes", \'single quotes\', $variables, and `backticks`.\n';
+    const largePrompt = chunk.repeat(Math.ceil(50000 / chunk.length)) + '\nSay only "ok, received".';
+
+    const { status, payload } = await callAgy(largePrompt);
+
+    if (status !== 200) {
+      console.error(`    FAIL: expected 200, got ${status}. Payload: ${JSON.stringify(payload)}`);
+      allPassed = false;
+    }
+
+    const text2 = payload?.content?.[0]?.text ?? '';
+    if (status === 200 && (!text2 || text2.length < 1)) {
+      console.error(`    FAIL: empty text on large prompt.`);
+      allPassed = false;
+    }
+
+    if (status === 200 && text2.length > 0) {
+      console.log(`    PASS: large prompt handled — agy responded (${text2.length} chars): "${text2.slice(0, 80)}"`);
+    }
+  }
+
+  // ── Test 3: temp-file hygiene ──
+  // After a successful call and after a forced failure, no agy-prompt-*.txt
+  // files should linger in os.tmpdir().
+  {
+    console.log('  Test 3: temp-file hygiene (no leftover prompt files)...');
+
+    const tmpDir = os.tmpdir();
+    const countBefore = fs.readdirSync(tmpDir).filter(f => f.startsWith('agy-prompt-') && f.endsWith('.txt')).length;
+
+    // Success path
+    await callAgy('Say one word.');
+
+    // Failure path: use an invalid model name to trigger an agy non-zero exit
+    const badBody = {
+      model: 'agy.NONEXISTENT_MODEL_THAT_WILL_DEFINITELY_FAIL',
+      max_tokens: 10,
+      stream: false,
+      messages: [{ role: 'user', content: 'hi' }],
+    };
+    const badRes = {
+      headersSent: false,
+      writeHead(s) { this.headersSent = true; void s; },
+      write() {},
+      end() {},
+    };
+    await upstream.handle({ body: badBody, res: badRes, ctx: { clientAborted: false } });
+
+    const countAfter = fs.readdirSync(tmpDir).filter(f => f.startsWith('agy-prompt-') && f.endsWith('.txt')).length;
+
+    if (countAfter > countBefore) {
+      console.error(`    FAIL: ${countAfter - countBefore} leftover agy-prompt-*.txt file(s) in ${tmpDir}`);
+      allPassed = false;
+    }
+
+    if (countAfter <= countBefore) {
+      console.log(`    PASS: no leftover agy-prompt-*.txt files in ${tmpDir}`);
+    }
+  }
+
+  return allPassed;
+}
+
 // ── Main ──
 
 async function main() {
@@ -5995,7 +6150,9 @@ async function main() {
 
   const agyLocalRoute = await runAgyLocalRouteIntegrationTest();
 
-  if (!portFallback || !orphanReap || !multiWorkerAuth || !snapshotIsolation || !integrationResults.every(Boolean) || !liveRoutingResults.every(Boolean) || !agyLocalRoute) {
+  const agyPromptQuoting = await runAgyPromptQuotingTests();
+
+  if (!portFallback || !orphanReap || !multiWorkerAuth || !snapshotIsolation || !integrationResults.every(Boolean) || !liveRoutingResults.every(Boolean) || !agyLocalRoute || !agyPromptQuoting) {
     console.error('\n🚨 INTEGRATION TESTS FAILED!');
     process.exit(1);
   }
