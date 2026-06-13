@@ -5,9 +5,11 @@ const GUI_PREFIX = '/gui';
 // Resolves a request URL under /gui to a concrete file path inside guiDir,
 // or returns null when the request must be 404'd. Pure function; no I/O.
 //
-// Security boundary: every URL that escapes guiDir (literal '..', percent-encoded
-// '..', absolute paths injected after /gui/, null bytes, malformed
-// percent-encoding, or anything not under /gui) returns null. Callers MUST
+// Security boundary: every URL that escapes guiDir returns null. The guard
+// enforces this explicitly via path.resolve() + a startsWith(guiDir) containment
+// check — NOT by relying on any upstream parser's normalization. Covered vectors:
+// literal '..', percent-encoded '..', absolute paths injected after /gui/, null
+// bytes, malformed percent-encoding, and anything not under /gui. Callers MUST
 // treat null as a hard 404, not a fallback.
 export function resolveGuiPath(guiDir, urlPath) {
   if (typeof guiDir !== 'string' || guiDir.length === 0) return null;

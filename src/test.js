@@ -538,6 +538,10 @@ async function runUnitTests() {
   assert(resolveGuiPath(GUI_DIR, '/gui//etc/passwd') === null, 'absolute-path injection rejected');
   // Final-path containment: a path with .. that resolves back inside is allowed
   assert(resolveGuiPath(GUI_DIR, '/gui/sub/../app.js') === GUI_APP, '.. that resolves back inside allowed');
+  // Bare traversal paths (no /gui prefix) — rejected by the prefix guard, not parser normalization
+  assert(resolveGuiPath(GUI_DIR, '../../../../etc/passwd') === null, 'bare traversal ../../../../etc/passwd rejected');
+  assert(resolveGuiPath(GUI_DIR, '../../../.env') === null, 'bare traversal ../../../.env rejected');
+  assert(resolveGuiPath(GUI_DIR, 'subdir/../../etc/passwd') === null, 'bare traversal subdir/../../etc/passwd rejected');
 
   // ── Result ──
   console.log('\nResult:');
