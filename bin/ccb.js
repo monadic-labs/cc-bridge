@@ -692,6 +692,14 @@ const CCB_CMDS = {
   },
   '--x-provider': () => handleProviderCommand(),
   '--x-route': () => handleRouteCommand(),
+  '--x-model': () => {
+    process.stderr.write('ccb: --x-model is not a command. Use --x-route to manage model routing.\n\n');
+    process.stderr.write('  ccb --x-route add model <model-key> <provider-id>\n');
+    process.stderr.write('  ccb --x-route remove <model-key>\n');
+    process.stderr.write('  ccb --x-route list\n');
+    process.stderr.write('  ccb --x-route tree\n');
+    process.exit(1);
+  },
   '--x-key': () => handleKeyCommand(),
   '--x-version': () => handleVersionsCommand(),
   '--version': () => {
