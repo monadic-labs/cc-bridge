@@ -4162,6 +4162,184 @@ async function runWatchdogOrphanReapTest() {
   return true;
 }
 
+async function runMultiWorkerAuthTest() {
+  console.log('\n── Multi-worker auth consistency test (shared CCB_KEEPALIVE_SECRET) ──');
+
+  const PRODUCTION_PORT = 9099;
+  const POLL_MS = 200;
+  const READY_TIMEOUT_MS = 15000;
+  const SEQUENTIAL_REQUEST_COUNT = 20;
+  const CONCURRENT_REQUEST_COUNT = 10;
+
+  const proxySecretPath = path.join(TEST_CONFIG_DIR, LOGS_DIR_NAME, 'proxy.secret');
+
+  killTestDaemon();
+  await setupTestConfig();
+
+  const { RUNTIME_FILENAME: AUTH_RT_FILENAME } = await import('../src/core/constants.js');
+  const runtimePath = path.join(TEST_CONFIG_DIR, AUTH_RT_FILENAME);
+  if (fs.existsSync(runtimePath)) fs.unlinkSync(runtimePath);
+
+  // ── 1. Start watchdog ──
+  console.log('  Starting test watchdog...');
+  const started = await startTestDaemon();
+  if (!started) {
+    console.error('  FAIL: Test daemon failed to start');
+    return false;
+  }
+
+  // Safety: abort if this watchdog holds the production port
+  const ssCheck = runSync('sh', ['-c', `ss -ltnp | grep :${PRODUCTION_PORT}`], { encoding: 'utf8' });
+  const productionPids = [...(ssCheck.stdout || '').matchAll(/pid=(\d+)/g)].map((m) => Number(m[1]));
+  if (productionPids.includes(testDaemonPid)) {
+    console.error(`  ABORT: watchdog PID ${testDaemonPid} holds production port ${PRODUCTION_PORT} — not killing`);
+    killTestDaemon();
+    return false;
+  }
+
+  // ── 2. Read the proxy secret written by the first worker ──
+  const authSecret = (() => {
+    try { return fs.readFileSync(proxySecretPath, 'utf8').trim(); }
+    catch { return ''; }
+  })();
+  if (!authSecret) {
+    console.error('  FAIL: proxy.secret not found or empty after daemon start');
+    killTestDaemon();
+    return false;
+  }
+  console.log(`  Proxy secret acquired (${authSecret.length} chars)`);
+
+  // ── 3. Trigger a restart — creates a draining worker alongside the new one ──
+  console.log('  Triggering restart to create a draining worker...');
+  const restartResponse = await new Promise((resolve) => {
+    const req = http.request(
+      {
+        hostname: 'localhost',
+        port: TEST_PORT,
+        path: '/api/restart',
+        method: 'POST',
+        headers: { authorization: `Bearer ${authSecret}` },
+        timeout: 5000
+      },
+      (res) => { res.resume(); resolve(res.statusCode); }
+    );
+    req.on('error', () => resolve(0));
+    req.on('timeout', () => { req.destroy(); resolve(0); });
+    req.end();
+  });
+  if (restartResponse !== 202) {
+    console.error(`  FAIL: /api/restart returned ${restartResponse}, expected 202`);
+    killTestDaemon();
+    return false;
+  }
+
+  // ── 4. Poll until the new worker is ready (responds 200 on the authed status endpoint) ──
+  console.log('  Waiting for new worker to be ready...');
+  let newWorkerUp = false;
+  const readyStart = Date.now();
+  while (Date.now() - readyStart < READY_TIMEOUT_MS) {
+    const statusCode = await new Promise((resolve) => {
+      const req = http.request(
+        {
+          hostname: 'localhost',
+          port: TEST_PORT,
+          path: '/__ccb_internal__/status',
+          method: 'GET',
+          headers: { authorization: `Bearer ${authSecret}` },
+          timeout: 1000
+        },
+        (res) => { res.resume(); resolve(res.statusCode); }
+      );
+      req.on('error', () => resolve(0));
+      req.on('timeout', () => { req.destroy(); resolve(0); });
+      req.end();
+    });
+    if (statusCode === 200) { newWorkerUp = true; break; }
+    await sleep(POLL_MS);
+  }
+  if (!newWorkerUp) {
+    console.error('  FAIL: New worker did not become ready within timeout');
+    killTestDaemon();
+    return false;
+  }
+
+  // ── 5. Make SEQUENTIAL_REQUEST_COUNT sequential authenticated requests ──
+  //    All must return 200. A 401 means the new worker has a different secret.
+  console.log(`  Making ${SEQUENTIAL_REQUEST_COUNT} sequential authenticated requests...`);
+  let sequentialPassed = true;
+  for (let i = 0; i < SEQUENTIAL_REQUEST_COUNT; i++) {
+    const statusCode = await new Promise((resolve) => {
+      const req = http.request(
+        {
+          hostname: 'localhost',
+          port: TEST_PORT,
+          path: '/api/config',
+          method: 'GET',
+          headers: { authorization: `Bearer ${authSecret}` },
+          timeout: 3000
+        },
+        (res) => { res.resume(); resolve(res.statusCode); }
+      );
+      req.on('error', () => resolve(0));
+      req.on('timeout', () => { req.destroy(); resolve(0); });
+      req.end();
+    });
+    if (statusCode === 401) {
+      console.error(`  FAIL: sequential request ${i + 1} returned 401 — workers have different secrets`);
+      sequentialPassed = false;
+      break;
+    }
+    if (statusCode !== 200) {
+      console.error(`  FAIL: sequential request ${i + 1} returned ${statusCode}, expected 200`);
+      sequentialPassed = false;
+      break;
+    }
+  }
+  if (!sequentialPassed) {
+    killTestDaemon();
+    return false;
+  }
+  console.log(`  PASS: ${SEQUENTIAL_REQUEST_COUNT} sequential requests all returned 200`);
+
+  // ── 6. Make CONCURRENT_REQUEST_COUNT concurrent authenticated requests ──
+  //    Exercises SO_REUSEPORT round-robin between workers.
+  console.log(`  Making ${CONCURRENT_REQUEST_COUNT} concurrent authenticated requests...`);
+  const concurrentResults = await Promise.all(
+    Array.from({ length: CONCURRENT_REQUEST_COUNT }, () =>
+      new Promise((resolve) => {
+        const req = http.request(
+          {
+            hostname: 'localhost',
+            port: TEST_PORT,
+            path: '/api/config',
+            method: 'GET',
+            headers: { authorization: `Bearer ${authSecret}` },
+            timeout: 5000
+          },
+          (res) => { res.resume(); resolve(res.statusCode); }
+        );
+        req.on('error', () => resolve(0));
+        req.on('timeout', () => { req.destroy(); resolve(0); });
+        req.end();
+      })
+    )
+  );
+
+  const concurrentFailures = concurrentResults.filter((code) => code !== 200);
+  if (concurrentFailures.length > 0) {
+    const count401 = concurrentResults.filter((c) => c === 401).length;
+    const suffix = count401 > 0 ? ` (${count401} × 401 — workers have different secrets)` : '';
+    console.error(`  FAIL: ${concurrentFailures.length} concurrent request(s) did not return 200${suffix}`);
+    killTestDaemon();
+    return false;
+  }
+  console.log(`  PASS: ${CONCURRENT_REQUEST_COUNT} concurrent requests all returned 200`);
+
+  console.log('  PASS: Multi-worker auth consistency confirmed — shared secret works across restart');
+  killTestDaemon();
+  return true;
+}
+
 async function runIntegrationTests() {
   console.log('\n── Integration Tests (isolated daemon on port ' + TEST_PORT + ') ──');
 
@@ -5254,11 +5432,13 @@ async function main() {
 
   const orphanReap = await runWatchdogOrphanReapTest();
 
+  const multiWorkerAuth = await runMultiWorkerAuthTest();
+
   const integrationResults = await runIntegrationTests();
 
   const liveRoutingResults = await runLiveRoutingTests();
 
-  if (!portFallback || !orphanReap || !integrationResults.every(Boolean) || !liveRoutingResults.every(Boolean)) {
+  if (!portFallback || !orphanReap || !multiWorkerAuth || !integrationResults.every(Boolean) || !liveRoutingResults.every(Boolean)) {
     console.error('\n🚨 INTEGRATION TESTS FAILED!');
     process.exit(1);
   }

@@ -2,6 +2,7 @@
 
 import fs from 'fs';
 import net from 'net';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import os from 'os';
@@ -75,6 +76,13 @@ try {
 function getConfig() {
   return _configCache.get();
 }
+
+// One secret for the lifetime of this watchdog process. All workers spawned
+// (initial + restart-spawned) receive this via CCB_KEEPALIVE_SECRET so their
+// auth gates are identical. Without this, each worker mints its own random
+// secret and SO_REUSEPORT round-robin between a draining worker and the new
+// one causes random 401s for clients whose token was issued by the other worker.
+const SHARED_AUTH_SECRET = crypto.randomBytes(32).toString('hex');
 
 function writeRuntimeFile(port) {
   const dir = path.dirname(runtimeFilePath);
@@ -198,7 +206,7 @@ async function spawnWorker() {
   // first worker establishes the actual port; subsequent restart-spawned
   // workers reuse that port through env CCB_DAEMON_PORT so we don't walk
   // the fallback range every time.
-  const env = { ...process.env, CCB_DAEMON_WORKER: '1' };
+  const env = { ...process.env, CCB_DAEMON_WORKER: '1', CCB_KEEPALIVE_SECRET: SHARED_AUTH_SECRET };
   if (state.activePort) env.CCB_DAEMON_PORT = String(state.activePort);
 
   const child = spawnDaemon(WORKER_SCRIPT, [], {
