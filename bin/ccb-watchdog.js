@@ -15,6 +15,7 @@ import { CONFIG_FILENAME } from '../src/core/constants.js';
 import { ConfigCache } from '../src/core/config-cache.js';
 import { WatchdogState } from '../src/core/watchdog-state.js';
 import { spawnDaemon } from '../src/infra/process-manager.js';
+import { ReadinessTimeoutException } from '../src/core/exceptions.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_SCRIPT = path.join(__dirname, '..', 'src', 'proxy.js');
@@ -30,6 +31,10 @@ const state = new WatchdogState();
 const KEEPALIVE_GRACE_MS = 5000;
 const MAX_CONSECUTIVE_CRASHES = 5;
 const CRASH_WINDOW_MS = 10000;
+// Maximum number of draining (old) workers kept alive simultaneously.
+// When a restart pushes the pool over this cap, the oldest draining worker
+// (smallest lastKeepaliveAt) is SIGKILL-ed immediately to reclaim its socket.
+const MAX_DRAINING_WORKERS = 3;
 
 const startTime = Date.now();
 const runtimeFilePath = path.join(
@@ -95,6 +100,25 @@ function removeRuntimeFile() {
   }
 }
 
+/**
+ * Kill all draining workers that have zero active keepalives — they are not
+ * serving any live client and can be reclaimed immediately.  Workers that
+ * still hold keepalives are left running so in-flight requests can complete.
+ *
+ * Used by the crash handler (process.exit(1) path) and by gracefulShutdown
+ * to ensure no orphaned listener sockets survive the watchdog exit.
+ */
+function reapDrainingWorkers() {
+  for (const [worker, workerState] of drainingWorkers) {
+    if (workerState.timer) clearTimeout(workerState.timer);
+    if (workerState.keepaliveCount === 0) {
+      log(`Reaping draining worker (PID ${worker.pid}) — zero keepalives`);
+      try { worker.kill('SIGKILL'); } catch { /* already gone */ }
+      drainingWorkers.delete(worker);
+    }
+  }
+}
+
 async function triggerRestart(source) {
   if (!state.beginRestart()) {
     log(`Restart requested via ${source} — ignored (already in progress)`);
@@ -133,6 +157,28 @@ async function triggerRestart(source) {
   if (state.activeWorker) {
     const oldWorker = state.activeWorker;
     const oldKeepalives = countKeepalivesFor(oldWorker);
+
+    // Fix 1: cap the draining pool at MAX_DRAINING_WORKERS.
+    // When at capacity, evict the oldest entry (min lastKeepaliveAt) before
+    // inserting the new draining worker.
+    if (drainingWorkers.size >= MAX_DRAINING_WORKERS) {
+      let oldestWorker = null;
+      let oldestTs = Infinity;
+      for (const [w, ws] of drainingWorkers) {
+        if (ws.lastKeepaliveAt < oldestTs) {
+          oldestTs = ws.lastKeepaliveAt;
+          oldestWorker = w;
+        }
+      }
+      if (oldestWorker) {
+        log(`Draining pool at capacity (${MAX_DRAINING_WORKERS}), evicting oldest worker (PID ${oldestWorker.pid})`);
+        const evictedState = drainingWorkers.get(oldestWorker);
+        if (evictedState.timer) clearTimeout(evictedState.timer);
+        try { oldestWorker.kill('SIGKILL'); } catch { /* already gone */ }
+        drainingWorkers.delete(oldestWorker);
+      }
+    }
+
     drainingWorkers.set(oldWorker, {
       keepaliveCount: oldKeepalives,
       lastKeepaliveAt: Date.now(),
@@ -173,7 +219,7 @@ async function spawnWorker() {
   const initTimeout = setTimeout(() => {
     log(`Worker initialization timeout (${config.workerInitTimeoutMs}ms) exceeded, killing hung worker`);
     child.kill('SIGKILL');
-    readyReject(new Error(`Worker init timeout (${config.workerInitTimeoutMs}ms)`));
+    readyReject(new ReadinessTimeoutException(`Worker init timeout (${config.workerInitTimeoutMs}ms)`));
   }, config.workerInitTimeoutMs);
 
   child.on('message', (msg) => {
@@ -207,22 +253,22 @@ async function spawnWorker() {
       // Drain old workers only after new worker is confirmed ready
       if (drainingWorkers.size > 0) {
         const keepaliveS = config.workerKeepaliveS;
-        for (const [oldWorker, state] of drainingWorkers) {
+        for (const [oldWorker, workerState] of drainingWorkers) {
           if (keepaliveS === -1) {
             log(`Old worker (PID ${oldWorker.pid}) kept alive indefinitely (workerKeepaliveS=-1)`);
             continue;
           }
-          if (keepaliveS === 0 && state.keepaliveCount === 0) {
+          if (keepaliveS === 0 && workerState.keepaliveCount === 0) {
             log(`Draining old worker (PID ${oldWorker.pid}) — no keepalives, policy=0`);
             oldWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
             continue;
           }
-          if (keepaliveS > 0 && state.keepaliveCount === 0) {
+          if (keepaliveS > 0 && workerState.keepaliveCount === 0) {
             log(`Old worker (PID ${oldWorker.pid}) — no keepalives, starting ${keepaliveS}s grace period`);
             startDrainGraceTimer(oldWorker, keepaliveS);
             continue;
           }
-          log(`Old worker (PID ${oldWorker.pid}) has ${state.keepaliveCount} keepalive(s), waiting for natural close`);
+          log(`Old worker (PID ${oldWorker.pid}) has ${workerState.keepaliveCount} keepalive(s), waiting for natural close`);
         }
       }
     }
@@ -230,7 +276,7 @@ async function spawnWorker() {
     if (workerMsg.type === 'error') {
       clearTimeout(initTimeout);
       log(`Worker error: ${workerMsg.message}`);
-      readyReject(new Error(workerMsg.message));
+      readyReject(new ReadinessTimeoutException(workerMsg.message));
     }
 
     if (workerMsg.type === 'restart-request') {
@@ -245,8 +291,8 @@ async function spawnWorker() {
     log(`Worker (PID ${child.pid}) exited with code ${code} and signal ${signal}`);
 
     if (drainingWorkers.has(child)) {
-      const state = drainingWorkers.get(child);
-      if (state.timer) clearTimeout(state.timer);
+      const workerState = drainingWorkers.get(child);
+      if (workerState.timer) clearTimeout(workerState.timer);
       drainingWorkers.delete(child);
       log(`Draining worker (PID ${child.pid}) removed`);
       return;
@@ -263,12 +309,16 @@ async function spawnWorker() {
 
       if (state.consecutiveCrashCount >= MAX_CONSECUTIVE_CRASHES) {
         log(`${MAX_CONSECUTIVE_CRASHES} consecutive worker crashes, giving up. Check daemon.err for details.`);
+        // Fix 2: reap draining workers before crash-budget exit so their
+        // listener sockets are released — prevents port squatting by orphans.
+        reapDrainingWorkers();
         process.exit(1);
       }
 
       log(`Active worker died unexpectedly, respawning... (crash ${state.consecutiveCrashCount}/${MAX_CONSECUTIVE_CRASHES})`);
       spawnWorker().then((w) => { state.bindWorker(w); }).catch((e) => {
         log(`Failed to respawn worker: ${e.message}`);
+        reapDrainingWorkers();
         process.exit(1);
       });
     }
@@ -280,15 +330,15 @@ async function spawnWorker() {
 }
 
 function startDrainGraceTimer(worker, keepaliveS) {
-  const state = drainingWorkers.get(worker);
-  if (!state) return;
+  const workerState = drainingWorkers.get(worker);
+  if (!workerState) return;
 
-  if (state.timer) clearTimeout(state.timer);
-  state.timer = setTimeout(() => {
+  if (workerState.timer) clearTimeout(workerState.timer);
+  workerState.timer = setTimeout(() => {
     const config = getConfig();
     log(`Grace period (${keepaliveS}s) expired for worker (PID ${worker.pid}), sending drain`);
     worker.send({ type: 'drain', timeout: config.drainTimeoutMs });
-    state.timer = null;
+    workerState.timer = null;
   }, keepaliveS * 1000);
 }
 
@@ -386,6 +436,11 @@ function handleControlConnection(socket) {
         if (state.activeWorker) {
           state.activeWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
         }
+        // Fix 2: immediately kill draining workers with zero keepalives;
+        // they are not serving anyone and must not outlive the watchdog.
+        reapDrainingWorkers();
+        // Remaining draining workers (with live keepalives) get a drain signal
+        // and the existing timeout covers their orderly shutdown.
         for (const [worker] of drainingWorkers) {
           worker.send({ type: 'drain', timeout: config.drainTimeoutMs });
         }
@@ -403,18 +458,18 @@ function handleControlConnection(socket) {
 
     // Update draining worker keepalive counts
     if (assignedWorker && drainingWorkers.has(assignedWorker)) {
-      const state = drainingWorkers.get(assignedWorker);
-      state.keepaliveCount = countKeepalivesFor(assignedWorker);
-      state.lastKeepaliveAt = Date.now();
+      const workerState = drainingWorkers.get(assignedWorker);
+      workerState.keepaliveCount = countKeepalivesFor(assignedWorker);
+      workerState.lastKeepaliveAt = Date.now();
 
       const config = getConfig();
       const keepaliveS = config.workerKeepaliveS;
 
-      if (state.keepaliveCount === 0 && keepaliveS === 0) {
+      if (workerState.keepaliveCount === 0 && keepaliveS === 0) {
         log(`Last keepalive closed for draining worker (PID ${assignedWorker.pid}), sending drain`);
         assignedWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
       }
-      if (state.keepaliveCount === 0 && keepaliveS > 0 && !state.timer) {
+      if (workerState.keepaliveCount === 0 && keepaliveS > 0 && !workerState.timer) {
         log(`Last keepalive closed for draining worker (PID ${assignedWorker.pid}), starting ${keepaliveS}s grace`);
         startDrainGraceTimer(assignedWorker, keepaliveS);
       }
@@ -482,6 +537,11 @@ function gracefulShutdown(signal) {
   if (state.activeWorker) {
     state.activeWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
   }
+  // Fix 2: immediately kill draining workers with zero keepalives — they hold
+  // listener sockets and must not outlive the watchdog process.
+  reapDrainingWorkers();
+  // Remaining draining workers (with live keepalives) get a drain signal; the
+  // timeout below covers their orderly shutdown.
   for (const [worker] of drainingWorkers) {
     worker.send({ type: 'drain', timeout: config.drainTimeoutMs });
   }

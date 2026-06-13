@@ -239,7 +239,7 @@ function queryWorkerStatusIpc(socket, timeoutMs) {
     socket.on('data', onData);
     setTimeout(() => {
       socket.off('data', onData);
-      reject(new Error('Timeout'));
+      reject(new ReadinessTimeoutException('IPC status query timed out'));
     }, timeoutMs);
   });
 }
@@ -794,6 +794,31 @@ function displaySessionSummary(info) {
   process.stdout.write('─────────────────────\n');
 }
 
+  // Kill every process listening on `port`. Used to evict an orphaned worker
+  // whose watchdog has already exited, freeing the port for a new watchdog.
+  // Mirrors the killListenersOnPort pattern in src/test.js.
+  function killOrphanListenersOnPort(port) {
+    if (!port) return;
+    try {
+      if (process.platform === 'win32') {
+        const r = runSync('netstat', ['-aon', '-p', 'TCP'], { encoding: 'utf8' });
+        const lines = (r.stdout || '').split('\n').filter((l) => l.includes(`:${port} `));
+        for (const line of lines) {
+          const pid = line.trim().split(/\s+/).pop();
+          if (pid && /^\d+$/.test(pid)) {
+            try { process.kill(Number(pid), 'SIGKILL'); } catch { /* already gone */ }
+          }
+        }
+        return;
+      }
+      const ss = runSync('sh', ['-c', `ss -ltnp | grep :${port}`], { encoding: 'utf8' });
+      const pids = [...(ss.stdout || '').matchAll(/pid=(\d+)/g)].map((m) => Number(m[1]));
+      for (const pid of pids) {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+    } catch { /* best effort */ }
+  }
+
   function startProxyDaemonProcess(versionInfo) {
   const logsDir = path.join(USER_CONFIG_DIR, LOGS_DIR_NAME);
   if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
@@ -816,8 +841,43 @@ function displaySessionSummary(info) {
   }
 
   async function ensureDaemon(config, versionInfo) {
-  // Existing daemon? readActivePort returns runtime.json port if recorded, else config.port.
-  if (await checkProxy(readActivePort(config), config.healthCheckTimeoutMs)) return;
+  const activePort = readActivePort(config);
+
+  if (await checkProxy(activePort, config.healthCheckTimeoutMs)) {
+    // Port is alive — verify it is owned by a live watchdog, not an orphaned
+    // worker whose watchdog has already crashed (Fix 3).
+    const runtime = readRuntimeState();
+    const watchdogPid = runtime && typeof runtime.watchdogPid === 'number' ? runtime.watchdogPid : null;
+
+    if (watchdogPid === null) return; // no pid recorded — treat as healthy (pre-Fix3 path)
+
+    const watchdogAlive = (() => {
+      try { process.kill(watchdogPid, 0); return true; }
+      catch { return false; }
+    })();
+    if (watchdogAlive) return; // healthy daemon — nothing to do
+
+    // Watchdog is dead but its draining worker still holds the port.
+    // Kill the orphan so the new watchdog can bind the port cleanly.
+    process.stderr.write(`[ccb] Orphaned worker on port ${activePort} (watchdog PID ${watchdogPid} dead) — reaping\n`);
+    killOrphanListenersOnPort(activePort);
+
+    // Wait up to 2 s for the port to be released before spawning the new watchdog.
+    const ORPHAN_WAIT_MS = 2000;
+    const ORPHAN_POLL_MS = 100;
+    const orphanStart = Date.now();
+    while (Date.now() - orphanStart < ORPHAN_WAIT_MS) {
+      await new Promise(r => setTimeout(r, ORPHAN_POLL_MS));
+      const portStillHeld = await new Promise((resolve) => {
+        const sock = net.connect({ host: '127.0.0.1', port: activePort });
+        sock.once('connect', () => { sock.destroy(); resolve(true); });
+        sock.once('error', () => resolve(false));
+        sock.setTimeout(ORPHAN_POLL_MS, () => { sock.destroy(); resolve(false); });
+      });
+      if (!portStillHeld) break;
+    }
+    // Fall through to startProxyDaemonProcess.
+  }
 
   startProxyDaemonProcess(versionInfo);
 
