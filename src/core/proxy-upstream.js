@@ -469,6 +469,24 @@ function finalizeUpstreamFailure(ctx, reason) {
   if (!ctx.res.writableEnded) ctx.res.end();
 }
 
+// HTTP gateway status for a given upstream socket/transport error code.
+// ETIMEDOUT (connect OR inactivity timeout) is a gateway TIMEOUT → 504: the
+// gateway could not get a timely response from the upstream. Every other
+// connect/transport failure (refused, reset, host/net unreachable, DNS, pipe)
+// is a BAD GATEWAY → 502: the gateway reached for an upstream that would not or
+// could not talk to it. An unrecognized code defaults to 502 — any upstream
+// failure is a bad gateway, never a 400 (400 = Bad Request = a CLIENT error
+// that tells SDKs/agents NOT to retry, which is wrong for a transient gateway
+// failure that a retry would fix). 400 is reserved for the genuinely malformed
+// CLIENT-request path (proxy-core.js buildErrorResponse), not this upstream path.
+const UPSTREAM_TIMEOUT_CODES = Object.freeze(['ETIMEDOUT']);
+const HTTP_GATEWAY_TIMEOUT = 504;
+const HTTP_BAD_GATEWAY = 502;
+export function httpStatusForUpstreamCode(code) {
+  if (UPSTREAM_TIMEOUT_CODES.includes(code)) return HTTP_GATEWAY_TIMEOUT;
+  return HTTP_BAD_GATEWAY;
+}
+
 function buildErrorResponse(res, error, startTime) {
   if (res.headersSent) return;
   const elapsedMs = startTime ? Date.now() - startTime : null;
@@ -481,7 +499,7 @@ function buildErrorResponse(res, error, startTime) {
       ...(elapsedMs !== null && { ccb_response_time_ms: elapsedMs })
     }
   });
-  res.writeHead(400, {
+  res.writeHead(httpStatusForUpstreamCode(error.code), {
     'content-type': 'application/json',
     'content-length': Buffer.byteLength(payload),
     'connection': 'close'

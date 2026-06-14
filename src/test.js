@@ -4585,6 +4585,22 @@ async function runUnitTests() {
     }
   }
 
+  // ── httpStatusForUpstreamCode: transient upstream codes map to 502/504, never 400 ──
+  // The code→status map is a pure function; this is the sanctioned manifesto carve-out
+  // (edge/boundary a behaviour test can't economically reach — the upstream-timeout knob
+  // is unwired, so ETIMEDOUT cannot be driven through the live daemon yet). The 502
+  // refused-upstream path IS additionally proven through the real daemon in
+  // runUpstreamStatusMappingTests below.
+  console.log('\nhttpStatusForUpstreamCode:');
+  const { httpStatusForUpstreamCode } = await import('../src/core/proxy-upstream.js');
+  assert(httpStatusForUpstreamCode('ETIMEDOUT') === 504, 'ETIMEDOUT (connect or inactivity timeout) -> 504 gateway timeout');
+  for (const code of ['ECONNREFUSED', 'ECONNRESET', 'EHOSTUNREACH', 'ENETUNREACH', 'ENOTFOUND', 'EPIPE']) {
+    assert(httpStatusForUpstreamCode(code) === 502, `${code} -> 502 bad gateway`);
+  }
+  assert(httpStatusForUpstreamCode('EAI_AGAIN') === 502, 'unrecognized DNS/temporary failure -> 502 (default bad gateway, not 400)');
+  assert(httpStatusForUpstreamCode(undefined) === 502, 'missing code -> 502 (never a client 400)');
+  assert(httpStatusForUpstreamCode(null) === 502, 'null code -> 502 (never a client 400)');
+
 }
 
 // ── Integration test (isolated daemon) ──
@@ -6147,6 +6163,16 @@ async function runSnapshotIsolationTest() {
     const runtimePath = path.join(TEST_CONFIG_DIR, RUNTIME_FILENAME);
     if (!fs.existsSync(runtimePath)) {
       console.error('FAIL: Snapshot isolation — runtime.json not written by snapshot-spawned daemon');
+      const logPath = path.join(logsDir, 'daemon.log');
+      const errPath = path.join(logsDir, 'daemon.err');
+      if (fs.existsSync(logPath)) {
+        console.error('--- daemon.log ---');
+        console.error(fs.readFileSync(logPath, 'utf8'));
+      }
+      if (fs.existsSync(errPath)) {
+        console.error('--- daemon.err ---');
+        console.error(fs.readFileSync(errPath, 'utf8'));
+      }
       killTestDaemon();
       return false;
     }
@@ -7267,6 +7293,188 @@ async function runSupersededRequestTests() {
   }
 }
 
+// Poll/read timings for the ephemeral-port status-mapping daemon. The daemon is
+// told port:0, so its bound port is read back from runtime.json (never hardcoded).
+const STATUS_MAPPING_POLL_MS = 200;
+const STATUS_MAPPING_POLL_ATTEMPTS = 75; // 15s ceiling
+// Client-side backstop so a regression (proxy hangs on a refused upstream instead
+// of synthesizing 502) cannot stall the suite.
+const STATUS_MAPPING_CLIENT_TIMEOUT_MS = 5000;
+
+/**
+ * Behaviour test for the upstream status-code mapping. A transient upstream
+ * failure must surface to the SDK/agent client as a RETRYABLE gateway status
+ * (502/504), never a 400 (Bad Request = "do not retry"). 400 is reserved for the
+ * genuinely malformed CLIENT-request path (proxy-core.js buildErrorResponse),
+ * not this upstream-failure path.
+ *
+ * Oracle = the client's per-request ATTRIBUTED result (the HTTP status + parsed
+ * error.code on THIS request's response), never a message string.
+ *
+ * - Refused upstream (ECONNREFUSED, a deterministic dead port) -> 502, with the
+ *   real socket error code carried in the body's error.code (proves the new
+ *   ProxyError.code field populates end-to-end). ETIMEDOUT->504 and the other
+ *   connect codes are additionally proven in the pure unit test above; the
+ *   upstream-timeout knob that would emit ETIMEDOUT live is not yet wired
+ *   (separate task T-qcqzf3nn), so the 504 branch is not reachable through the
+ *   real daemon here.
+ * - Recovery: a retry-capable request to a healthy upstream -> 200.
+ */
+async function runUpstreamStatusMappingTests() {
+  console.log('\n── Upstream status-mapping tests (transient failures -> 502/504, isolated daemon on ephemeral port) ──');
+  const failedBefore = failed;
+
+  const healthyStub = await spawnRecordingStub();
+  const deadPort = await acquireClosedPort(); // deterministic ECONNREFUSED upstream
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccb-status-map-'));
+  const logsDir = path.join(tempDir, LOGS_DIR_NAME);
+  fs.mkdirSync(logsDir, { recursive: true });
+
+  let liveDaemonPid = null;
+  let resolvedPort = null;
+
+  try {
+    // my-dead -> a refused (closed) upstream port; my-ok -> a healthy stub.
+    const providers = {
+      providers: {
+        ok: { url: `http://127.0.0.1:${healthyStub.port}`, anthropicCompliant: true, apiKey: '', models: {}, toolTransforms: {} },
+        dead: { url: `http://127.0.0.1:${deadPort}`, anthropicCompliant: true, apiKey: '', models: {}, toolTransforms: {} },
+      },
+      routes: {
+        models: { 'my-dead': 'dead.some-model', 'my-ok': 'ok.some-model' },
+        properties: {},
+        payloadSize: {},
+      },
+    };
+    fs.writeFileSync(path.join(tempDir, PROVIDERS_FILENAME), JSON.stringify(providers, null, 2), 'utf8');
+
+    const liveConfig = {
+      port: 0, // ephemeral: the watchdog records the OS-assigned port in runtime.json
+      anthropicBaseUrl: `http://127.0.0.1:${healthyStub.port}`,
+      daemon: {
+        healthCheckTimeoutMs: 1000,
+        pollIntervalMs: 200,
+        pollMaxAttempts: 15,
+        upstreamTimeoutMs: 0,
+        workerInitTimeoutMs: 20000,
+        drainTimeoutMs: 600000,
+        workerKeepaliveS: -1,
+        ipcTimeoutMs: 5000,
+        daemonStartTimeoutMs: 60000,
+        daemonStartProgressGraceMs: 15000,
+        bindHost: '127.0.0.1',
+        retry: {
+          // No retry: a refused upstream must surface its synthesized gateway status
+          // immediately (the point of the test), not be retried away. maxAttempts=0
+          // routes singleForwardAttempt straight to the terminal buildErrorResponse.
+          maxAttempts: 0,
+          baseDelayMs: 0,
+          maxDelayMs: 0,
+          retryOnStatusCodes: [],
+          retryOnTcpErrors: [],
+          retryOnBodyPatterns: [],
+        },
+      },
+      logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000, level: 'trace' },
+      compression: { recompressRequests: false },
+    };
+    fs.writeFileSync(path.join(tempDir, CONFIG_FILENAME), JSON.stringify(liveConfig, null, 2), 'utf8');
+    fs.writeFileSync(path.join(tempDir, ENV_FILENAME), 'OK_KEY=test-ok-key\nDEAD_KEY=test-dead-key\n', 'utf8');
+
+    const WATCHDOG_BIN = path.join(PKG_ROOT, 'bin', WATCHDOG_SCRIPT_NAME);
+    const out = fs.openSync(path.join(logsDir, 'daemon.log'), 'a');
+    const errFd = fs.openSync(path.join(logsDir, 'daemon.err'), 'a');
+    const child = spawnDaemon(WATCHDOG_BIN, [], {
+      detached: true,
+      stdio: ['ignore', out, errFd],
+      windowsHide: true,
+      env: { ...process.env, CCB_CONFIG_DIR: tempDir },
+    });
+    liveDaemonPid = child.pid;
+    child.unref();
+
+    const runtimePath = path.join(tempDir, RUNTIME_FILENAME);
+    let runtime = null;
+    for (let i = 0; i < STATUS_MAPPING_POLL_ATTEMPTS; i++) {
+      if (fs.existsSync(runtimePath)) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(runtimePath, 'utf8'));
+          if (typeof parsed.port === 'number') { runtime = parsed; break; }
+        } catch { /* file mid-write */ }
+      }
+      await sleep(STATUS_MAPPING_POLL_MS);
+    }
+    if (!runtime) {
+      assert(false, 'status-mapping: daemon runtime.json appeared within timeout');
+      return [false];
+    }
+    const livePort = runtime.port;
+    resolvedPort = livePort;
+
+    let ready = false;
+    for (let i = 0; i < STATUS_MAPPING_POLL_ATTEMPTS; i++) {
+      const probe = await new Promise((resolve) => {
+        const req = http.get(`http://127.0.0.1:${livePort}/v1/models`, () => resolve(true));
+        req.on('error', () => resolve(false));
+        req.setTimeout(500, () => { req.destroy(); resolve(false); });
+      });
+      if (probe) { ready = true; break; }
+      await sleep(STATUS_MAPPING_POLL_MS);
+    }
+    assert(ready, 'status-mapping: daemon answered /v1/models within timeout');
+    if (!ready) return [false];
+
+    const post = (model) => new Promise((resolve) => {
+      const body = JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] });
+      const req = http.request({
+        hostname: '127.0.0.1', port: livePort, path: '/v1/messages', method: 'POST',
+        headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body), authorization: 'Bearer oauth-sentinel' },
+      }, (res) => {
+        let b = '';
+        res.on('data', (d) => { b += d; });
+        res.on('end', () => resolve({ status: res.statusCode, body: b }));
+      });
+      req.on('error', (e) => resolve({ error: e.code || e.message }));
+      req.setTimeout(STATUS_MAPPING_CLIENT_TIMEOUT_MS, () => { req.destroy(); resolve({ error: 'CLIENT_TIMEOUT' }); });
+      req.end(body);
+    });
+
+    // ── Refused upstream -> 502 (never 400), carrying the real socket code ──
+    console.log('  Refused upstream (ECONNREFUSED) -> 502 + error.code');
+    {
+      const result = await post('my-dead');
+      assert(result.status === 502, `refused upstream -> 502 bad gateway (got ${JSON.stringify(result)})`);
+      assert(result.status !== 400, 'refused upstream is NOT a 400 (400 tells clients not to retry)');
+      // The body's error.code must carry the real socket failure (proves ProxyError.code
+      // populates end-to-end); assert the CODE, never the message string.
+      let parsedCode = null;
+      try { parsedCode = JSON.parse(result.body)?.error?.code ?? null; } catch { /* non-JSON */ }
+      assert(parsedCode === 'ECONNREFUSED', `error.code carries the real socket failure (got ${JSON.stringify(parsedCode)})`);
+    }
+
+    // ── Recovery: a retry-capable request to a healthy upstream -> 200 ──
+    console.log('  Healthy upstream -> 200 (recovery after a gateway failure)');
+    {
+      const result = await post('my-ok');
+      assert(result.status === 200, `healthy upstream -> 200 (got ${JSON.stringify(result)})`);
+    }
+
+    const statusMappingPassed = failed === failedBefore;
+    if (statusMappingPassed) {
+      console.log('  PASS: refused upstream mapped to a retryable gateway status (502, not 400)');
+    }
+    return [statusMappingPassed];
+  } finally {
+    if (liveDaemonPid) {
+      try { process.kill(liveDaemonPid, 'SIGKILL'); } catch { }
+    }
+    killListenersOnPort(resolvedPort);
+    await new Promise((resolve) => healthyStub.server.close(() => resolve()));
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { }
+  }
+}
+
 async function runLiveRoutingTests() {
   console.log('\n── Live routing tests (stub upstreams, isolated daemon on port ' + LIVE_ROUTING_PORT + ') ──');
 
@@ -7877,11 +8085,13 @@ async function main() {
 
   const supersededResults = await runSupersededRequestTests();
 
+  const statusMappingResults = await runUpstreamStatusMappingTests();
+
   const agyLocalRoute = await runAgyLocalRouteIntegrationTest();
 
   const agyPromptQuoting = await runAgyPromptQuotingTests();
 
-  if (!portFallback || !orphanReap || !multiWorkerAuth || !snapshotIsolation || !integrationResults.every(Boolean) || !liveRoutingResults.every(Boolean) || !supersededResults.every(Boolean) || !agyLocalRoute || !agyPromptQuoting) {
+  if (!portFallback || !orphanReap || !multiWorkerAuth || !snapshotIsolation || !integrationResults.every(Boolean) || !liveRoutingResults.every(Boolean) || !supersededResults.every(Boolean) || !statusMappingResults.every(Boolean) || !agyLocalRoute || !agyPromptQuoting) {
     console.error('\n🚨 INTEGRATION TESTS FAILED!');
     process.exit(1);
   }

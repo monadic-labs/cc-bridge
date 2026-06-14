@@ -76,7 +76,7 @@ export class ProxyConfig {
 
     const port = raw.port;
     if (port === undefined || port === null) throw new ConfigError('port must be explicitly defined in the config');
-    if (typeof port !== 'number' || port < 1 || port > 65535) throw new ConfigError('port must be a valid number between 1 and 65535');
+    if (typeof port !== 'number' || port < 0 || port > 65535) throw new ConfigError('port must be a valid number between 0 and 65535');
 
     const anthropicBaseUrl = raw.anthropicBaseUrl;
     if (typeof anthropicBaseUrl !== 'string' || !anthropicBaseUrl.match(/^https?:\/\//)) {

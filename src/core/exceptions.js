@@ -2,18 +2,21 @@ export class ProxyError extends Error {
   #operation;
   #requestId;
   #context;
+  #code;
 
-  constructor(message, { operation, requestId, context } = {}) {
+  constructor(message, { operation, requestId, context, code } = {}) {
     super(message);
     this.name = this.constructor.name;
     this.#operation = operation ?? 'unknown';
     this.#requestId = requestId ?? 0;
     this.#context = context ?? {};
+    this.#code = code ?? null;
   }
 
   get operation() { return this.#operation; }
   get requestId() { return this.#requestId; }
   get context() { return Object.freeze({ ...this.#context }); }
+  get code() { return this.#code; }
 
   toResponsePayload() {
     return JSON.stringify({
@@ -28,9 +31,8 @@ export class ConfigError extends ProxyError {
 }
 
 export class ConfigurationMissingException extends ConfigError {
-  constructor(message, props) { 
-    super(message, props); 
-    this.code = 401;
+  constructor(message, props) {
+    super(message, { code: 401, ...props });
   }
 }
 
