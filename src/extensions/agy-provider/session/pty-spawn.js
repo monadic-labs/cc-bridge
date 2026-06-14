@@ -68,16 +68,28 @@ export function spawnPtyAgy(deps) {
   const agyDirectory = agyDir(agyPath);
   // agy's -p/--print takes the prompt AS ITS ARGUMENT (verified: the spike and
   // agy-format both invoke `agy --model '...' -p '<prompt>'`; a bare `-p` errors
-  // `flag needs an argument: -p`). The prompt is shell-single-quoted to survive
-  // the `script -qec "..."` wrapper. Each `agy -p` is one full agentic loop.
+  // `flag needs an argument: -p`).
+  // We pass the prompt and model via environment variables CCB_AGY_PROMPT and
+  // CCB_AGY_MODEL to avoid quote, backtick, and dollar-sign parsing or command
+  // injection in the shell command wrapper. For remote SSH execution, we export
+  // them explicitly on the shell command line.
   const escapedModel = shellQuoteSingle(model);
   const escapedPrompt = shellQuoteSingle(prompt);
-  const shellCommand = `export PATH=${agyDirectory}:$PATH; script -qec "agy --model ${escapedModel} -p ${escapedPrompt}" /dev/null`;
+  let shellCommand = `export PATH=${agyDirectory}:$PATH; script -qec 'agy --model "$CCB_AGY_MODEL" -p "$CCB_AGY_PROMPT"' /dev/null`;
+  if (sshHost) {
+    shellCommand = `export CCB_AGY_PROMPT=${escapedPrompt}; export CCB_AGY_MODEL=${escapedModel}; export PATH=${agyDirectory}:$PATH; script -qec 'agy --model "$CCB_AGY_MODEL" -p "$CCB_AGY_PROMPT"' /dev/null`;
+  }
   const invocation = buildAgyInvocation(shellCommand, sshHost);
+
+  const activeEnv = {
+    ...env,
+    CCB_AGY_PROMPT: prompt,
+    CCB_AGY_MODEL: model,
+  };
 
   const child = spawnCommand(invocation.cmd, invocation.args, {
     cwd: sandboxDir,
-    env,
+    env: activeEnv,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 

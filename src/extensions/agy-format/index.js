@@ -100,11 +100,12 @@ export function createAgyFormatExtension(config = {}, binaryProbe = undefined) {
   async function executeAgy(displayName, prompt) {
     if (sshHost) {
       // Remote SSH path: temp file would need to exist on the remote host.
-      // Limitation: double-quotes and $-signs in the prompt will break the command.
-      // A future improvement should SCP a temp file to the remote host instead.
-      const escapedModel = displayName.replace(/'/g, "'\"'\"'");
-      const escapedPrompt = prompt.replace(/'/g, "'\"'\"'");
-      const shellCommand = `export PATH=${resolvedAgyDir}:$PATH; script -qec "agy --model '${escapedModel}' -p '${escapedPrompt}'" /dev/null`;
+      // We pass prompt and model via environment variables CCB_AGY_PROMPT and
+      // CCB_AGY_MODEL to avoid quote, backtick, and dollar-sign parsing or command
+      // injection in the shell command wrapper.
+      const escapedModel = `'${displayName.replace(/'/g, "'\"'\"'")}'`;
+      const escapedPrompt = `'${prompt.replace(/'/g, "'\"'\"'")}'`;
+      const shellCommand = `export CCB_AGY_PROMPT=${escapedPrompt}; export CCB_AGY_MODEL=${escapedModel}; export PATH=${resolvedAgyDir}:$PATH; script -qec 'agy --model "$CCB_AGY_MODEL" -p "$CCB_AGY_PROMPT"' /dev/null`;
       const { cmd, args } = buildAgyInvocation(shellCommand, sshHost);
       const raw = await execCommand(cmd, args, {
         timeout: requestTimeoutMs,

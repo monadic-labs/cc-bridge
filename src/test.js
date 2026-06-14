@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import http from 'http';
+import net from 'net';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -2020,13 +2021,13 @@ async function runUnitTests() {
   // discoverExtensions on built-in dir
   const extDir = path.join(PKG_ROOT, 'src', 'extensions');
   const discovered = await discoverExtensions(extDir);
-  assert(discovered.length === 8, `discovers 8 extensions (found ${discovered.length})`);
+  assert(discovered.length === 9, `discovers 9 extensions (found ${discovered.length})`);
   const errors = discovered.filter(m => m.error);
   assert(errors.length === 0, `no discovery errors (${errors.map(e => e.error).join(', ')})`);
 
   // buildRegistry with no providers — only always-on extensions
   const { registry: regNoProviders } = buildRegistry(discovered, []);
-  assert(regNoProviders.size === 7, `7 always-on extensions without providers (got ${regNoProviders.size})`);
+  assert(regNoProviders.size === 8, `8 always-on extensions without providers (got ${regNoProviders.size})`);
   assert(regNoProviders.requestTransformerCount >= 2, 'at least 2 request transformers (sanitization + non-compliant)');
 
   // buildRegistry with provider that has toolTransforms.web_search
@@ -2035,15 +2036,15 @@ async function runUnitTests() {
     toolTransforms: { web_search: {} }
   });
   const { registry: regWithWs } = buildRegistry(discovered, [providerWithWs]);
-  assert(regWithWs.size === 8, `8 extensions with web_search provider (got ${regWithWs.size})`);
+  assert(regWithWs.size === 9, `9 extensions with web_search provider (got ${regWithWs.size})`);
 
   // getAll() exposes the full extension list including those without
   // tunable schemas — this is what the GUI Extensions tab consumes.
   const allExtensions = regWithWs.getAll();
-  assert(allExtensions.length === 8, `getAll returns 8 extensions (got ${allExtensions.length})`);
+  assert(allExtensions.length === 9, `getAll returns 9 extensions (got ${allExtensions.length})`);
   const byName = Object.fromEntries(allExtensions.map(e => [e.name, e]));
 
-  for (const name of ['agy-format', 'fallback', 'load-balancer', 'non-compliant-transform', 'openai-format', 'sanitization', 'thinking-sse', 'web-search-zai']) {
+  for (const name of ['agy-format', 'agy-provider', 'fallback', 'load-balancer', 'non-compliant-transform', 'openai-format', 'sanitization', 'thinking-sse', 'web-search-zai']) {
     assert(byName[name], `getAll includes ${name}`);
     assert(typeof byName[name].title === 'string' && byName[name].title.length > 0, `${name} has non-empty title`);
     assert(typeof byName[name].description === 'string' && byName[name].description.length > 0, `${name} has non-empty description`);
@@ -4174,7 +4175,17 @@ async function runUnitTests() {
             const fulfillDeadline = Date.now() + 5_000;
             const tryFulfill = () => {
               if (actorRef.current.state.pendingCount > 0) {
-                const content = fs.readFileSync(call.arguments.path, 'utf8');
+                // Correct tool-executor behavior: a malformed call (missing/blank
+                // required `path`) returns an isError result to agy rather than
+                // throwing — real Gemini is non-deterministic and may call read_file
+                // with no args. Returning the error lets agy retry/continue instead
+                // of crashing the bridge's readline callback.
+                const argPath = call.arguments?.path;
+                if (typeof argPath !== 'string' || argPath.length === 0) {
+                  socketServer.fulfill(call.mcpId, { content: [{ type: 'text', text: 'read_file error: missing required argument "path"' }], isError: true });
+                  return;
+                }
+                const content = fs.readFileSync(argPath, 'utf8');
                 socketServer.fulfill(call.mcpId, { content: [{ type: 'text', text: content }], isError: false });
                 return;
               }
@@ -4232,6 +4243,176 @@ async function runUnitTests() {
         try { if (spawnedChild) { spawnedChild.kill('SIGTERM'); } } catch { /* already exited */ }
         try { if (socketServer) { socketServer.stop(); } } catch { /* already stopped */ }
         try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
+      }
+    }
+  }
+
+  // ── agy-provider: end-to-end ccb integration test ──
+  // Proves the full stack: ccb daemon → resolveUnmatched → handleUpstream →
+  // actor-registry.ensure → socket server → agy PTY → MCP bridge → SSE response.
+  // Gated: same CCB_AGY_MVP_TEST=1 flag (needs real OAuth + real agy).
+  if (process.env.CCB_AGY_MVP_TEST === '1') {
+    console.log('\nagy-provider end-to-end ccb integration test (isolated daemon):');
+    const { resolveAgyBinary: resolveAgyBinaryE2e } = await import('../src/extensions/agy-format/binary-resolver.js');
+    let agyPresentE2e = true;
+    try { resolveAgyBinaryE2e(undefined); } catch { agyPresentE2e = false; }
+    const realGeminiDirE2e = path.join(os.homedir(), '.gemini');
+    const hasAuthE2e = fs.existsSync(path.join(realGeminiDirE2e, 'oauth_creds.json'));
+
+    if (!agyPresentE2e || !hasAuthE2e) {
+      console.log('  (skipped: requires real agy binary + OAuth creds)');
+    }
+    if (agyPresentE2e && hasAuthE2e) {
+      const ccbTestDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccb-agy-e2e-'));
+      // Allocate a FREE high port (bind+close a throwaway server) so the daemon
+      // never collides with another live ccb instance on this box. ccb's watchdog
+      // AUTO-BUMPS to the next free port when the configured port is taken — so a
+      // hardcoded port can silently bind elsewhere and curl hits the wrong daemon.
+      // We then assert the daemon bound EXACTLY this port (fail loud if bumped).
+      const AGY_E2E_PORT = await new Promise((resolve) => {
+        const probe = net.createServer();
+        probe.listen(0, '127.0.0.1', () => {
+          const port = probe.address().port;
+          probe.close(() => resolve(port));
+        });
+      });
+      let e2eDaemonPid = null;
+      try {
+        // Minimal isolated config — no ZAI provider; agy-provider handles routing
+        // via resolveUnmatched (activation: 'always', order 60 for agyp: prefix).
+        const e2eLogsDir = path.join(ccbTestDir, LOGS_DIR_NAME);
+        fs.mkdirSync(e2eLogsDir, { recursive: true });
+
+        const e2eProviders = { providers: {}, extensions: {}, routes: { models: {}, properties: {}, payloadSize: {} } };
+        fs.writeFileSync(path.join(ccbTestDir, PROVIDERS_FILENAME), JSON.stringify(e2eProviders, null, 2), 'utf8');
+
+        const e2eConfig = {
+          port: AGY_E2E_PORT,
+          daemon: { healthCheckTimeoutMs: 1000, pollIntervalMs: 200, pollMaxAttempts: 15, upstreamTimeoutMs: 0, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: -1, ipcTimeoutMs: 5000, daemonStartTimeoutMs: 60000, daemonStartProgressGraceMs: 15000 },
+          logging: { enabled: false, requests: false, responses: false, history: 0, maxBodyLog: 0, level: 'info' },
+        };
+        fs.writeFileSync(path.join(ccbTestDir, CONFIG_FILENAME), JSON.stringify(e2eConfig, null, 2), 'utf8');
+        fs.writeFileSync(path.join(ccbTestDir, ENV_FILENAME), 'AGY_KEY=local\nAGY_PROVIDER_KEY=local\n', 'utf8');
+
+        // Start isolated daemon
+        const WATCHDOG_BIN_E2E = path.join(PKG_ROOT, 'bin', WATCHDOG_SCRIPT_NAME);
+        const logOut = fs.openSync(path.join(e2eLogsDir, 'daemon.log'), 'a');
+        const logErr = fs.openSync(path.join(e2eLogsDir, 'daemon.err'), 'a');
+        const e2eChild = spawnDaemon(WATCHDOG_BIN_E2E, [], {
+          detached: true, stdio: ['ignore', logOut, logErr], windowsHide: true,
+          env: { ...process.env, CCB_CONFIG_DIR: ccbTestDir, AGY_KEY: 'local' },
+        });
+        e2eDaemonPid = e2eChild.pid;
+        e2eChild.unref();
+
+        // Wait for the daemon to be ready AND verify it bound EXACTLY the free
+        // port we allocated (fail loud if the watchdog bumped to another port —
+        // that would mean our curls hit a different daemon). The watchdog writes
+        // the bound port to runtime.json; we read it back and assert equality.
+        const runtimePath = path.join(ccbTestDir, RUNTIME_FILENAME);
+        let e2eUp = false;
+        let actualBoundPort = null;
+        for (let i = 0; i < 40; i++) {
+          try {
+            const runtime = JSON.parse(fs.readFileSync(runtimePath, 'utf8'));
+            if (typeof runtime.port === 'number') actualBoundPort = runtime.port;
+          } catch { /* runtime.json not written yet */ }
+          if (actualBoundPort === AGY_E2E_PORT) {
+            const ready = await new Promise((r) => {
+              const req = http.get(`http://localhost:${AGY_E2E_PORT}/v1/models`, () => r(true));
+              req.on('error', () => r(false));
+              req.setTimeout(500, () => { req.destroy(); r(false); });
+            });
+            if (ready) { e2eUp = true; break; }
+          }
+          await sleep(250);
+        }
+        assert(actualBoundPort !== null, 'e2e: daemon wrote no runtime.json (bound-port unknown)');
+        assert(actualBoundPort === AGY_E2E_PORT, `e2e: daemon bound port ${actualBoundPort} but configured ${AGY_E2E_PORT} (watchdog port-bumped — would hit wrong daemon)`);
+        assert(e2eUp, 'e2e: isolated ccb daemon started and answered /v1/models on the allocated port');
+
+        if (e2eUp) {
+          // Tool the session will use: echo its input verbatim.
+          const echoTool = {
+            name: 'echo_content',
+            description: 'Return the text argument verbatim',
+            input_schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
+          };
+          const e2ePrompt = 'Use the echo_content tool with text "E2E_PROOF_42" then call submit_final_answer with the result.';
+
+          // Round 1: initial request — expect tool_use SSE.
+          const body1 = JSON.stringify({
+            model: 'agyp:Gemini 3.1 Pro', max_tokens: 1024, stream: true,
+            messages: [{ role: 'user', content: e2ePrompt }],
+            tools: [echoTool],
+          });
+          const res1 = await new Promise((r) => {
+            const req = http.request({
+              hostname: 'localhost', port: AGY_E2E_PORT, path: '/v1/messages', method: 'POST',
+              headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body1), 'x-api-key': 'test-key', 'anthropic-version': '2023-06-01' },
+              timeout: 90000,
+            }, (res) => {
+              const chunks = [];
+              res.on('data', (c) => chunks.push(c));
+              res.on('end', () => r({ statusCode: res.statusCode, body: Buffer.concat(chunks).toString() }));
+            });
+            req.on('error', (e) => r({ error: e }));
+            req.on('timeout', () => { req.destroy(); r({ error: { message: 'timeout after 90s' } }); });
+            req.write(body1); req.end();
+          });
+
+          if (res1.error) {
+            assert(false, `e2e: round-1 connection error: ${res1.error.message}`);
+          }
+          if (!res1.error) {
+            assert(res1.body.includes('"type":"tool_use"'), 'e2e: round-1 SSE contains tool_use block');
+            assert(res1.body.includes('"stop_reason":"tool_use"'), 'e2e: round-1 SSE stop_reason is tool_use');
+
+            // Extract the tool_use_id emitted by the actor for round-2 correlation.
+            const toolUseMatch = res1.body.match(/"id":"(toolu_[^"]+)"/);
+            const toolUseId = toolUseMatch ? toolUseMatch[1] : null;
+            assert(toolUseId !== null, 'e2e: tool_use_id extracted from round-1 SSE');
+
+            if (toolUseId) {
+              // Round 2: send tool_result — expect end_turn SSE (submit_final_answer path).
+              const body2 = JSON.stringify({
+                model: 'agyp:Gemini 3.1 Pro', max_tokens: 1024, stream: true,
+                messages: [
+                  { role: 'user', content: e2ePrompt },
+                  { role: 'assistant', content: [{ type: 'tool_use', id: toolUseId, name: 'echo_content', input: { text: 'E2E_PROOF_42' } }] },
+                  { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUseId, content: 'E2E_PROOF_42' }] },
+                ],
+                tools: [echoTool],
+              });
+              const res2 = await new Promise((r) => {
+                const req = http.request({
+                  hostname: 'localhost', port: AGY_E2E_PORT, path: '/v1/messages', method: 'POST',
+                  headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body2), 'x-api-key': 'test-key', 'anthropic-version': '2023-06-01' },
+                  timeout: 90000,
+                }, (res) => {
+                  const chunks = [];
+                  res.on('data', (c) => chunks.push(c));
+                  res.on('end', () => r({ statusCode: res.statusCode, body: Buffer.concat(chunks).toString() }));
+                });
+                req.on('error', (e) => r({ error: e }));
+                req.on('timeout', () => { req.destroy(); r({ error: { message: 'timeout after 90s' } }); });
+                req.write(body2); req.end();
+              });
+              if (res2.error) {
+                assert(false, `e2e: round-2 connection error: ${res2.error.message}`);
+              }
+              if (!res2.error) {
+                assert(res2.body.includes('"stop_reason":"end_turn"'), 'e2e: round-2 SSE contains end_turn (submit_final_answer received)');
+                console.log('  e2e PASSED: daemon → resolveUnmatched → handleUpstream → actor → MCP → submit_final_answer confirmed.');
+              }
+            }
+          }
+        }
+      } catch (err) {
+        assert(false, `e2e integration test failed: ${err && err.message ? err.message : err}`);
+      } finally {
+        try { if (e2eDaemonPid) { process.kill(e2eDaemonPid, 'SIGKILL'); } } catch { /* already gone */ }
+        try { fs.rmSync(ccbTestDir, { recursive: true, force: true }); } catch { /* best-effort */ }
       }
     }
   }

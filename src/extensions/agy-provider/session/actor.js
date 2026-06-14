@@ -56,6 +56,9 @@ export function createSessionActor({ server, config }) {
   // The current turn's SSE sink (set by handleUpstream; cleared when the turn ends).
   let turnResponse = NO_RESPONSE;
   let turnModel = 'unknown';
+  // Buffered SSE from a tool call that arrived before setTurnResponse installed a real sink.
+  // Flushed immediately when the next setTurnResponse call arrives.
+  let pendingEmit = null;
 
   function genToolUseId() {
     seq += 1;
@@ -130,6 +133,11 @@ export function createSessionActor({ server, config }) {
     // tool execution — the ONLY thing held is agy's MCP call, in `pending`).
     const block = { type: 'tool_use', id: toolUseId, name, input: args ?? {} };
     const sse = buildToolUseSseSequence({ messageId: `msg_${toolUseId}`, model: turnModel, toolUseBlocks: [block], usage: { inputTokens: 0, outputTokens: 0 } });
+    if (turnResponse === NO_RESPONSE) {
+      // Sink not yet installed by handleUpstream — buffer and flush when setTurnResponse arrives.
+      pendingEmit = sse;
+      return;
+    }
     turnResponse.writeSse(sse);
     turnResponse.end();
     turnResponse = NO_RESPONSE;
@@ -235,6 +243,13 @@ export function createSessionActor({ server, config }) {
       turnResponse = sink ?? NO_RESPONSE;
       if (typeof model === 'string') {
         turnModel = model;
+      }
+      if (pendingEmit !== null && turnResponse !== NO_RESPONSE) {
+        const sse = pendingEmit;
+        pendingEmit = null;
+        turnResponse.writeSse(sse);
+        turnResponse.end();
+        turnResponse = NO_RESPONSE;
       }
     },
 
