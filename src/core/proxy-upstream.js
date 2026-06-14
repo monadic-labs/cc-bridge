@@ -56,6 +56,14 @@ function forwardWithRetry({ ctx, handleResponseEnd, errorReporter, getConfig, po
   });
 
   async function attemptRetry() {
+    if (ctx.superseded) {
+      // A newer request is queued behind this one on the same keep-alive socket.
+      // Stop retrying and tear the shared socket down so the newer request's
+      // client retries on a fresh connection — never write this request's late
+      // failure onto the stream the newer request now owns.
+      teardownSuperseded(ctx);
+      return;
+    }
     if (attempt >= retryConfig.maxAttempts || ctx.clientAborted) {
       // Out of retries or client gone — attempt fallback if enabled, else stream the last failure
       if (shouldAttemptFallbackForTcpError(ctx.matchedRule, ctx.fallbackDepth)) {
@@ -96,6 +104,13 @@ function forwardWithRetry({ ctx, handleResponseEnd, errorReporter, getConfig, po
 
     await new Promise(r => setTimeout(r, delay));
     if (ctx.clientAborted) return;
+    if (ctx.superseded) {
+      // Superseded during the backoff window. Returning without teardown would
+      // leave this request's response queued behind nothing on the shared socket,
+      // starving the newer request — destroy so the newer client retries fresh.
+      teardownSuperseded(ctx);
+      return;
+    }
 
     forwardWithRetry({ ctx, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, retryConfig, attempt: attempt + 1, openaiProviders });
   }
@@ -124,6 +139,12 @@ async function singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, get
   // failure instead of an unhandled rejection that would crash the worker.
   if (extensions?.hasUpstreamHandler(providerId)) {
     if (ctx.clientAborted) return;
+    if (ctx.superseded) {
+      // Don't dispatch the held call to the upstream handler at all — a newer
+      // request now owns this socket. Destroy so the newer client retries fresh.
+      teardownSuperseded(ctx);
+      return;
+    }
     try {
       const body = JSON.parse(ctx.forwardBody.toString());
       await extensions.invokeUpstream({ providerId, body, req: ctx.req, res: ctx.res, ctx });
@@ -166,6 +187,13 @@ async function singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, get
 
   proxyReq.on('error', (err) => {
     if (ctx.clientAborted) return;
+    if (ctx.superseded) {
+      // The upstream for this request failed late, but a newer request now owns
+      // this socket. Writing the failure here would corrupt the newer request's
+      // response — destroy the shared socket instead so the newer client retries.
+      teardownSuperseded(ctx);
+      return;
+    }
     errorReporter.write(new UpstreamError(err.message, { code: err.code }), {
       requestId: ctx.id,
       route: ctx.routeLabel,
@@ -217,6 +245,19 @@ function resolveUpstreamUrl(targetBase, reqUrl, isCustom, isOpenaiFormat) {
 }
 
 function handleProxyResponse({ reqCtx, proxyRes, headers, handleResponseEnd, errorReporter, getConfig, policy, extensions, emit, forwardToUpstream, onUpstreamResponse, onRetryNeeded, openaiProviders }) {
+  // The upstream for a superseded request finally produced a response, but a
+  // newer request now owns this socket. Discard the entire response — never
+  // writeHead, never stream a chunk, never call the success/error terminal —
+  // and destroy the shared socket so the newer client retries on a fresh
+  // connection. This one guard covers the SSE writeHead, the passthrough
+  // writeHead, the per-chunk writes, and the 'end' terminal writes below,
+  // because returning here lets none of them run. Drain the upstream response
+  // so the underlying socket frees its buffer before we destroy it.
+  if (reqCtx.superseded) {
+    proxyRes.resume();
+    teardownSuperseded(reqCtx);
+    return;
+  }
   if (onUpstreamResponse) onUpstreamResponse(proxyRes);
 
   const isError = proxyRes.statusCode >= 400;
@@ -318,6 +359,12 @@ function handleProxyResponse({ reqCtx, proxyRes, headers, handleResponseEnd, err
 }
 function handleNormalResponse(reqCtx, proxyRes, chunks, handleResponseEnd, headers, _extensions, transformer) {
   if (reqCtx.clientAborted) return;
+  if (reqCtx.superseded) {
+    // A late upstream success on a superseded request would corrupt the newer
+    // request's response — discard it and tear the shared socket down.
+    teardownSuperseded(reqCtx);
+    return;
+  }
 
   const resCtx = new ProxyResponseContext({
     proxyRes,
@@ -345,6 +392,13 @@ function handleNormalResponse(reqCtx, proxyRes, chunks, handleResponseEnd, heade
 }
 function streamBufferedError(reqCtx, proxyRes, chunks, _handleResponseEnd, _headers, errorReporter) {
   if (reqCtx.clientAborted) return;
+  if (reqCtx.superseded) {
+    // A buffered upstream error on a superseded request must never be written —
+    // it would occupy this request's response slot on the shared socket. Tear
+    // the socket down so the newer client retries on a fresh connection.
+    teardownSuperseded(reqCtx);
+    return;
+  }
 
   let errorId = null;
   const body = Buffer.concat(chunks).toString();
@@ -399,6 +453,15 @@ function streamBufferedError(reqCtx, proxyRes, chunks, _handleResponseEnd, _head
  */
 function finalizeUpstreamFailure(ctx, reason) {
   if (ctx.clientAborted) return;
+  if (ctx.superseded) {
+    // Every upstream attempt failed and a newer request now owns this socket.
+    // Never write the failure here — destroy the shared socket so the newer
+    // client retries on a fresh connection. buildErrorResponse is unsafe for a
+    // superseded request: it writes a body AND sets connection: close, both of
+    // which write into the shared response stream the newer request depends on.
+    teardownSuperseded(ctx);
+    return;
+  }
   if (!ctx.res.headersSent) {
     buildErrorResponse(ctx.res, new UpstreamError(`Upstream connection failed: ${reason}`, { code: reason }), ctx.startTime);
     return;
@@ -424,4 +487,24 @@ function buildErrorResponse(res, error, startTime) {
     'connection': 'close'
   });
   res.end(payload);
+}
+
+/**
+ * Tear down a superseded request. The newer request's response is queued
+ * behind this one on the same keep-alive socket, so this request must write
+ * NOTHING (no writeHead / end / body — any byte would occupy this request's
+ * response slot and read as the wrong request's answer) and instead destroy
+ * the shared socket. That forces the newer request's client to retry on a
+ * fresh, unambiguous connection. Best-effort if headers were already sent:
+ * a sent response cannot be un-sent, but destroying still closes the stream
+ * the newer request would otherwise block on. Never call buildErrorResponse
+ * here — it writes a body AND sets `connection: close`, both of which write
+ * into the shared response stream. The guard that calls this is the WRITE
+ * ATTEMPT (terminal response site); markSuperseded() never tears down, so a
+ * fully-completed previous request on a benign sequential keep-alive reuse
+ * never reaches a guarded write and is never closed.
+ */
+function teardownSuperseded(ctx) {
+  const socket = ctx.req.socket;
+  if (socket) socket.destroy();
 }

@@ -6894,6 +6894,379 @@ function killListenersOnPort(port) {
   } catch { }
 }
 
+const SUPERSEDED_PORT = 9124;
+const SUPERSEDED_POLL_MS = 200;
+const SUPERSEDED_POLL_ATTEMPTS = 75; // 15 s ceiling
+// Gap between the pipelined A and B frames: long enough that A has reached the
+// proxy and its slow upstream is pending, short enough that A's answer (hangMs)
+// has not landed — so B genuinely supersedes A on the same socket.
+const SUPERSEDED_PIPELINE_GAP_MS = 40;
+// How long A's slow stub holds its response open — must exceed the pipeline gap.
+const SUPERSEDED_UPSTREAM_HANG_MS = 400;
+// Tier-1 client-abort gap: A has reached the proxy before its caller aborts it.
+const SUPERSEDED_ABORT_LET_LAND_MS = 50;
+// Backstop so a regression (socket never destroyed) cannot hang the suite.
+const SUPERSEDED_SOCKET_BACKSTOP_MS = 2000;
+
+/**
+ * Spawn a stub upstream that holds the first request for `hangMs` then returns
+ * a distinctive body, so the proxy's upstream response arrives LATE — the window
+ * in which a newer request can arrive on the same keep-alive socket and supersede
+ * this one. `tag` is the body the client should NEVER read as another request's
+ * answer; `status` defaults to 200 (a late SUCCESS is as corrupting as a late
+ * error per the supersession contract).
+ */
+async function spawnHangingStub(hangMs, tag, status = 200) {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      requests.push({ method: req.method, url: req.url, headers: { ...req.headers }, body });
+      // Hold the response open so a pipelined successor can supersede it before
+      // this upstream answer lands.
+      setTimeout(() => {
+        res.writeHead(status, { 'content-type': 'application/json' });
+        res.end(tag);
+      }, hangMs);
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return { server, port: server.address().port, requests };
+}
+
+/**
+ * Parse N pipelined HTTP/1.1 responses out of a raw byte buffer, attributing
+ * them in wire order (response #1 → the first request sent, #2 → the second).
+ * Returns an array of { status, body } — the per-request ATTRIBUTED result,
+ * which is the correct oracle: "bytes present somewhere in the buffer" passes
+ * for BOTH correct delivery AND corruption, so it is never the assertion.
+ */
+function parseOrderedResponses(buf) {
+  const results = [];
+  let idx = 0;
+  while (idx < buf.length) {
+    const headerEnd = buf.indexOf('\r\n\r\n', idx);
+    if (headerEnd === -1) break;
+    const headerBlock = buf.slice(idx, headerEnd).toString();
+    idx = headerEnd + 4;
+    const statusLine = headerBlock.split('\r\n')[0];
+    const statusMatch = statusLine.match(/HTTP\/1\.1 (\d+)/);
+    const status = statusMatch ? Number(statusMatch[1]) : 0;
+    const headers = Object.fromEntries(
+      headerBlock.split('\r\n').slice(1).map((line) => {
+        const sep = line.indexOf(':');
+        return sep === -1 ? [line, ''] : [line.slice(0, sep).trim().toLowerCase(), line.slice(sep + 1).trim()];
+      })
+    );
+    const enc = (headers['transfer-encoding'] ?? '').toLowerCase();
+    const lenStr = headers['content-length'];
+    let body = '';
+    if (enc.includes('chunked')) {
+      // Decode a single chunked body (sufficient for stub responses: one chunk + 0).
+      // buf is a string, so slices are strings — join, do not Buffer.concat.
+      let cur = idx;
+      const decoded = [];
+      while (cur < buf.length) {
+        const lineEnd = buf.indexOf('\r\n', cur);
+        if (lineEnd === -1) break;
+        const sizeHex = buf.slice(cur, lineEnd).trim();
+        cur = lineEnd + 2;
+        const size = parseInt(sizeHex, 16);
+        if (!Number.isFinite(size) || size <= 0) break;
+        decoded.push(buf.slice(cur, cur + size));
+        cur += size + 2;
+      }
+      body = decoded.join('');
+      idx = cur;
+    }
+    if (!enc.includes('chunked') && lenStr !== undefined) {
+      const len = parseInt(lenStr, 10);
+      body = buf.slice(idx, idx + (Number.isFinite(len) ? len : 0)).toString();
+      idx += Number.isFinite(len) ? len : 0;
+    }
+    results.push({ status, body });
+  }
+  return results;
+}
+
+/**
+ * Regression for the superseded-request fix. A request (A) whose upstream
+ * responds LATE is superseded by a newer request (B) on the SAME keep-alive
+ * socket. The fix (panel Fix b): A writes NOTHING and destroys the shared
+ * socket, so B's client retries on a fresh connection — A's late response
+ * never corrupts B's.
+ *
+ * Three tiers (oracle = client per-request ATTRIBUTED result, never
+ * "bytes somewhere in buffer"):
+ *   Tier 1 — production path: real http.Agent client (no pipelining). A's
+ *            client aborts mid-flight, then the same agent sends B. B's caller
+ *            receives B's correct response and never A's tag.
+ *   Tier 2 — adversarial pipelining: raw net.Socket pipelines A then B; A's
+ *            upstream answers AFTER B is queued. The shared socket is torn
+ *            down (A writes nothing); B retried on a FRESH socket returns the
+ *            correct response. A's tag never appears as B's answer under either
+ *            attribution model.
+ *   Tier 3 — benign-reuse guard: A completes FULLY, then B on the same socket.
+ *            No supersession fires; the socket is NOT closed; A→A's tag,
+ *            B→B's tag, no extra round-trip.
+ */
+async function runSupersededRequestTests() {
+  console.log('\n── Superseded-request tests (keep-alive reuse, isolated daemon on port ' + SUPERSEDED_PORT + ') ──');
+  const failedBefore = failed;
+
+  const okStub = await spawnRecordingStub();
+  const slowStub = await spawnHangingStub(SUPERSEDED_UPSTREAM_HANG_MS, 'A-LATE-TAG', 200);
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccb-superseded-'));
+  const logsDir = path.join(tempDir, LOGS_DIR_NAME);
+  fs.mkdirSync(logsDir, { recursive: true });
+
+  let liveDaemonPid = null;
+  let resolvedPort = null;
+
+  try {
+    const providers = {
+      providers: {
+        ok: { url: `http://127.0.0.1:${okStub.port}`, anthropicCompliant: true, apiKey: '', models: {}, toolTransforms: {} },
+        slow: { url: `http://127.0.0.1:${slowStub.port}`, anthropicCompliant: true, apiKey: '', models: {}, toolTransforms: {} },
+      },
+      routes: {
+        models: {
+          'my-ok': 'ok.some-model',
+          'my-slow': 'slow.some-model',
+        },
+        properties: {},
+        payloadSize: {},
+      },
+    };
+    fs.writeFileSync(path.join(tempDir, PROVIDERS_FILENAME), JSON.stringify(providers, null, 2), 'utf8');
+
+    const liveConfig = {
+      port: SUPERSEDED_PORT,
+      anthropicBaseUrl: `http://127.0.0.1:${okStub.port}`,
+      daemon: {
+        healthCheckTimeoutMs: 1000,
+        pollIntervalMs: 200,
+        pollMaxAttempts: 15,
+        upstreamTimeoutMs: 0,
+        workerInitTimeoutMs: 20000,
+        drainTimeoutMs: 600000,
+        workerKeepaliveS: -1,
+        ipcTimeoutMs: 5000,
+        daemonStartTimeoutMs: 60000,
+        daemonStartProgressGraceMs: 15000,
+        bindHost: '127.0.0.1',
+        retry: {
+          maxAttempts: 0, // no retry: A's single upstream attempt is the one that lands late
+          baseDelayMs: 0,
+          maxDelayMs: 0,
+          retryOnStatusCodes: [],
+          retryOnTcpErrors: [],
+          retryOnBodyPatterns: [],
+        },
+      },
+      logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000, level: 'trace' },
+      compression: { recompressRequests: false },
+    };
+    fs.writeFileSync(path.join(tempDir, CONFIG_FILENAME), JSON.stringify(liveConfig, null, 2), 'utf8');
+    fs.writeFileSync(path.join(tempDir, ENV_FILENAME), 'OK_KEY=test-ok-key\nSLOW_KEY=test-slow-key\n', 'utf8');
+
+    const WATCHDOG_BIN = path.join(PKG_ROOT, 'bin', WATCHDOG_SCRIPT_NAME);
+    const out = fs.openSync(path.join(logsDir, 'daemon.log'), 'a');
+    const err = fs.openSync(path.join(logsDir, 'daemon.err'), 'a');
+    const child = spawnDaemon(WATCHDOG_BIN, [], {
+      detached: true,
+      stdio: ['ignore', out, err],
+      windowsHide: true,
+      env: { ...process.env, CCB_CONFIG_DIR: tempDir },
+    });
+    liveDaemonPid = child.pid;
+    child.unref();
+
+    const runtimePath = path.join(tempDir, RUNTIME_FILENAME);
+    let runtime = null;
+    for (let i = 0; i < SUPERSEDED_POLL_ATTEMPTS; i++) {
+      if (fs.existsSync(runtimePath)) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(runtimePath, 'utf8'));
+          if (typeof parsed.port === 'number') { runtime = parsed; break; }
+        } catch { /* file mid-write */ }
+      }
+      await sleep(SUPERSEDED_POLL_MS);
+    }
+    if (!runtime) {
+      assert(false, 'superseded: daemon runtime.json appeared within timeout');
+      return [false];
+    }
+    const livePort = runtime.port;
+    resolvedPort = livePort;
+
+    let ready = false;
+    for (let i = 0; i < SUPERSEDED_POLL_ATTEMPTS; i++) {
+      const probe = await new Promise((resolve) => {
+        const req = http.get(`http://127.0.0.1:${livePort}/v1/models`, () => resolve(true));
+        req.on('error', () => resolve(false));
+        req.setTimeout(500, () => { req.destroy(); resolve(false); });
+      });
+      if (probe) { ready = true; break; }
+      await sleep(SUPERSEDED_POLL_MS);
+    }
+    assert(ready, 'superseded: daemon answered /v1/models within timeout');
+    if (!ready) return [false];
+
+    // okStub returns '{}'; give it a distinctive body so B's result is unambiguous.
+    const okServer = okStub.server;
+    okServer.removeAllListeners('request');
+    okServer.on('request', (req, res) => {
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        okStub.requests.push({ method: req.method, url: req.url, headers: { ...req.headers }, body });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('B-OK-TAG');
+      });
+    });
+
+    // ── Tier 3 FIRST (benign sequential reuse) so Tiers 1/2 don't disturb it ──
+    console.log('  Tier 3: benign sequential keep-alive reuse (A completes, then B) — socket NOT closed, no supersession');
+    {
+      const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+      const fire = (model) => new Promise((resolve) => {
+        const bodyJson = JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] });
+        const req = http.request({
+          hostname: '127.0.0.1', port: livePort, path: '/v1/messages', method: 'POST', agent,
+          headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(bodyJson), authorization: 'Bearer oauth-sentinel' },
+        }, (res) => { let b = ''; res.on('data', (d) => { b += d; }); res.on('end', () => resolve({ status: res.statusCode, body: b })); });
+        req.on('error', (e) => resolve({ error: e.code || e.message }));
+        req.end(bodyJson);
+      });
+      const a = await fire('my-ok');
+      const b = await fire('my-ok');
+      // Sequential reuse: both served on ONE warm socket, no supersession, no close.
+      assert(a.status === 200 && a.body === 'B-OK-TAG', `T3: A got its own 200 response (got ${JSON.stringify(a)})`);
+      assert(b.status === 200 && b.body === 'B-OK-TAG', `T3: B got its own 200 response on the reused socket (got ${JSON.stringify(b)})`);
+      agent.destroy();
+    }
+
+    // ── Tier 1 — production path: a subsequent healthy request is never fed a stale response ──
+    // Node's http.Agent does NOT pipeline (maxSockets queues the next request until the prior
+    // response completes), and a client abort closes its own socket rather than issuing a new
+    // request on it — so a real client cannot trigger supersession the way a pipelining client
+    // can. The production guarantee this tier asserts is therefore the weaker, real one: after
+    // an abandoned slow request, the NEXT request the agent issues receives its OWN correct
+    // response and is NEVER handed the abandoned request's late upstream tag. The dangerous
+    // supersession corruption itself is reproduced and proven in Tier 2 (raw-socket pipelining).
+    console.log('  Tier 1: production path — after an abandoned request, the next request gets its own response (no stale-tag leak)');
+    {
+      const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+      const aBodyJson = JSON.stringify({ model: 'my-slow', messages: [{ role: 'user', content: 'hi' }] });
+      const aReq = http.request({
+        hostname: '127.0.0.1', port: livePort, path: '/v1/messages', method: 'POST', agent,
+        headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(aBodyJson), authorization: 'Bearer oauth-sentinel' },
+      }, () => {});
+      aReq.on('error', () => {}); // aborted sockets emit ECONNRESET — expected, swallow.
+      aReq.end(aBodyJson);
+      await sleep(SUPERSEDED_ABORT_LET_LAND_MS); // let A reach the proxy and the slow upstream
+      aReq.destroy(); // client abandons A
+
+      const fire = (model) => new Promise((resolve) => {
+        const bodyJson = JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] });
+        const req = http.request({
+          hostname: '127.0.0.1', port: livePort, path: '/v1/messages', method: 'POST', agent,
+          headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(bodyJson), authorization: 'Bearer oauth-sentinel' },
+        }, (res) => { let b = ''; res.on('data', (d) => { b += d; }); res.on('end', () => resolve({ status: res.statusCode, body: b })); });
+        req.on('error', (e) => resolve({ error: e.code || e.message }));
+        req.setTimeout(5000, () => { req.destroy(); resolve({ error: 'CLIENT_TIMEOUT' }); });
+        req.end(bodyJson);
+      });
+      const b = await fire('my-ok');
+      // The next request's caller must receive its own 200 body and NEVER the abandoned
+      // request's late upstream tag — the production guarantee. (Supersession itself is
+      // not reachable via the agent path; Tier 2 reproduces the corruption directly.)
+      assert(
+        !(b.status === 200 && b.body === 'A-LATE-TAG'),
+        `T1: B was NOT served A's late response (got ${JSON.stringify(b)})`
+      );
+      assert(b.status === 200 && b.body === 'B-OK-TAG', `T1: B received its own correct 200 response (got ${JSON.stringify(b)})`);
+      agent.destroy();
+    }
+
+    // ── Tier 2 — adversarial pipelining: raw socket pipelines A then B; A answers late ──
+    console.log('  Tier 2: adversarial pipelining — A upstream answers AFTER B is queued on the same socket');
+    {
+      // frame(model, closeConnection) builds a complete HTTP/1.1 request frame
+      // (headers + body) ready to write onto a raw socket. No placeholder string
+      // surgery — Content-Length is computed from the real body bytes.
+      const frame = (model, closeConnection) => {
+        const body = JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] });
+        const lines = [
+          'POST /v1/messages HTTP/1.1',
+          'Host: x',
+          `Content-Length: ${Buffer.byteLength(body)}`,
+          'content-type: application/json',
+          'authorization: Bearer oauth-sentinel',
+        ];
+        if (closeConnection) lines.push('Connection: close');
+        return lines.join('\r\n') + '\r\n\r\n' + body;
+      };
+      const pipelined = await new Promise((resolve) => {
+        const sock = net.createConnection({ host: '127.0.0.1', port: livePort }, () => {
+          // Pipeline A immediately, then B after a short gap — both on ONE socket,
+          // A's slow upstream still pending. B supersedes A.
+          sock.write(frame('my-slow', false));
+          setTimeout(() => sock.write(frame('my-ok', true)), SUPERSEDED_PIPELINE_GAP_MS);
+        });
+        let buf = '';
+        sock.on('data', (d) => { buf += d.toString(); });
+        sock.on('end', () => resolve(buf));
+        sock.on('error', () => resolve(buf));
+        // Bound the wait: the proxy destroys the socket on supersession, which
+        // ends this connection promptly; cap so a regression can't hang the suite.
+        setTimeout(() => { sock.destroy(); resolve(buf); }, SUPERSEDED_SOCKET_BACKSTOP_MS);
+      });
+
+      // Under supersession, A writes NOTHING and the shared socket is destroyed.
+      // So the pipelined socket yields ZERO usable responses for B on THIS socket
+      // (B must retry fresh). Assert: B's correct body is NOT delivered here, AND
+      // A's late tag is NOT present at all (A wrote nothing).
+      assert(!pipelined.includes('A-LATE-TAG'), `T2: A's late upstream tag never reached the wire (got: ${JSON.stringify(pipelined.slice(0, 200))})`);
+      const pipelinedResponses = parseOrderedResponses(pipelined);
+      const sawB = pipelinedResponses.some((r) => r.body === 'B-OK-TAG');
+      assert(!sawB, `T2: B was NOT served on the torn-down superseded socket (it must retry fresh) (got ${pipelinedResponses.length} response(s))`);
+
+      // B retried on a FRESH socket must return its correct response — proving the
+      // daemon survived and the fix routes the newer request to a clean connection.
+      const freshB = await new Promise((resolve) => {
+        const bodyJson = JSON.stringify({ model: 'my-ok', messages: [{ role: 'user', content: 'hi' }] });
+        const req = http.request({
+          hostname: '127.0.0.1', port: livePort, path: '/v1/messages', method: 'POST',
+          headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(bodyJson), authorization: 'Bearer oauth-sentinel' },
+        }, (res) => { let b = ''; res.on('data', (d) => { b += d; }); res.on('end', () => resolve({ status: res.statusCode, body: b })); });
+        req.on('error', (e) => resolve({ error: e.code || e.message }));
+        req.setTimeout(5000, () => { req.destroy(); resolve({ error: 'CLIENT_TIMEOUT' }); });
+        req.end(bodyJson);
+      });
+      assert(freshB.status === 200 && freshB.body === 'B-OK-TAG', `T2: B retried on a fresh socket returned its correct 200 (got ${JSON.stringify(freshB)})`);
+      assert(!pipelined.includes('A-LATE-TAG') && freshB.body === 'B-OK-TAG', 'T2: A-LATE-TAG never served as any request\'s answer, and B got B-OK-TAG');
+    }
+
+    const supersededPassed = failed === failedBefore;
+    if (supersededPassed) {
+      console.log('  PASS: all superseded-request tiers completed (A never corrupts B)');
+    }
+    return [supersededPassed];
+  } finally {
+    if (liveDaemonPid) {
+      try { process.kill(liveDaemonPid, 'SIGKILL'); } catch { }
+    }
+    killListenersOnPort(resolvedPort ?? SUPERSEDED_PORT);
+    await new Promise((resolve) => okStub.server.close(() => resolve()));
+    await new Promise((resolve) => slowStub.server.close(() => resolve()));
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { }
+  }
+}
+
 async function runLiveRoutingTests() {
   console.log('\n── Live routing tests (stub upstreams, isolated daemon on port ' + LIVE_ROUTING_PORT + ') ──');
 
@@ -7502,11 +7875,13 @@ async function main() {
 
   const liveRoutingResults = await runLiveRoutingTests();
 
+  const supersededResults = await runSupersededRequestTests();
+
   const agyLocalRoute = await runAgyLocalRouteIntegrationTest();
 
   const agyPromptQuoting = await runAgyPromptQuotingTests();
 
-  if (!portFallback || !orphanReap || !multiWorkerAuth || !snapshotIsolation || !integrationResults.every(Boolean) || !liveRoutingResults.every(Boolean) || !agyLocalRoute || !agyPromptQuoting) {
+  if (!portFallback || !orphanReap || !multiWorkerAuth || !snapshotIsolation || !integrationResults.every(Boolean) || !liveRoutingResults.every(Boolean) || !supersededResults.every(Boolean) || !agyLocalRoute || !agyPromptQuoting) {
     console.error('\n🚨 INTEGRATION TESTS FAILED!');
     process.exit(1);
   }

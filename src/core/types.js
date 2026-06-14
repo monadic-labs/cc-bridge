@@ -51,6 +51,16 @@ export class Option {
   unwrapOr(defaultValue) { return this.#hasValue ? this.#value : defaultValue; }
 }
 
+// Property key for the superseded flag, stored on the shared HTTP response object
+// rather than per-context. The original ProxyRequestContext and every ctx derived
+// from it via withRouting share the SAME #res, so storing the flag there makes
+// markSuperseded() visible to the routed ctx that the upstream-forward code
+// actually holds — otherwise withRouting copies a stale boolean snapshot and a
+// flag set on the original (by a newer request on the same socket) never reaches
+// the routed ctx's superseded getter. A Symbol key avoids colliding with the
+// http.ServerResponse surface; the flag is request-scoped, not global state.
+const SUPERSEDED = Symbol('ccb.superseded');
+
 export class ProxyRequestContext {
   #req;
   #res;
@@ -69,7 +79,6 @@ export class ProxyRequestContext {
   #originalBody;
   #fallbackDepth;
   #matchedRule;
-  #superseded;
 
   constructor({ req, res, id, startTime, urlSessionId }) {
     this.#req = req;
@@ -89,7 +98,6 @@ export class ProxyRequestContext {
     this.#originalBody = Buffer.alloc(0);
     this.#fallbackDepth = 0;
     this.#matchedRule = null;
-    this.#superseded = false;
   }
 
   get req() { return this.#req; }
@@ -110,12 +118,12 @@ export class ProxyRequestContext {
   get originalBody() { return this.#originalBody; }
   get fallbackDepth() { return this.#fallbackDepth; }
   get matchedRule() { return this.#matchedRule; }
-  /** True when the client has disconnected (aborted or closed the request). Checked live, no propagation needed. */
+  /** True when the client has disconnected (aborted or closed the request). Checked live, no propagation needed. Terminal guards stop on this without any teardown — the socket is already dead. */
   get clientAborted() { return this.#req.aborted || this.#res.destroyed || (this.#req.socket?.destroyed ?? false); }
-  /** True when a newer request has arrived on the same keep-alive socket. Error responses must be discarded. */
-  get superseded() { return this.#superseded; }
-  /** Mark this request as superseded by a newer request on the same socket. */
-  markSuperseded() { this.#superseded = true; }
+  /** True when a newer request has arrived on the same keep-alive socket. Distinct from clientAborted: the socket is still live and the newer request's response is queued behind this one, so the superseded request must write NOTHING and destroy the shared socket — forcing the newer request's client to retry on a fresh, unambiguous connection. Any bytes written would occupy this request's response slot and read as the wrong request's answer. The flag is stored on the shared response object (not a per-context field) so markSuperseded() set on the original ctx is visible to the routed ctx the upstream-forward code holds. */
+  get superseded() { return this.#res[SUPERSEDED] === true; }
+  /** Mark this request as superseded by a newer request on the same socket. Writes to the shared response object so every ctx derived via withRouting observes the flip. */
+  markSuperseded() { this.#res[SUPERSEDED] = true; }
 
   withRouting({ routeLabel, reqModel, sessionId, routedHeaders, forwardBody, targetBase, isCustom, rawBody, sanitizationReport, originalBody, fallbackDepth, matchedRule }) {
     const next = new ProxyRequestContext({ req: this.#req, res: this.#res, id: this.#id, startTime: this.#startTime, urlSessionId: this.#urlSessionId });
@@ -131,7 +139,6 @@ export class ProxyRequestContext {
     next.#originalBody = originalBody ?? this.#originalBody;
     next.#fallbackDepth = fallbackDepth ?? this.#fallbackDepth;
     next.#matchedRule = matchedRule ?? this.#matchedRule;
-    next.#superseded = this.#superseded;
     return next;
   }
 }
