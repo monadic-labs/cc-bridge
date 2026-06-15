@@ -1,8 +1,9 @@
 import { spawn, execFile, execSync, spawnSync } from 'child_process';
 import process from 'process';
 import path from 'path';
-import { WATCHDOG_SCRIPT_NAME } from '../core/constants.js';
 import { SubprocessTimeoutError, SubprocessOutputError, SubprocessExitError } from '../core/exceptions.js';
+import { planShutdown } from './kill-planner.js';
+import { executeShutdown } from './kill-executor.js';
 
 /**
  * Spawn a Node.js script as a background/detached process.
@@ -169,92 +170,68 @@ export function getProcesses() {
   }
 }
 
-export async function runKill() {
-  const isWin = process.platform === 'win32';
-  const currentPid = process.pid;
+/**
+ * POSIX single-pid signaller. Returns a (pid) => void that sends `signalName`,
+ * swallowing the "process already gone" race.
+ */
+function posixSignaller(signalName) {
+  return (pid) => {
+    try { process.kill(pid, signalName); } catch { /* already exited */ }
+  };
+}
 
-  async function signalGraceful(pid) {
-    try {
-      // Signal twice as requested for Claude Code to catch it
-      process.kill(pid, 'SIGINT');
-      await sleep(200);
-      try { process.kill(pid, 'SIGINT'); } catch { }
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  function forceKill(pid) {
+/**
+ * Windows tree-kill via taskkill /T. `force` adds /F (un-graceful); without it
+ * taskkill requests a graceful close. Both walk the whole process tree.
+ */
+function windowsTaskkill(force) {
+  const forceFlag = force ? '/F ' : '';
+  return (pid) => {
     try {
       // eslint-disable-next-line local/no-direct-spawn
-      if (isWin) { execSync(`taskkill /F /PID ${pid} /T`, { stdio: 'ignore', windowsHide: true }); return true; }
-      process.kill(pid, 'SIGKILL');
-      return true;
-    } catch {
-      return false;
-    }
+      execSync(`taskkill ${forceFlag}/PID ${pid} /T`, { stdio: 'ignore', windowsHide: true });
+    } catch { /* process may have already exited */ }
+  };
+}
+
+/**
+ * Build the real, effectful shutdown environment for executeShutdown().
+ * The single seam where process signalling, process listing, the clock, and
+ * the delay primitive enter — everything below the planner/executor is injected.
+ */
+function buildShutdownEnv() {
+  const isWin = process.platform === 'win32';
+  return {
+    listPids: () => getProcesses().map(proc => proc.pid),
+    signalGraceful: isWin ? windowsTaskkill(false) : posixSignaller('SIGINT'),
+    signalForce: isWin ? windowsTaskkill(true) : posixSignaller('SIGKILL'),
+    sleep: (ms) => new Promise(resolve => setTimeout(resolve, ms)),
+    now: () => Date.now(),
+  };
+}
+
+function formatOutcome(outcome) {
+  if (outcome.exitedGracefully) return `${outcome.unit}: exited gracefully.`;
+  if (outcome.forced.length > 0) return `${outcome.unit}: force-killed after grace (${outcome.forced.join(', ')}).`;
+  return `${outcome.unit}: still alive after grace (force disabled).`;
+}
+
+/**
+ * Gracefully shut down every ccb session and dangling proxy daemon.
+ *
+ * Composition root: snapshot the machine, plan the shutdown (pure), then run it
+ * serially with real injected deps. Each ccb+claude unit is closed with two
+ * sequential Ctrl-C and a poll-for-exit before any force — so a `claude` that
+ * may be mid-OAuth-refresh is never SIGKILLed out from under its disk-persist.
+ */
+export async function runKill() {
+  const snapshot = getProcesses();
+  const plan = planShutdown(snapshot, process.pid);
+  if (plan.isEmpty()) {
+    console.log('No CCB sessions or proxy daemons found.');
+    return;
   }
-
-  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-  let procs = getProcesses();
-
-  const ccbProcs = procs.filter(p =>
-    p.pid !== currentPid &&
-    (p.cmd.includes('bin/ccb.js') || p.cmd.includes('bin\\ccb.js') || /\bccb(\.js|\.cmd)?\b/.test(p.cmd))
-  );
-
-  const ccbPids = new Set(ccbProcs.map(p => p.pid));
-
-  if (ccbProcs.length > 0) {
-    console.log(`Sending graceful shutdown signals to ${ccbProcs.length} CCB session(s)...`);
-    for (const p of ccbProcs) {
-      await signalGraceful(p.pid);
-    }
-
-    console.log('Waiting 5 seconds for sessions to save and exit...');
-    await sleep(5000);
-  }
-
-  procs = getProcesses();
-
-  const survivingCcb = procs.filter(p => ccbPids.has(p.pid));
-
-  const survivingClaude = procs.filter(p =>
-    p.pid !== currentPid &&
-    p.cmd.includes('claude') &&
-    ccbPids.has(p.ppid)
-  );
-
-  let killed = 0;
-  for (const p of [...survivingClaude, ...survivingCcb]) {
-    if (forceKill(p.pid)) {
-      console.log(`Forcefully killed persistent process ${p.pid} (${p.cmd.substring(0, 50)}...)`);
-      killed++;
-    }
-  }
-
-  if (killed === 0 && ccbProcs.length > 0) {
-    console.log('All CCB sessions exited gracefully.');
-  }
-
-  // Rescan for daemons that might be hanging
-  procs = getProcesses();
-    const daemonProcs = procs.filter(p =>
-    p.pid !== currentPid &&
-    (p.cmd.includes(WATCHDOG_SCRIPT_NAME) || p.cmd.includes('src/proxy.js') || p.cmd.includes('src\\proxy.js'))
-  );
-
-  killed = 0;
-  for (const p of daemonProcs) {
-    if (forceKill(p.pid)) {
-      console.log(`Killed dangling proxy daemon ${p.pid} (${p.cmd.substring(0, 50)}...)`);
-      killed++;
-    }
-  }
-
-  if (killed === 0 && daemonProcs.length === 0) {
-    console.log('No dangling proxy daemons found.');
-  }
+  console.log(`Gracefully shutting down ${plan.size()} unit(s) one at a time...`);
+  const outcomes = await executeShutdown(plan, buildShutdownEnv());
+  for (const outcome of outcomes) console.log(formatOutcome(outcome));
 }
