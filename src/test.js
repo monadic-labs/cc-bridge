@@ -4606,8 +4606,24 @@ async function runUnitTests() {
 
 // ── Integration test (isolated daemon) ──
 
-const TEST_PORT = 9100;
+// The test daemon binds port 0 (OS-assigned) and writes the actually-bound
+// port to runtime.json. TEST_CONFIG_PORT is the value written to config.json;
+// the live port every call site uses is read back from runtime.json into
+// testDaemonPort by startTestDaemon / waitForRuntimePort. Hardcoding a fixed
+// port collides with a leaked watchdog-respawned daemon from a prior run
+// (spurious EADDRINUSE) and tempts a dangerous reap of live listeners — bind
+// 0, read back, never hardcode. (Manifesto: zero-global-state network.)
+const TEST_CONFIG_PORT = 0;
 const TEST_CONFIG_DIR = path.join(PKG_ROOT, '.test-config');
+
+// Mutable test-daemon state: the PID we spawned and the port it actually
+// bound. Set together by startTestDaemon after reading runtime.json; cleared
+// by killTestDaemon. Module-scoped (not global mutable state in the banned
+// sense) because it is the test harness's own fixture lifecycle, owned by one
+// sequential driver — every function that reads it first ensures the daemon
+// is up.
+let testDaemonPid = null;
+let testDaemonPort = null;
 
 async function setupTestConfig() {
   const testEnvPath = path.join(TEST_CONFIG_DIR, ENV_FILENAME);
@@ -4707,7 +4723,7 @@ async function setupTestConfig() {
   fs.writeFileSync(path.join(TEST_CONFIG_DIR, PROVIDERS_FILENAME), JSON.stringify(providers, null, 2), 'utf8');
 
   const config = {
-    port: TEST_PORT,
+    port: TEST_CONFIG_PORT,
     daemon: { healthCheckTimeoutMs: 1000, pollIntervalMs: 200, pollMaxAttempts: 15, upstreamTimeoutMs: 0, workerInitTimeoutMs: 20000, drainTimeoutMs: 600000, workerKeepaliveS: -1, ipcTimeoutMs: 5000, daemonStartTimeoutMs: 60000, daemonStartProgressGraceMs: 15000 },
     logging: { enabled: true, requests: true, responses: true, history: 5, maxBodyLog: 1000, level: 'trace' }
   };
@@ -4717,8 +4733,11 @@ async function setupTestConfig() {
 }
 
 function checkTestProxy() {
+  // Probe the port the daemon actually bound (read back from runtime.json into
+  // testDaemonPort by startTestDaemon). Returns false while the daemon is down.
+  if (!testDaemonPort) return Promise.resolve(false);
   return new Promise((resolve) => {
-    const req = http.get(`http://localhost:${TEST_PORT}/v1/models`, () => resolve(true));
+    const req = http.get(`http://localhost:${testDaemonPort}/v1/models`, () => resolve(true));
     req.on('error', () => resolve(false));
     req.setTimeout(500, () => { req.destroy(); resolve(false); });
   });
@@ -4728,12 +4747,55 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-let testDaemonPid = null;
+// Read the actually-bound port the watchdog wrote to runtime.json. The daemon
+// binds config.port (0 = OS-assigned) and records the resolved port here on
+// worker-ready. Polls until the file holds a numeric port. Returns null if it
+// never appears within the timeout — the daemon failed to bind.
+const RUNTIME_PORT_POLL_MS = 200;
+const RUNTIME_PORT_TIMEOUT_MS = 15000;
 
+async function waitForRuntimePort(configDir) {
+  const runtimePath = path.join(configDir, RUNTIME_FILENAME);
+  const startTs = Date.now();
+  while (Date.now() - startTs < RUNTIME_PORT_TIMEOUT_MS) {
+    if (fs.existsSync(runtimePath)) {
+      try {
+        const runtime = JSON.parse(fs.readFileSync(runtimePath, 'utf8'));
+        if (typeof runtime.port === 'number') return runtime.port;
+      } catch { /* file may be mid-write */ }
+    }
+    await sleep(RUNTIME_PORT_POLL_MS);
+  }
+  return null;
+}
+
+function dumpDaemonLogs() {
+  const logsDir = path.join(TEST_CONFIG_DIR, LOGS_DIR_NAME);
+  const logPath = path.join(logsDir, 'daemon.log');
+  const errPath = path.join(logsDir, 'daemon.err');
+  if (fs.existsSync(logPath)) {
+    console.error('--- daemon.log ---');
+    console.error(fs.readFileSync(logPath, 'utf8'));
+  }
+  if (fs.existsSync(errPath)) {
+    console.error('--- daemon.err ---');
+    console.error(fs.readFileSync(errPath, 'utf8'));
+  }
+}
+
+// Spawn a watchdog configured against configDir and wait until it publishes its
+// bound port. Returns true and sets testDaemonPid + testDaemonPort; returns
+// false (and clears state) if the daemon never came up.
 async function startTestDaemon() {
   const WATCHDOG_BIN = path.join(PKG_ROOT, 'bin', WATCHDOG_SCRIPT_NAME);
   const out = fs.openSync(path.join(TEST_CONFIG_DIR, LOGS_DIR_NAME, 'daemon.log'), 'a');
   const err = fs.openSync(path.join(TEST_CONFIG_DIR, LOGS_DIR_NAME, 'daemon.err'), 'a');
+
+  // Delete stale runtime.json to prevent reading a stale port from a previous run
+  const runtimePath = path.join(TEST_CONFIG_DIR, RUNTIME_FILENAME);
+  if (fs.existsSync(runtimePath)) {
+    try { fs.unlinkSync(runtimePath); } catch { }
+  }
 
   const child = spawnDaemon(WATCHDOG_BIN, [], {
     detached: true,
@@ -4744,11 +4806,25 @@ async function startTestDaemon() {
   testDaemonPid = child.pid;
   child.unref();
 
+  // The daemon binds port 0; discover the real port from runtime.json before
+  // any readiness probe can target it.
+  const port = await waitForRuntimePort(TEST_CONFIG_DIR);
+  if (port === null) {
+    console.error('FAIL: startTestDaemon — runtime.json not written or missing port');
+    dumpDaemonLogs();
+    testDaemonPid = null;
+    testDaemonPort = null;
+    return false;
+  }
+  testDaemonPort = port;
+
   const POLL_MS = 200;
   for (let i = 0; i < 15; i++) {
     if (await checkTestProxy()) return true;
     await sleep(POLL_MS);
   }
+  console.error('FAIL: startTestDaemon — checkTestProxy failed');
+  dumpDaemonLogs();
   return false;
 }
 
@@ -4758,26 +4834,11 @@ function killTestDaemon() {
     testDaemonPid = null;
   }
 
-  // Kill anything listening on the test port
-  try {
-  if (process.platform === 'win32') {
-    const r = runSync('netstat', ['-aon', '-p', 'TCP'], { encoding: 'utf8' });
-    const lines = (r.stdout || '').split('\n').filter(l => l.includes(`:${TEST_PORT} `));
-    for (const line of lines) {
-      const pid = line.trim().split(/\s+/).pop();
-      if (pid && /^\d+$/.test(pid)) {
-        try { process.kill(Number(pid), 'SIGKILL'); } catch { }
-      }
-    }
-  }
-  if (process.platform !== 'win32') {
-    const ss = runSync('sh', ['-c', `ss -ltnp | grep :${TEST_PORT}`], { encoding: 'utf8' });
-    const match = ss.stdout.match(/pid=(\d+)/);
-    if (match && match[1]) {
-      process.kill(Number(match[1]), 'SIGKILL');
-    }
-  }
-  } catch { }
+  // Kill anything listening on the port the daemon actually bound. Reading the
+  // live testDaemonPort (never a hardcoded literal) means we only ever reap a
+  // listener this harness spawned — not whatever happens to sit on a fixed port.
+  killListenersOnPort(testDaemonPort);
+  testDaemonPort = null;
 }
 
 // ANSI CSI / OSC escape strip — turns terminal output into something
@@ -5524,7 +5585,7 @@ async function assertWebSearchTransform() {
 
   const res1 = await new Promise((resolve) => {
     const req = http.request({
-      hostname: 'localhost', port: TEST_PORT, path: '/v1/messages', method: 'POST',
+      hostname: 'localhost', port: testDaemonPort, path: '/v1/messages', method: 'POST',
       headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body1), 'x-api-key': 'test-key', 'anthropic-version': '2023-06-01' },
       timeout: 90000
     }, (res) => {
@@ -5585,7 +5646,7 @@ async function assertWebSearchTransform() {
 
   const res2 = await new Promise((resolve) => {
     const req = http.request({
-      hostname: 'localhost', port: TEST_PORT, path: '/v1/messages', method: 'POST',
+      hostname: 'localhost', port: testDaemonPort, path: '/v1/messages', method: 'POST',
       headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body2), 'x-api-key': 'test-key', 'anthropic-version': '2023-06-01' },
       timeout: 90000
     }, (res) => {
@@ -5642,22 +5703,33 @@ async function assertWebSearchTransform() {
 }
 
 async function runPortFallbackTest() {
-  console.log('\n── Port fallback test (occupies TEST_PORT, asserts watchdog bumps) ──');
+  console.log('\n── Port fallback test (occupies an ephemeral port, asserts watchdog bumps) ──');
 
   killTestDaemon();
   await setupTestConfig();
 
-  const { RUNTIME_FILENAME } = await import('../src/core/constants.js');
   const runtimePath = path.join(TEST_CONFIG_DIR, RUNTIME_FILENAME);
   if (fs.existsSync(runtimePath)) fs.unlinkSync(runtimePath);
 
-  // Hold TEST_PORT with a real TCP listener
+  // Obtain a guaranteed-free port P by binding 0 (no hardcoded port can collide
+  // with a leaked prior-run daemon). The SAME server stays bound on P — it IS
+  // the blocker — so the daemon's configured port P is busy and the watchdog
+  // must bump off it. Holding the port continuously from bind 0 to read-back
+  // removes the close-then-rebind race a scout/blocker pair would introduce.
   const net = await import('net');
   const blocker = net.createServer();
   await new Promise((resolve, reject) => {
     blocker.once('error', reject);
-    blocker.listen(TEST_PORT, '127.0.0.1', resolve);
+    blocker.listen(0, '127.0.0.1', resolve);
   });
+  const blockedPort = blocker.address().port;
+
+  // Point the daemon's config at P so its first bind attempt collides and the
+  // watchdog's port-fallback walks to the next free port.
+  const configPath = path.join(TEST_CONFIG_DIR, CONFIG_FILENAME);
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  config.port = blockedPort;
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
 
   try {
     const WATCHDOG_BIN = path.join(PKG_ROOT, 'bin', WATCHDOG_SCRIPT_NAME);
@@ -5672,31 +5744,23 @@ async function runPortFallbackTest() {
     testDaemonPid = child.pid;
     child.unref();
 
-    // Wait for runtime.json to appear and for the new port to answer
-    const RUNTIME_TIMEOUT_MS = 15000;
-    const RUNTIME_POLL_MS = 200;
-    const startTs = Date.now();
-    let runtime = null;
-    while (Date.now() - startTs < RUNTIME_TIMEOUT_MS) {
-      if (fs.existsSync(runtimePath)) {
-        try {
-          runtime = JSON.parse(fs.readFileSync(runtimePath, 'utf8'));
-          if (typeof runtime.port === 'number') break;
-        } catch { /* file may be mid-write */ }
-      }
-      await sleep(RUNTIME_POLL_MS);
-    }
-
-    if (!runtime) {
+    // Wait for runtime.json to appear and report the bumped port.
+    const bumpedPort = await waitForRuntimePort(TEST_CONFIG_DIR);
+    if (bumpedPort === null) {
       console.error('  FAIL: runtime.json never appeared after 15s');
       return false;
     }
-    assert(runtime.port !== TEST_PORT, 'watchdog did NOT bind blocked TEST_PORT');
-    assert(runtime.port > TEST_PORT && runtime.port <= TEST_PORT + 10, `watchdog bound a port within fallback range (got ${runtime.port})`);
+    const runtime = JSON.parse(fs.readFileSync(runtimePath, 'utf8'));
+    // The blocker holds P, so the watchdog must bind a DIFFERENT free port —
+    // its fallback walk [P, P+1, ... P+9, 0] lands elsewhere.
+    assert(bumpedPort !== blockedPort, 'watchdog bumped off the blocked port');
+    assert(bumpedPort === runtime.port, 'runtime.json port matches the read-back');
     assert(typeof runtime.watchdogPid === 'number' && runtime.watchdogPid > 0, 'runtime.json records a watchdog PID');
     assert(typeof runtime.version === 'string', 'runtime.json records the version');
 
     // Verify the bumped port actually answers /v1/models
+    const RUNTIME_TIMEOUT_MS = 15000;
+    const RUNTIME_POLL_MS = 200;
     const probeStart = Date.now();
     let alive = false;
     while (Date.now() - probeStart < RUNTIME_TIMEOUT_MS) {
@@ -5710,7 +5774,7 @@ async function runPortFallbackTest() {
     }
     assert(alive, 'bumped-port daemon answers HTTP');
 
-    console.log(`  PASS: watchdog fell back from ${TEST_PORT} to ${runtime.port} and wrote runtime.json correctly`);
+    console.log(`  PASS: watchdog fell back from ${blockedPort} to ${bumpedPort} and wrote runtime.json correctly`);
     return true;
   } finally {
     await new Promise((resolve) => blocker.close(() => resolve()));
@@ -5824,7 +5888,7 @@ async function runWatchdogOrphanReapTest() {
   const restartHeaders = restartSecret ? { authorization: `Bearer ${restartSecret}` } : {};
   const restartResponse = await new Promise((resolve) => {
     const req = http.request(
-      { hostname: 'localhost', port: TEST_PORT, path: '/api/restart', method: 'POST', headers: restartHeaders, timeout: 5000 },
+      { hostname: 'localhost', port: testDaemonPort, path: '/api/restart', method: 'POST', headers: restartHeaders, timeout: 5000 },
       (res) => { res.resume(); resolve(res.statusCode); }
     );
     req.on('error', () => resolve(0));
@@ -5877,8 +5941,11 @@ async function runWatchdogOrphanReapTest() {
   if (recordedPid !== null) {
     const pidAlive = (() => { try { process.kill(recordedPid, 0); return true; } catch { return false; } })();
     if (!pidAlive) {
-      console.log(`  Dead watchdog PID ${recordedPid} confirmed — killing orphaned worker on port ${TEST_PORT}`);
-      killListenersOnPort(TEST_PORT);
+      // Pin the port the daemon actually bound before reaping — the orphaned
+      // worker inherited it. Never a hardcoded literal.
+      const reapedPort = testDaemonPort;
+      console.log(`  Dead watchdog PID ${recordedPid} confirmed — killing orphaned worker on port ${reapedPort}`);
+      killListenersOnPort(reapedPort);
       // Wait for the port to be released (bounded poll).
       const netMod = await import('net');
       const ORPHAN_WAIT_MS = 2000;
@@ -5887,7 +5954,7 @@ async function runWatchdogOrphanReapTest() {
       while (Date.now() - orphanStart < ORPHAN_WAIT_MS) {
         await sleep(POLL_MS);
         const probeResult = await new Promise((resolve) => {
-          const orphanProbe = netMod.default.connect({ host: '127.0.0.1', port: TEST_PORT });
+          const orphanProbe = netMod.default.connect({ host: '127.0.0.1', port: reapedPort });
           orphanProbe.once('connect', () => { orphanProbe.destroy(); resolve(true); });
           orphanProbe.once('error', () => resolve(false));
           orphanProbe.setTimeout(POLL_MS, () => { orphanProbe.destroy(); resolve(false); });
@@ -5895,10 +5962,10 @@ async function runWatchdogOrphanReapTest() {
         if (!probeResult) { portCleared = true; break; }
       }
       if (!portCleared) {
-        console.error(`  FAIL: Port ${TEST_PORT} still held after orphan kill — Fix 3 ineffective`);
+        console.error(`  FAIL: Port ${reapedPort} still held after orphan kill — Fix 3 ineffective`);
         return false;
       }
-      console.log(`  PASS: Port ${TEST_PORT} released after orphan kill`);
+      console.log(`  PASS: Port ${reapedPort} released after orphan kill`);
     }
   }
 
@@ -5906,7 +5973,6 @@ async function runWatchdogOrphanReapTest() {
   const restarted = await startTestDaemon();
   if (!restarted) {
     console.error('  FAIL: New watchdog failed to start after orphan reap');
-    killListenersOnPort(TEST_PORT);
     killTestDaemon();
     return false;
   }
@@ -5977,7 +6043,7 @@ async function runMultiWorkerAuthTest() {
     const req = http.request(
       {
         hostname: 'localhost',
-        port: TEST_PORT,
+        port: testDaemonPort,
         path: '/api/restart',
         method: 'POST',
         headers: { authorization: `Bearer ${authSecret}` },
@@ -6004,7 +6070,7 @@ async function runMultiWorkerAuthTest() {
       const req = http.request(
         {
           hostname: 'localhost',
-          port: TEST_PORT,
+          port: testDaemonPort,
           path: '/__ccb_internal__/status',
           method: 'GET',
           headers: { authorization: `Bearer ${authSecret}` },
@@ -6034,7 +6100,7 @@ async function runMultiWorkerAuthTest() {
       const req = http.request(
         {
           hostname: 'localhost',
-          port: TEST_PORT,
+          port: testDaemonPort,
           path: '/api/config',
           method: 'GET',
           headers: { authorization: `Bearer ${authSecret}` },
@@ -6072,7 +6138,7 @@ async function runMultiWorkerAuthTest() {
         const req = http.request(
           {
             hostname: 'localhost',
-            port: TEST_PORT,
+            port: testDaemonPort,
             path: '/api/config',
             method: 'GET',
             headers: { authorization: `Bearer ${authSecret}` },
@@ -6169,6 +6235,12 @@ async function runSnapshotIsolationTest() {
     const snapVersionsDir = path.join(TEST_CONFIG_DIR, 'versions');
     fs.mkdirSync(snapVersionsDir, { recursive: true });
 
+    // Delete stale runtime.json to prevent reading a stale port from a previous run
+    const runtimePath = path.join(TEST_CONFIG_DIR, RUNTIME_FILENAME);
+    if (fs.existsSync(runtimePath)) {
+      try { fs.unlinkSync(runtimePath); } catch { }
+    }
+
     const logsDir = path.join(TEST_CONFIG_DIR, LOGS_DIR_NAME);
     const out = fs.openSync(path.join(logsDir, 'daemon.log'), 'a');
     const err = fs.openSync(path.join(logsDir, 'daemon.err'), 'a');
@@ -6186,6 +6258,15 @@ async function runSnapshotIsolationTest() {
     testDaemonPid = snapChild.pid;
     snapChild.unref();
 
+    // Discover the bound port from runtime.json and set testDaemonPort
+    const port = await waitForRuntimePort(TEST_CONFIG_DIR);
+    if (port === null) {
+      console.error('FAIL: Snapshot isolation — daemon failed to write runtime.json');
+      killTestDaemon();
+      return false;
+    }
+    testDaemonPort = port;
+
     const POLL_MS = 200;
     let daemonUp = false;
     for (let i = 0; i < 15; i++) {
@@ -6195,13 +6276,13 @@ async function runSnapshotIsolationTest() {
 
     if (!daemonUp) {
       console.error('FAIL: Snapshot isolation — daemon spawned from snapshot did not start');
+      dumpDaemonLogs();
       killTestDaemon();
       return false;
     }
     console.log('  Daemon spawned from snapshot is up');
 
     // runtime.json must be written by the watchdog on worker-ready.
-    const runtimePath = path.join(TEST_CONFIG_DIR, RUNTIME_FILENAME);
     if (!fs.existsSync(runtimePath)) {
       console.error('FAIL: Snapshot isolation — runtime.json not written by snapshot-spawned daemon');
       const logPath = path.join(logsDir, 'daemon.log');
@@ -6225,8 +6306,11 @@ async function runSnapshotIsolationTest() {
     }
     console.log(`  Watchdog PID from runtime.json: ${runtime.watchdogPid}`);
 
+    // Capture the port this daemon actually bound before killTestDaemon clears
+    // it, so the release-wait probes the right ephemeral port.
+    const releasedPort = testDaemonPort;
     killTestDaemon();
-    killListenersOnPort(TEST_PORT);
+    killListenersOnPort(releasedPort);
     // Wait for the port to be fully released before the next test claims it.
     const PORT_RELEASE_TIMEOUT_MS = 2000;
     const PORT_RELEASE_POLL_MS = 100;
@@ -6234,7 +6318,7 @@ async function runSnapshotIsolationTest() {
     const releaseStart = Date.now();
     while (Date.now() - releaseStart < PORT_RELEASE_TIMEOUT_MS) {
       const held = await new Promise((resolve) => {
-        const sock = netMod.default.connect({ host: '127.0.0.1', port: TEST_PORT });
+        const sock = netMod.default.connect({ host: '127.0.0.1', port: releasedPort });
         sock.once('connect', () => { sock.destroy(); resolve(true); });
         sock.once('error', () => resolve(false));
         sock.setTimeout(PORT_RELEASE_POLL_MS, () => { sock.destroy(); resolve(false); });
@@ -6250,7 +6334,7 @@ async function runSnapshotIsolationTest() {
 }
 
 async function runIntegrationTests() {
-  console.log('\n── Integration Tests (isolated daemon on port ' + TEST_PORT + ') ──');
+  console.log('\n── Integration Tests (isolated daemon on ephemeral port 0) ──');
 
   killTestDaemon();
   await setupTestConfig();
@@ -6258,7 +6342,7 @@ async function runIntegrationTests() {
   console.log('Starting test daemon...');
   const started = await startTestDaemon();
   if (!started) {
-    console.error('FAIL: Test daemon failed to start on port ' + TEST_PORT);
+    console.error('FAIL: Test daemon failed to start on ephemeral port 0');
     return [false];
   }
   console.log('Test daemon started.');
@@ -6269,7 +6353,7 @@ async function runIntegrationTests() {
   try {
     const req = http.get({
       hostname: 'localhost',
-      port: TEST_PORT,
+      port: testDaemonPort,
       path: '/__ccb_internal__/keepalive',
       headers: { connection: 'keep-alive' }
     });
@@ -6310,7 +6394,7 @@ async function runIntegrationTests() {
     }
     const req = http.request({
       hostname: 'localhost',
-      port: TEST_PORT,
+      port: testDaemonPort,
       path: path_,
       method,
       headers,
@@ -6377,7 +6461,7 @@ async function runIntegrationTests() {
       console.error('  FAIL: /api/daemon-config missing logging section');
       apiSuccess = false;
     }
-    if (cfg.port === TEST_PORT && cfg.daemon.ipcTimeoutMs === 5000) console.log('  PASS: GET /api/daemon-config returns complete config');
+    if (cfg.port === TEST_CONFIG_PORT && cfg.daemon.ipcTimeoutMs === 5000) console.log('  PASS: GET /api/daemon-config returns complete config');
   }
   if (r2.statusCode !== 200) {
     console.error(`  FAIL: GET /api/daemon-config returned ${r2.statusCode}`);
@@ -6452,7 +6536,7 @@ async function runIntegrationTests() {
 
   // ── A4 auth gate regressions ──
   const rawApiRequest = (rawHeaders, rawPath) => new Promise((resolve) => {
-    const req = http.request({ hostname: 'localhost', port: TEST_PORT, path: rawPath, method: 'GET', headers: rawHeaders, timeout: HTTP_TIMEOUT_MS, agent: apiAgent }, (res) => {
+    const req = http.request({ hostname: 'localhost', port: testDaemonPort, path: rawPath, method: 'GET', headers: rawHeaders, timeout: HTTP_TIMEOUT_MS, agent: apiAgent }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => resolve({ statusCode: res.statusCode, body: Buffer.concat(chunks).toString() }));
@@ -6586,7 +6670,7 @@ async function runIntegrationTests() {
     if (stressSecret) stressHeaders.authorization = `Bearer ${stressSecret}`;
     const req = http.request({
       hostname: 'localhost',
-      port: TEST_PORT,
+      port: testDaemonPort,
       path: ep.path,
       method: ep.method,
       headers: stressHeaders,
@@ -6831,7 +6915,6 @@ async function runIntegrationTests() {
 
 // ── Live routing tests (isolated daemon + local stub upstreams) ──
 
-const LIVE_ROUTING_PORT = 9123;
 const LIVE_ROUTING_POLL_MS = 200;
 const LIVE_ROUTING_POLL_ATTEMPTS = 75; // 15 s ceiling
 
@@ -6961,7 +7044,6 @@ function killListenersOnPort(port) {
   } catch { }
 }
 
-const SUPERSEDED_PORT = 9124;
 const SUPERSEDED_POLL_MS = 200;
 const SUPERSEDED_POLL_ATTEMPTS = 75; // 15 s ceiling
 // Gap between the pipelined A and B frames: long enough that A has reached the
@@ -7079,7 +7161,7 @@ function parseOrderedResponses(buf) {
  *            B→B's tag, no extra round-trip.
  */
 async function runSupersededRequestTests() {
-  console.log('\n── Superseded-request tests (keep-alive reuse, isolated daemon on port ' + SUPERSEDED_PORT + ') ──');
+  console.log('\n── Superseded-request tests (keep-alive reuse, isolated daemon on ephemeral port 0) ──');
   const failedBefore = failed;
 
   const okStub = await spawnRecordingStub();
@@ -7110,7 +7192,7 @@ async function runSupersededRequestTests() {
     fs.writeFileSync(path.join(tempDir, PROVIDERS_FILENAME), JSON.stringify(providers, null, 2), 'utf8');
 
     const liveConfig = {
-      port: SUPERSEDED_PORT,
+      port: 0,
       anthropicBaseUrl: `http://127.0.0.1:${okStub.port}`,
       daemon: {
         healthCheckTimeoutMs: 1000,
@@ -7327,7 +7409,7 @@ async function runSupersededRequestTests() {
     if (liveDaemonPid) {
       try { process.kill(liveDaemonPid, 'SIGKILL'); } catch { }
     }
-    killListenersOnPort(resolvedPort ?? SUPERSEDED_PORT);
+    killListenersOnPort(resolvedPort);
     await new Promise((resolve) => okStub.server.close(() => resolve()));
     await new Promise((resolve) => slowStub.server.close(() => resolve()));
     try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { }
@@ -7517,7 +7599,7 @@ async function runUpstreamStatusMappingTests() {
 }
 
 async function runLiveRoutingTests() {
-  console.log('\n── Live routing tests (stub upstreams, isolated daemon on port ' + LIVE_ROUTING_PORT + ') ──');
+  console.log('\n── Live routing tests (stub upstreams, isolated daemon on ephemeral port 0) ──');
 
   // Snapshot before: any assert() failure increments `failed`; compare after to detect failures.
   const failedBefore = failed;
@@ -7584,7 +7666,7 @@ async function runLiveRoutingTests() {
     // ── Write config.json ──
     // anthropicBaseUrl points to anthropicStub so unmatched requests hit it.
     const liveConfig = {
-      port: LIVE_ROUTING_PORT,
+      port: 0,
       anthropicBaseUrl: `http://127.0.0.1:${anthropicStub.port}`,
       daemon: {
         healthCheckTimeoutMs: 1000,
@@ -7870,7 +7952,7 @@ export function createFaultyUpstreamExtension(_config) {
     if (liveDaemonPid) {
       try { process.kill(liveDaemonPid, 'SIGKILL'); } catch { }
     }
-    killListenersOnPort(resolvedPort ?? LIVE_ROUTING_PORT);
+    killListenersOnPort(resolvedPort);
     await new Promise((resolve) => anthropicStub.server.close(() => resolve()));
     await new Promise((resolve) => primaryStub.server.close(() => resolve()));
     await new Promise((resolve) => fallbackStub.server.close(() => resolve()));
