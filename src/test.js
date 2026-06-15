@@ -17,6 +17,7 @@ import {
   RUNTIME_FILENAME
 } from '../src/core/constants.js';
 import { ArgumentError, ConfigError } from '../src/core/exceptions.js';
+import { resolveRealClaudeTestHome } from './infra/test-claude-gate.js';
 
 // Enforce: tests must be invoked via `npm test` (or `npm run test`) — never
 // directly with `node src/test.js`. `npm test` runs lint first and is the
@@ -4821,6 +4822,12 @@ const INTERACTIVE_MAX_OUTPUT_BYTES = 2 * 1024 * 1024; // 2 MiB cap per session
 const MUX_SESSION_PREFIX = `ccbtest-${process.pid}-`;
 let muxSessionCounter = 0;
 
+// Throwaway HOME resolved once by runInteractiveModelTests() and threaded into
+// every InteractiveSession call site via this module-scoped variable. The
+// dispatcher sets it before any call site runs, so the stale-null risk is zero.
+// null = gate refused (tests skipped); string = opted-in throwaway dir.
+let realClaudeTestHome = null;
+
 function muxAvailable() {
   if (process.platform === 'win32') return false;
   return runSync('tmux', ['-V']).status === 0;
@@ -4850,6 +4857,12 @@ function requireMux() {
 
 class InteractiveSession {
   constructor(cmd, args, env) {
+    // Belt-and-suspenders gate: defense-in-depth against any future call site
+    // that bypasses runInteractiveModelTests() and constructs an
+    // InteractiveSession directly without the dispatcher's skip guard.
+    // Must fire BEFORE requireMux() and BEFORE any tmux side effect.
+    const gateResult = resolveRealClaudeTestHome(process.env);
+    if (!gateResult.isSuccess) throw gateResult.error;
     requireMux();
     this.output = '';
     this.lastDataAt = Date.now();
@@ -4994,6 +5007,10 @@ async function assertModel(model, expectedPattern) {
   const CCB_BIN = path.join(PKG_ROOT, 'bin', 'ccb.js');
   const session = new InteractiveSession(process.execPath, [CCB_BIN, '--model', model], {
     ...process.env,
+    HOME: realClaudeTestHome,
+    // Scrub CLAUDE_CONFIG_DIR: anchor it under the throwaway home so a stray
+    // value in process.env cannot re-anchor the spawned claude to the real creds.
+    CLAUDE_CONFIG_DIR: path.join(realClaudeTestHome, '.claude'),
     CCB_CONFIG_DIR: TEST_CONFIG_DIR
   });
 
@@ -5082,6 +5099,10 @@ async function testModelSwitch() {
   const CCB_BIN = path.join(PKG_ROOT, 'bin', 'ccb.js');
   const session = new InteractiveSession(process.execPath, [CCB_BIN, '--model', 'glm-4.7'], {
     ...process.env,
+    HOME: realClaudeTestHome,
+    // Scrub CLAUDE_CONFIG_DIR: anchor it under the throwaway home so a stray
+    // value in process.env cannot re-anchor the spawned claude to the real creds.
+    CLAUDE_CONFIG_DIR: path.join(realClaudeTestHome, '.claude'),
     CCB_CONFIG_DIR: TEST_CONFIG_DIR
   });
 
@@ -5212,6 +5233,10 @@ async function testModelSwitchBackAndForth() {
 
   const session = new InteractiveSession(process.execPath, [CCB_BIN, '--model', 'glm-4.7'], {
     ...process.env,
+    HOME: realClaudeTestHome,
+    // Scrub CLAUDE_CONFIG_DIR: anchor it under the throwaway home so a stray
+    // value in process.env cannot re-anchor the spawned claude to the real creds.
+    CLAUDE_CONFIG_DIR: path.join(realClaudeTestHome, '.claude'),
     CCB_CONFIG_DIR: TEST_CONFIG_DIR
   });
 
@@ -5326,6 +5351,10 @@ async function assertTtyConcurrency() {
   const CCB_BIN = path.join(PKG_ROOT, 'bin', 'ccb.js');
   const session = new InteractiveSession(process.execPath, [CCB_BIN, '--model', 'glm-4.7'], {
     ...process.env,
+    HOME: realClaudeTestHome,
+    // Scrub CLAUDE_CONFIG_DIR: anchor it under the throwaway home so a stray
+    // value in process.env cannot re-anchor the spawned claude to the real creds.
+    CLAUDE_CONFIG_DIR: path.join(realClaudeTestHome, '.claude'),
     CCB_CONFIG_DIR: TEST_CONFIG_DIR
   });
 
@@ -5707,6 +5736,18 @@ async function runInteractiveModelTests() {
     console.log('\nSKIP: interactive CLI tests — tmux not available (the mux driver needs it).');
     return true;
   }
+
+  // Real-claude gate: default path skips cleanly (never throws) to protect
+  // the user's live OAuth refresh token. Opt in by setting
+  // CCB_TEST_REAL_CLAUDE_HOME to a throwaway HOME dir with its own `claude login`.
+  const gateResult = resolveRealClaudeTestHome(process.env);
+  if (!gateResult.isSuccess) {
+    console.log(gateResult.error.message);
+    return true;
+  }
+  // Stash the resolved throwaway HOME so call sites can thread it into their
+  // InteractiveSession env without re-running the gate on every construction.
+  realClaudeTestHome = gateResult.value.home;
 
   let success = true;
 
