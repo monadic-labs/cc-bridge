@@ -31,6 +31,7 @@ import {
 
 import { createSnapshot, listSnapshots, getSnapshotWatchdogPath } from '../src/core/snapshot.js';
 import { CCBSnapshotError } from '../src/core/exceptions.js';
+import { writeFileAtomic, withConfigLock } from '../src/core/fs-atomic.js';
 
 import { 
   addRouteModel, 
@@ -102,7 +103,10 @@ function loadVersions() {
 }
 
 function saveVersions(versions) {
-  fs.writeFileSync(VERSIONS_PATH, JSON.stringify(versions, null, 2) + '\n', 'utf8');
+  const result = withConfigLock(VERSIONS_PATH, () => {
+    writeFileAtomic(VERSIONS_PATH, JSON.stringify(versions, null, 2) + '\n', 'utf8');
+  });
+  if (!result.isSuccess) throw result.error;
 }
 
 async function handleVersionsCommand() {
@@ -286,16 +290,20 @@ function readJsonFile(filePath) {
 }
 
 function writeJsonIfNeeded(filePath, newJson) {
-  if (!fs.existsSync(filePath)) {
-    fs.writeFileSync(filePath, newJson, 'utf8');
-    return `Created: ${filePath}`;
-  }
-  const existingRaw = fs.readFileSync(filePath, 'utf8').trim();
-  if (existingRaw !== newJson.trim()) {
-    fs.writeFileSync(filePath, newJson, 'utf8');
-    return `Updated: ${filePath}`;
-  }
-  return `No changes needed for: ${filePath}`;
+  const result = withConfigLock(filePath, () => {
+    if (!fs.existsSync(filePath)) {
+      writeFileAtomic(filePath, newJson, 'utf8');
+      return `Created: ${filePath}`;
+    }
+    const existingRaw = fs.readFileSync(filePath, 'utf8').trim();
+    if (existingRaw !== newJson.trim()) {
+      writeFileAtomic(filePath, newJson, 'utf8');
+      return `Updated: ${filePath}`;
+    }
+    return `No changes needed for: ${filePath}`;
+  });
+  if (!result.isSuccess) throw result.error;
+  return result.value;
 }
 
 function init() {
@@ -347,7 +355,10 @@ function readProvidersJson() {
 
 function writeProvidersJson(data) {
   const providersPath = path.join(USER_CONFIG_DIR, PROVIDERS_FILENAME);
-  fs.writeFileSync(providersPath, JSON.stringify(data, null, 2) + '\n', 'utf8');
+  const result = withConfigLock(providersPath, () => {
+    writeFileAtomic(providersPath, JSON.stringify(data, null, 2) + '\n', 'utf8');
+  });
+  if (!result.isSuccess) throw result.error;
 }
 
 function handleRouteCommand() {

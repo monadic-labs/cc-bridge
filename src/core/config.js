@@ -4,6 +4,7 @@ import os from 'os';
 import { CONFIG_FILENAME, CCB_DIR_NAME } from './constants.js';
 import { ConfigError } from './exceptions.js';
 import { ensureCompleteConfig } from './migrator.js';
+import { writeFileAtomic, withConfigLock } from './fs-atomic.js';
 
 export class RetryConfig {
   #maxAttempts;
@@ -167,7 +168,7 @@ export function loadConfigFromFile(configDir) {
   if (!fs.existsSync(configPath)) {
     throw new ConfigError(`${CONFIG_FILENAME} missing: ${configPath}. Please run 'ccb --x-init' first.`);
   }
-  let raw = fs.readFileSync(configPath, 'utf8');
+  const raw = fs.readFileSync(configPath, 'utf8');
   let parsed;
   try {
     parsed = JSON.parse(raw);
@@ -176,7 +177,17 @@ export function loadConfigFromFile(configDir) {
   }
   const merged = ensureCompleteConfig(parsed);
   if (JSON.stringify(parsed) !== JSON.stringify(merged)) {
-    fs.writeFileSync(configPath, JSON.stringify(merged, null, 2) + '\n', 'utf8');
+    // Persist the defaulted config atomically, serialized against concurrent
+    // writers. Re-read inside the lock so a concurrent edit is not clobbered
+    // by our default-write: if the on-disk content changed since the read
+    // above, re-merge from the newer content instead of writing our stale view.
+    const writeResult = withConfigLock(configPath, () => {
+      const currentRaw = fs.existsSync(configPath) ? fs.readFileSync(configPath, 'utf8') : '';
+      const base = (() => { try { return JSON.parse(currentRaw); } catch { return parsed; } })();
+      const freshMerged = ensureCompleteConfig(base);
+      writeFileAtomic(configPath, JSON.stringify(freshMerged, null, 2) + '\n', 'utf8');
+    });
+    if (!writeResult.isSuccess) throw writeResult.error;
   }
   return new ProxyConfig(merged);
 }

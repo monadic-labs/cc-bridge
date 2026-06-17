@@ -17,6 +17,7 @@ import { Result, ProxyRequestContext } from './core/types.js';
 import { ConfigError, ArgumentError, ReadinessTimeoutException } from './core/exceptions.js';
 import { buildRoutingPolicy } from './core/routing-rules.js';
 import { loadEnv } from './core/env-file.js';
+import { watchConfigFile } from './core/fs-atomic.js';
 import { decompress, compress } from './core/compression.js';
 import { handleRequestEnd } from './core/proxy-request.js';
 import { handleResponseEnd } from './core/proxy-response.js';
@@ -287,17 +288,16 @@ export function createProxyCore({ configDir, port }) {
 
   function getConfig() { return configCache.get(); }
 
-  try {
-    const configPath = path.join(configDir, CONFIG_FILENAME);
-    fs.watch(configPath, () => {
-      const refreshResult = configCache.tryRefresh();
-      if (!refreshResult.isSuccess) {
-        errorReporter.write(refreshResult.error, { operation: 'config hot-reload' });
-      }
-    });
-  } catch (e) {
-    errorReporter.write(e, { operation: 'setting up config.json watcher' });
-  }
+  const configPath = path.join(configDir, CONFIG_FILENAME);
+  // Watch the DIRECTORY (not the file inode) so an atomic tmp+rename replace
+  // of config.json still triggers the reload — fs.watch(file) would bind to
+  // the old inode and silently die on rename. See fs-atomic.js watchConfigFile.
+  watchConfigFile(configPath, () => {
+    const refreshResult = configCache.tryRefresh();
+    if (!refreshResult.isSuccess) {
+      errorReporter.write(refreshResult.error, { operation: 'config hot-reload' });
+    }
+  }, (e) => errorReporter.write(e, { operation: 'setting up config.json watcher' }));
 
   const currentPort = port ?? getConfig().port;
 
@@ -410,11 +410,13 @@ export function createProxyCore({ configDir, port }) {
     const data = fs.readFileSync(providersPath, 'utf8');
     const loadPromise = loadAndApplyProviders(data, { throwOnFailure: true });
 
-    try {
-      fs.watch(providersPath, () => { reloadProviders().catch((e) => errorReporter.write(e, { operation: 'providers reload callback' })); });
-    } catch (e) {
-      errorReporter.write(e, { operation: 'setting up providers.json watcher' });
-    }
+    // Watch the DIRECTORY (not the file inode) so an atomic tmp+rename replace
+    // of providers.json still triggers the reload — fs.watch(file) would bind
+    // to the old inode and silently die on a cross-process rename. See
+    // fs-atomic.js watchConfigFile.
+    watchConfigFile(providersPath, () => {
+      reloadProviders().catch((e) => errorReporter.write(e, { operation: 'providers reload callback' }));
+    }, (e) => errorReporter.write(e, { operation: 'setting up providers.json watcher' }));
 
     const userExtDir = path.join(configDir, 'extensions');
     const watchDirs = [BUILTIN_EXTENSIONS_DIR];

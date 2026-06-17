@@ -17,6 +17,7 @@ import { ConfigCache } from '../src/core/config-cache.js';
 import { WatchdogState } from '../src/core/watchdog-state.js';
 import { spawnDaemon } from '../src/infra/process-manager.js';
 import { ReadinessTimeoutException } from '../src/core/exceptions.js';
+import { watchConfigFile } from '../src/core/fs-atomic.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_SCRIPT = process.env.CCB_SNAPSHOT_DIR
@@ -64,16 +65,19 @@ function log(msg) {
 // the watchdog. Eliminates the 9 redundant FS reads across spawn/restart
 // /keepalive/drain handlers.
 const _configCache = new ConfigCache(() => loadConfigFromFile(_configDir));
-try {
-  fs.watch(path.join(_configDir, CONFIG_FILENAME), () => {
+// Watch the DIRECTORY (not the file inode) so an atomic tmp+rename replace of
+// config.json still triggers the reload — fs.watch(file) would bind to the old
+// inode and silently die on rename. See src/core/fs-atomic.js watchConfigFile.
+watchConfigFile(
+  path.join(_configDir, CONFIG_FILENAME),
+  () => {
     const refresh = _configCache.tryRefresh();
     if (!refresh.isSuccess) {
       log(`config hot-reload failed: ${refresh.error.message}`);
     }
-  });
-} catch (e) {
-  log(`config watcher setup failed: ${e.message}`);
-}
+  },
+  (e) => { log(`config watcher setup failed: ${e.message}`); }
+);
 
 function getConfig() {
   return _configCache.get();

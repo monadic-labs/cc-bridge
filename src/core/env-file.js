@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { writeFileAtomic, withConfigLock } from './fs-atomic.js';
 
 /**
  * Parse a .env file into a frozen key-value object.
@@ -26,29 +27,36 @@ export function loadEnv(envPath) {
  * If the key already exists (or exists as a commented-out `# KEY=...` line),
  * the line is replaced in-place. Otherwise the key is appended. The file is
  * chmod 0600 on non-Windows platforms (best-effort).
+ *
+ * The read-modify-write is serialized across processes via a lockfile and the
+ * write itself is atomic (temp + rename), so concurrent `ccb --x-key set`
+ * invocations cannot lose one another's key or leave a truncated file.
  */
 export function updateEnvKey(envPath, key, value) {
-  const content = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
+  const result = withConfigLock(envPath, () => {
+    const content = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
 
-  const lines = content.split('\n');
-  let found = false;
-  const newLines = lines.map((line) => {
-    const trimmed = line.trim();
-    if (trimmed.startsWith(`${key}=`) || trimmed.startsWith(`# ${key}=`)) {
-      found = true;
-      return `${key}=${value}`;
+    const lines = content.split('\n');
+    let found = false;
+    const newLines = lines.map((line) => {
+      const trimmed = line.trim();
+      if (trimmed.startsWith(`${key}=`) || trimmed.startsWith(`# ${key}=`)) {
+        found = true;
+        return `${key}=${value}`;
+      }
+      return line;
+    });
+
+    if (!found) {
+      newLines.push(`${key}=${value}`);
     }
-    return line;
+
+    writeFileAtomic(envPath, newLines.join('\n').trim() + '\n', 'utf8');
+    if (process.platform !== 'win32') {
+      try { fs.chmodSync(envPath, 0o600); } catch { /* best effort */ }
+    }
   });
-
-  if (!found) {
-    newLines.push(`${key}=${value}`);
-  }
-
-  fs.writeFileSync(envPath, newLines.join('\n').trim() + '\n', 'utf8');
-  if (process.platform !== 'win32') {
-    try { fs.chmodSync(envPath, 0o600); } catch { /* best effort */ }
-  }
+  if (!result.isSuccess) throw result.error;
 }
 
 /**
@@ -60,40 +68,44 @@ export function updateEnvKey(envPath, key, value) {
  * @returns {string[]} Array of removed keys.
  */
 export function pruneEnvLines(envPath, predicate) {
-  if (!fs.existsSync(envPath)) return [];
+  const result = withConfigLock(envPath, () => {
+    if (!fs.existsSync(envPath)) return [];
 
-  const content = fs.readFileSync(envPath, 'utf8');
-  const lines = content.split('\n');
-  const keptLines = [];
-  const removed = [];
+    const content = fs.readFileSync(envPath, 'utf8');
+    const lines = content.split('\n');
+    const keptLines = [];
+    const removed = [];
 
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) {
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) {
+        keptLines.push(line);
+        continue;
+      }
+
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx === -1) {
+        keptLines.push(line);
+        continue;
+      }
+
+      const key = trimmed.slice(0, eqIdx).trim();
+      const value = trimmed.slice(eqIdx + 1).trim();
+
+      if (predicate({ key, value })) {
+        removed.push(key);
+        continue;
+      }
       keptLines.push(line);
-      continue;
     }
 
-    const eqIdx = trimmed.indexOf('=');
-    if (eqIdx === -1) {
-      keptLines.push(line);
-      continue;
-    }
+    if (removed.length === 0) return removed;
 
-    const key = trimmed.slice(0, eqIdx).trim();
-    const value = trimmed.slice(eqIdx + 1).trim();
-
-    if (predicate({ key, value })) {
-      removed.push(key);
-      continue;
-    }
-    keptLines.push(line);
-  }
-
-  if (removed.length === 0) return removed;
-
-  fs.writeFileSync(envPath, keptLines.join('\n').trim() + '\n', 'utf8');
-  return removed;
+    writeFileAtomic(envPath, keptLines.join('\n').trim() + '\n', 'utf8');
+    return removed;
+  });
+  if (!result.isSuccess) throw result.error;
+  return result.value;
 }
 
 /**
