@@ -359,6 +359,58 @@ function countKeepalivesFor(worker) {
   return count;
 }
 
+// Shared grace→drain→exit sequence for the ACTIVE worker's no-client shutdown.
+// Single source: both the edge path (last keepalive socket closed) and the
+// level path (periodic no-client poll) funnel through here, so they can never
+// diverge on the grace window, drain signal, or exit timing.
+//
+// Guards kept OUTSIDE (caller-resolved): whether the trigger applies at all
+// (assignedWorker is active / poll's predicate incl. workerKeepaliveS !== -1).
+// Guards kept INSIDE (common to both callers): not already shutting down, no
+// grace timer already pending. The grace body re-checks keepaliveConnections
+// at expiry so a keepalive arriving during the window cancels the exit.
+function scheduleShutdownAfterGrace(reason) {
+  if (state.isShuttingDown || state.hasKeepaliveGraceTimer) return;
+  log(`No clients (${reason}), starting ${KEEPALIVE_GRACE_MS}ms grace before shutdown`);
+  state.setKeepaliveGraceTimer(setTimeout(() => {
+    state.setKeepaliveGraceTimer(null);
+    if (keepaliveConnections.size > 0) {
+      log('Grace period ended but new keepalive arrived, cancelling shutdown');
+      return;
+    }
+    state.beginShutdown({ draining: true });
+    log('Grace period expired, shutting down');
+    const config = getConfig();
+    if (state.activeWorker) {
+      state.activeWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
+    }
+    state.setShutdownTimer(setTimeout(() => {
+      state.setShutdownTimer(null);
+      process.exit(0);
+    }, config.drainTimeoutMs + 1000));
+  }, KEEPALIVE_GRACE_MS));
+}
+
+// Level-triggered no-client exit. The edge path (socket 'close') only fires
+// when a keepalive socket CLOSES, so a daemon that NEVER receives a keepalive
+// (every test daemon; any client that dies before opening one) never runs that
+// handler and leaks forever. This poll closes that gap: independent of socket
+// events, it re-evaluates the zero-client condition on a fixed cadence.
+// .unref() so the timer itself never keeps the process alive — only a live
+// keepalive, the worker, or a pending grace/shutdown timer does.
+const NO_CLIENT_POLL_INTERVAL_MS = Math.max(500, Math.floor(KEEPALIVE_GRACE_MS / 5));
+function startNoClientPoll() {
+  const timer = setInterval(() => {
+    if (!state.activeWorker) return;
+    if (keepaliveConnections.size !== 0) return;
+    if (countKeepalivesFor(state.activeWorker) !== 0) return;
+    if (getConfig().workerKeepaliveS === -1) return; // pinned — never auto-drain
+    scheduleShutdownAfterGrace('no keepalive ever, level-triggered');
+  }, NO_CLIENT_POLL_INTERVAL_MS);
+  timer.unref();
+  return timer;
+}
+
 function handleControlConnection(socket) {
   socket.on('data', (data) => {
     const messages = data.toString().split('\n');
@@ -484,28 +536,12 @@ function handleControlConnection(socket) {
       }
     }
 
-    // Newest worker: shut down when last keepalive closes (with grace period)
+    // Newest worker: shut down when last keepalive closes (edge trigger).
+    // The grace→drain→exit sequence is shared with the level-triggered poll
+    // via scheduleShutdownAfterGrace — both paths funnel through one function.
     if (state.isActiveWorker(assignedWorker) && keepaliveConnections.size === 0 && !state.isShuttingDown) {
-      const activeKeepalives = countKeepalivesFor(state.activeWorker);
-      if (activeKeepalives === 0) {
-        log(`Last keepalive closed, starting ${KEEPALIVE_GRACE_MS}ms grace before shutdown`);
-        state.setKeepaliveGraceTimer(setTimeout(() => {
-          state.setKeepaliveGraceTimer(null);
-          if (keepaliveConnections.size > 0) {
-            log('Grace period ended but new keepalive arrived, cancelling shutdown');
-            return;
-          }
-          state.beginShutdown({ draining: true });
-          log('Grace period expired, shutting down');
-          const config = getConfig();
-          if (state.activeWorker) {
-            state.activeWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
-          }
-          state.setShutdownTimer(setTimeout(() => {
-            state.setShutdownTimer(null);
-            process.exit(0);
-          }, config.drainTimeoutMs + 1000));
-        }, KEEPALIVE_GRACE_MS));
+      if (countKeepalivesFor(state.activeWorker) === 0) {
+        scheduleShutdownAfterGrace('last keepalive closed, edge-triggered');
       }
     }
   });
@@ -537,6 +573,11 @@ function handleControlConnection(socket) {
     log(`Control IPC error: ${err.message}`);
     process.exit(1);
   });
+
+  // Start the level-triggered no-client poll once the daemon is fully up
+  // (worker bound + control IPC listening). It catches daemons that never
+  // receive a keepalive — the case the edge-triggered close handler can't see.
+  startNoClientPoll();
 })();
 
 function gracefulShutdown(signal) {
