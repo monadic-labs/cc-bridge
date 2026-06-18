@@ -263,20 +263,25 @@ async function spawnWorker() {
       log(`Worker ready (PID ${workerMsg.pid}, ${workerMsg.routes} routes, ${workerMsg.extensions} extensions)`);
       readyResolve({ child, port: state.activePort });
 
-      // Drain old workers only after new worker is confirmed ready
+      // Drain old workers only after new worker is confirmed ready.
+      //
+      // workerKeepaliveS === -1 means "never AUTO-shed the ACTIVE worker", NOT
+      // "keep every draining orphan forever". A draining worker serving ZERO
+      // keepalives is a true orphan holding a listener socket for nobody — it is
+      // reaped regardless of policy (sent {type:'drain}, same as policy=0). Only
+      // a draining worker that STILL holds live keepalives is left for natural
+      // close. The worker's own drain handler is idempotent (!drained guard) and
+      // polls activeConnections before exit, so re-sending drain to a worker
+      // mid-flight is safe.
       if (drainingWorkers.size > 0) {
         const keepaliveS = config.workerKeepaliveS;
         for (const [oldWorker, workerState] of drainingWorkers) {
-          if (keepaliveS === -1) {
-            log(`Old worker (PID ${oldWorker.pid}) kept alive indefinitely (workerKeepaliveS=-1)`);
-            continue;
-          }
-          if (keepaliveS === 0 && workerState.keepaliveCount === 0) {
-            log(`Draining old worker (PID ${oldWorker.pid}) — no keepalives, policy=0`);
-            oldWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
-            continue;
-          }
-          if (keepaliveS > 0 && workerState.keepaliveCount === 0) {
+          if (workerState.keepaliveCount === 0) {
+            if (keepaliveS === 0 || keepaliveS === -1) {
+              log(`Draining old worker (PID ${oldWorker.pid}) — no keepalives, policy=${keepaliveS}`);
+              oldWorker.send({ type: 'drain', timeout: config.drainTimeoutMs });
+              continue;
+            }
             log(`Old worker (PID ${oldWorker.pid}) — no keepalives, starting ${keepaliveS}s grace period`);
             startDrainGraceTimer(oldWorker, keepaliveS);
             continue;
@@ -403,12 +408,38 @@ function scheduleShutdownAfterGrace(reason) {
 // .unref() so the timer itself never keeps the process alive — only a live
 // keepalive, the worker, or a pending grace/shutdown timer does.
 const NO_CLIENT_POLL_INTERVAL_MS = Math.max(500, Math.floor(KEEPALIVE_GRACE_MS / 5));
+
+/**
+ * Reap true orphans from the DRAINING pool: workers with zero live keepalives
+ * that are serving nobody. Independent of workerKeepaliveS — even under -1
+ * ("never auto-shed the ACTIVE worker") a draining orphan holding a listener
+ * socket for no client is sent {type:'drain'} and reclaimed. This is purely
+ * about the draining pool; the active worker's shutdown is governed separately
+ * by scheduleShutdownAfterGrace + the -1 gate in startNoClientPoll.
+ *
+ * The worker's drain handler is idempotent (!drained guard) and exits only once
+ * core.activeConnections hits 0, so a worker still serving in-flight streams is
+ * not killed by the signal — it finishes them.
+ */
+function reapTrueOrphansFromDrainingPool() {
+  if (drainingWorkers.size === 0) return;
+  const config = getConfig();
+  for (const [worker, workerState] of drainingWorkers) {
+    if (workerState.keepaliveCount !== 0) continue;
+    log(`Reaping true-orphan draining worker (PID ${worker.pid}) — zero keepalives`);
+    worker.send({ type: 'drain', timeout: config.drainTimeoutMs });
+  }
+}
+
 function startNoClientPoll() {
   const timer = setInterval(() => {
     if (!state.activeWorker) return;
+    // Reap true-orphan DRAINING workers on every tick, independent of policy —
+    // the -1 gate below is for the ACTIVE worker's shutdown, not for orphans.
+    reapTrueOrphansFromDrainingPool();
     if (keepaliveConnections.size !== 0) return;
     if (countKeepalivesFor(state.activeWorker) !== 0) return;
-    if (getConfig().workerKeepaliveS === -1) return; // pinned — never auto-drain
+    if (getConfig().workerKeepaliveS === -1) return; // pinned — never auto-drain ACTIVE
     scheduleShutdownAfterGrace('no keepalive ever, level-triggered');
   }, NO_CLIENT_POLL_INTERVAL_MS);
   timer.unref();

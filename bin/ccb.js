@@ -779,6 +779,30 @@ const CCB_CMDS = {
   });
 }
 
+/**
+ * Pure decision: should ensureDaemon SKIP spawning a new watchdog because the
+ * configured port is already owned by a live daemon?
+ *
+ * checkProxy (HTTP GET /v1/models) is the primary liveness signal, but it can
+ * return false on a port that is genuinely live but momentarily HTTP-silent —
+ * a fresh bind not yet serving, a transient reset, or a half-up worker. A raw
+ * TCP probe (tcpProbe) is the tiebreaker: TCP-alive means SOMETHING is bound
+ * there, so spawning a second watchdog (which can't bind the port, auto-bumps
+ * to an ephemeral port, and writes an unrecognized runtime.json) is wrong.
+ *
+ * Rule: skip the spawn iff checkProxy failed AND the port is TCP-live.
+ *
+ * Extracted as a pure predicate so the rule is mechanically testable (full
+ * truth table, deterministic — no process spawning) AND lives in one place.
+ * ensureDaemon is the sole caller.
+ *
+ * @param {{ checkProxyOk: boolean, tcpAlive: boolean }} probes
+ * @returns {boolean} true → treat the existing port owner as live, do not spawn.
+ */
+export function shouldSkipSpawnForLivePort({ checkProxyOk, tcpAlive }) {
+  return !checkProxyOk && tcpAlive;
+}
+
 function readProxySecret() {
   try {
     return fs.readFileSync(path.join(LOGS_DIR, 'proxy.secret'), 'utf8').trim();
@@ -916,6 +940,21 @@ function displaySessionSummary(info) {
       if (!portStillHeld) break;
     }
     // Fall through to startProxyDaemonProcess.
+  }
+
+  // checkProxy failed (or there was no healthy runtime owner). But checkProxy
+  // is an HTTP GET to /v1/models and can return false on a port that is
+  // genuinely live but momentarily HTTP-silent — a fresh bind not yet serving,
+  // a transient reset, or a half-up worker. Before spawning a SECOND watchdog
+  // (which can't bind the live port, auto-bumps to an ephemeral port, and writes
+  // an unrecognized runtime.json — a duplicate-spawn loop), do a raw TCP probe:
+  // if the configured port is listening, a daemon already owns it. Treat that as
+  // alive and skip the spawn. The skip rule is a single pure predicate so the
+  // decision is mechanically testable (see shouldSkipSpawnForLivePort).
+  const tcpAlive = await tcpProbe(activePort, config.healthCheckTimeoutMs);
+  if (shouldSkipSpawnForLivePort({ checkProxyOk: false, tcpAlive })) {
+    process.stderr.write(`[ccb] Port ${activePort} already in use (TCP-alive, HTTP not healthy yet) — treating existing daemon as live, not spawning a duplicate\n`);
+    return;
   }
 
   await startProxyDaemonProcess(versionInfo);
