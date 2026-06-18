@@ -458,7 +458,8 @@ export class RoutingPolicy {
   get allTargetModels() {
     const models = new Set();
     for (const rule of this.#rules) {
-      models.add(rule.targetModel);
+      if (rule.targetModel) models.add(rule.targetModel);
+      if (rule.type === 'exact') models.add(rule.match);
     }
     if (this.#legacyMap) {
       for (const alias of this.#legacyMap.allAliases) {

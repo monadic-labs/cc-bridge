@@ -1383,6 +1383,7 @@ async function runUnitTests() {
   assert(targets.includes('reasoner'), 'allTargetModels includes reasoner');
   assert(targets.includes('fast'), 'allTargetModels includes fast');
   assert(targets.includes('mirror-model'), 'allTargetModels includes legacy');
+  assert(targets.includes('my-model'), 'allTargetModels includes exact-rule alias (the name users type in /model)');
 
   // RoutingPolicy with passthrough rule
   const policyWithPassthrough = new RoutingPolicy({
