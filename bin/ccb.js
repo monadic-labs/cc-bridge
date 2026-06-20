@@ -1096,7 +1096,7 @@ async function entry() {
 
   const activePort = readActivePort(config);
   const ipcPath = getControlIpcPath(activePort);
-  const KEEPALIVE_INTERVAL_MS = 15000;
+  const KEEPALIVE_INTERVAL_MS = Math.max(1000, parseInt(process.env.CCB_KEEPALIVE_INTERVAL_MS, 10) || 15000);
   const RECONNECT_FLOOR_MS = 1000;
   const RECONNECT_CEILING_MS = 30000;
   const RECONNECT_MULTIPLIER = 2;

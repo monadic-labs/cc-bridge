@@ -79,6 +79,35 @@ watchConfigFile(
   (e) => { log(`config watcher setup failed: ${e.message}`); }
 );
 
+// Watch proxy source files for code changes — edits to src/proxy.js or
+// src/proxy-core.js trigger a zero-downtime restart so the new worker picks
+// up the updated code from the live working tree. A single debounce timer
+// across both files coalesces editor save-storms into one restart.
+const CODE_RELOAD_DEBOUNCE_MS = 300;
+let _codeReloadTimer = null;
+function debouncedCodeReload(filename) {
+  if (_codeReloadTimer) clearTimeout(_codeReloadTimer);
+  _codeReloadTimer = setTimeout(() => {
+    _codeReloadTimer = null;
+    log(`Source change detected (${filename}), triggering code reload`);
+    triggerRestart('proxy code change').catch((e) => {
+      log(`Code-reload restart failed: ${e.message}`);
+    });
+  }, CODE_RELOAD_DEBOUNCE_MS);
+  _codeReloadTimer.unref?.();
+}
+
+watchConfigFile(
+  path.join(__dirname, '..', 'src', 'proxy.js'),
+  () => debouncedCodeReload('proxy.js'),
+  (e) => { log(`src/proxy.js watcher setup failed: ${e.message}`); }
+);
+watchConfigFile(
+  path.join(__dirname, '..', 'src', 'proxy-core.js'),
+  () => debouncedCodeReload('proxy-core.js'),
+  (e) => { log(`src/proxy-core.js watcher setup failed: ${e.message}`); }
+);
+
 function getConfig() {
   return _configCache.get();
 }
