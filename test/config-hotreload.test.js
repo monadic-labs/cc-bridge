@@ -44,6 +44,7 @@
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -310,3 +311,62 @@ test('config.json cross-process atomic rename storm: daemon stays up, watcher he
 
   try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
 });
+
+// ── (d) Adding a NEW provider: models appear in /v1/models without restart ───
+//
+// T-44rjt2cs / T-br3aqvw7: editing providers.json to add a brand-new provider
+// (not just changing models on an existing one) must make the new provider's
+// models visible in the GET /v1/models response, without a daemon restart.
+test('adding a new provider via hot-reload: models appear in /v1/models', async () => {
+  const configDir = makeTmpDir();
+  writeIsolatedConfig(configDir, ['baseline-model']);
+  fs.writeFileSync(path.join(configDir, '.env'),
+    'ZAI_KEY=throwaway-not-a-real-key\nNEWPROVIDER_KEY=throwaway\n', 'utf8');
+  const { port, logPath } = await spawnWatchdog(configDir);
+
+  const baseModels = await fetchModels(port);
+  assert.ok(baseModels.includes('baseline-model'),
+    `baseline-model missing from initial /v1/models: ${JSON.stringify(baseModels)}`);
+  assert.ok(!baseModels.includes('new-model'),
+    `new-model should not exist before edit: ${JSON.stringify(baseModels)}`);
+
+  const updated = {
+    providers: {
+      isolated: { url: 'http://127.0.0.1:1/v1', anthropicCompliant: true, models: ['baseline-model'] },
+      newprovider: { url: 'http://127.0.0.1:2/v1', anthropicCompliant: true, models: ['new-model'] },
+    },
+    routes: { models: {}, properties: {}, payloadSize: {} },
+  };
+  fs.writeFileSync(path.join(configDir, 'providers.json'),
+    JSON.stringify(updated, null, 2), 'utf8');
+
+  const reloaded = await pollUntil(async () => {
+    const models = await fetchModels(port);
+    return models.includes('new-model');
+  }, { timeoutMs: 8000, stepMs: 200 });
+
+  assert.equal(reloaded, true,
+    `new provider's model did not appear in /v1/models after hot-reload; ` +
+    `models: ${JSON.stringify(await fetchModels(port))}; log tail:\n${safeRead(logPath).split('\n').slice(-10).join('\n')}`);
+
+  const finalModels = await fetchModels(port);
+  assert.ok(finalModels.includes('baseline-model'),
+    `baseline-model disappeared after adding new provider: ${JSON.stringify(finalModels)}`);
+});
+
+async function fetchModels(port) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ hostname: '127.0.0.1', port, path: '/v1/models', method: 'GET' }, (res) => {
+      let body = '';
+      res.on('data', (d) => { body += d; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(body);
+          resolve((parsed.data ?? []).map((m) => m.id));
+        } catch (e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}

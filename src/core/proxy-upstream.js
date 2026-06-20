@@ -185,6 +185,14 @@ async function singleForwardAttempt({ ctx, handleResponseEnd, errorReporter, get
     })
   );
 
+  const upstreamTimeoutMs = getConfig().upstreamTimeoutMs;
+  if (upstreamTimeoutMs > 0) {
+    proxyReq.setTimeout(upstreamTimeoutMs, () => {
+      const timeoutErr = new UpstreamError('Upstream inactivity timeout', { code: 'ETIMEDOUT' });
+      proxyReq.destroy(timeoutErr);
+    });
+  }
+
   proxyReq.on('error', (err) => {
     if (ctx.clientAborted) return;
     if (ctx.superseded) {
@@ -420,14 +428,6 @@ function streamBufferedError(reqCtx, proxyRes, chunks, _handleResponseEnd, _head
     if (result) errorId = result.errorId;
   }
 
-  if (reqCtx.res.headersSent) {
-    if (!reqCtx.res.writableEnded) reqCtx.res.end();
-    return;
-  }
-  const resHeaders = filterResponseHeaders(proxyRes.headers);
-  if (errorId) resHeaders['x-ccb-error-id'] = errorId;
-  reqCtx.res.writeHead(proxyRes.statusCode, resHeaders);
-
   let outBody = body;
   if (errorId && body) {
     try {
@@ -438,6 +438,13 @@ function streamBufferedError(reqCtx, proxyRes, chunks, _handleResponseEnd, _head
       }
     } catch { }
   }
+
+  const resHeaders = filterResponseHeaders(proxyRes.headers);
+  if (errorId) resHeaders['x-ccb-error-id'] = errorId;
+  if (resHeaders['content-length'] !== undefined) {
+    resHeaders['content-length'] = String(Buffer.byteLength(outBody));
+  }
+  reqCtx.res.writeHead(proxyRes.statusCode, resHeaders);
   reqCtx.res.write(outBody);
   reqCtx.res.end();
 }

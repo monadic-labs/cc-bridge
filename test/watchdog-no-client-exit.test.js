@@ -45,11 +45,18 @@ const POLL_INTERVAL_MS = 1000; // impl: max(500, floor(KEEPALIVE_GRACE_MS / 5))
 const spawnedPids = new Set();
 const tmpDirs = new Set();
 
-afterEach(() => {
+afterEach(async () => {
+  // SIGTERM first so the watchdog's gracefulShutdown drains and reaps its
+  // own worker — prevents orphaning the child proxy process to init (PID 1).
   for (const pid of spawnedPids) {
-    // Safe: every pid here is a watchdog (and its worker) we spawned ourselves
-    // against a per-test config dir; it binds an OS-assigned port, never 9099.
-    try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+    try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
+  }
+  // Brief grace for graceful exit, then SIGKILL any stragglers.
+  if (spawnedPids.size > 0) {
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    for (const pid of spawnedPids) {
+      try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+    }
   }
   spawnedPids.clear();
   for (const dir of tmpDirs) {

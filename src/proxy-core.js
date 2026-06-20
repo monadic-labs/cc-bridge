@@ -743,11 +743,14 @@ export function createProxyCore({ configDir, port }) {
       if (urlSessionId) req.url = strippedUrl;
 
       const ctx = new ProxyRequestContext({ req, res, id: shellState.reqCount, startTime: Date.now(), urlSessionId });
+      const socket = req.socket;
       res.on('close', () => {
         shellState = shellState.withConnectionBump(-1);
+        if (socket && lastCtxPerSocket.get(socket) === ctx) {
+          lastCtxPerSocket.delete(socket);
+        }
       });
 
-      const socket = req.socket;
       if (socket) {
         const prevCtx = lastCtxPerSocket.get(socket);
         if (prevCtx) prevCtx.markSuperseded();

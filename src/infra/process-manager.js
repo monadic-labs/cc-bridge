@@ -127,6 +127,12 @@ export function spawnWithStdin(cmd, args, input, options = {}) {
       settle(null, stdout);
     });
 
+    child.stdin.on('error', () => {
+      // EPIPE / other write errors when the child closes stdin before the
+      // write completes. The child's 'close' or 'error' handlers settle
+      // the promise — swallow here to prevent an unhandled exception crash.
+    });
+
     try {
       child.stdin.write(input, 'utf8');
       child.stdin.end();
