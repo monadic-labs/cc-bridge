@@ -140,21 +140,23 @@ async function spawnWatchdog(configDir) {
   child.unref();
   spawnedPids.add(child.pid);
 
-  const port = await pollUntilReady(configDir);
+  const port = await pollUntilReady(configDir, child.pid);
   assert.ok(port !== null, `watchdog never came ready; daemon log:\n${safeRead(logPath)}`);
   return { pid: child.pid, port, logPath };
 }
 
-// Poll runtime.json for the actually-bound port (precedent: src/test.js
-// waitForRuntimePort). port: 0 → the port is only knowable after the worker
-// writes it here on ready.
-async function pollUntilReady(configDir) {
+// Poll runtime.json for the actually-bound port, correlating watchdogPid with
+// the spawned child PID to prevent reading a stale runtime.json from a prior
+// or concurrent watchdog (T-b6m7d5k2).
+async function pollUntilReady(configDir, expectedPid) {
   const runtimePath = path.join(configDir, 'runtime.json');
   const got = await pollUntil(() => {
     if (!fs.existsSync(runtimePath)) return false;
     try {
       const runtime = JSON.parse(fs.readFileSync(runtimePath, 'utf8'));
-      return typeof runtime.port === 'number' && typeof runtime.watchdogPid === 'number';
+      return typeof runtime.port === 'number'
+        && typeof runtime.watchdogPid === 'number'
+        && (!expectedPid || runtime.watchdogPid === expectedPid);
     } catch { return false; /* mid-write */ }
   }, { timeoutMs: 15000, stepMs: 100 });
   if (!got) return null;

@@ -127,13 +127,15 @@ function writeIsolatedConfig(configDir, providersModels) {
   fs.writeFileSync(path.join(configDir, '.env'), 'ZAI_KEY=throwaway-not-a-real-key\n', 'utf8');
 }
 
-async function pollUntilReady(configDir) {
+async function pollUntilReady(configDir, expectedPid) {
   const runtimePath = path.join(configDir, 'runtime.json');
   const got = await pollUntil(() => {
     if (!fs.existsSync(runtimePath)) return false;
     try {
       const runtime = JSON.parse(fs.readFileSync(runtimePath, 'utf8'));
-      return typeof runtime.port === 'number' && typeof runtime.watchdogPid === 'number';
+      return typeof runtime.port === 'number'
+        && typeof runtime.watchdogPid === 'number'
+        && (!expectedPid || runtime.watchdogPid === expectedPid);
     } catch { return false; }
   }, { timeoutMs: 15000, stepMs: 100 });
   if (!got) return null;
@@ -152,7 +154,7 @@ async function spawnWatchdog(configDir) {
   child.unref();
   spawnedPids.add(child.pid);
 
-  const port = await pollUntilReady(configDir);
+  const port = await pollUntilReady(configDir, child.pid);
   assert.ok(port !== null, `watchdog never came ready; daemon log:\n${safeRead(logPath)}`);
   await delay(RELOAD_SETTLE_MS); // let the initial "[providers] Loaded:" line land
   return { pid: child.pid, port, logPath };
